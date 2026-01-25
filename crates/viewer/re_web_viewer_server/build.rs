@@ -16,9 +16,13 @@ fn main() {
         let viewer_js_path = std::path::Path::new("./web_viewer/re_viewer.js");
         let viewer_wasm_path = std::path::Path::new("./web_viewer/re_viewer_bg.wasm");
 
-        assert!(
-            viewer_js_path.exists() && viewer_wasm_path.exists(),
-            "Web viewer not found, run `pixi run rerun-build-web` to build it!"
-        );
+        // Building the web viewer is an optional, toolchain-heavy step.
+        // For a plain `cargo build`, gracefully disable the server if the assets are missing.
+        if !(viewer_js_path.exists() && viewer_wasm_path.exists()) {
+            println!(
+                "cargo:warning=Web viewer assets not found; disabling the web viewer server. Run `pixi run rerun-build-web` to enable it."
+            );
+            println!("cargo::rustc-cfg=disable_web_viewer_server");
+        }
     }
 }

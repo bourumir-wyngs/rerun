@@ -15,6 +15,21 @@ members = [
   "tests/rust/re_integration_test",
   "tests/rust/test_*",
 ]
+# `cargo build` (without `--workspace`) will only build `default-members`.
+#
+# This is intentionally a conservative set of core crates that should build on a
+# stock Rust setup.
+#
+# Some workspace members are test- and tooling-only crates that pull in optional
+# heavy dependencies (e.g. `lance` which requires a sufficiently new `protoc`).
+# Those can still be built explicitly using `cargo build -p <crate>` or
+# `cargo build --workspace`.
+default-members = [
+  "crates/top/re_sdk",
+  "crates/top/rerun",
+  "crates/top/rerun-cli",
+  "crates/top/rerun_c",
+]
 exclude = ["examples/rust/revy", "examples/rust/chess_robby_fischer"]
 
 [workspace.package]
@@ -314,7 +329,7 @@ pathdiff = "0.2.3"
 percent-encoding = "2.3"
 pico-args = "0.5.0"
 pin-project-lite = "0.2.16"
-ply-rs-bw = { version = "=2.0.3", default-features = false } # ply-rs-bw has released semver breaking changes in patch releases before. Fool me once, shame on you…
+ply-rs-bw = { version = "=3.0.0", default-features = false } # ply-rs-bw has released semver breaking changes in patch releases before. Fool me once, shame on you…
 poll-promise = "0.3.0"
 pollster = "0.4.0"
 prettyplease = "0.2.37"
@@ -822,6 +837,13 @@ significant_drop_tightening = "allow" # An update of parking_lot made this trigg
 unnecessary_debug_formatting = "allow"
 
 [patch.crates-io]
+# Use a prebuilt `protoc` for the Lance crates so `cargo test --workspace` doesn't depend on the
+# system `protoc` version.
+lance-encoding = { path = "crates/third_party/lance-encoding" }
+lance-file = { path = "crates/third_party/lance-file" }
+lance-table = { path = "crates/third_party/lance-table" }
+lance-index = { path = "crates/third_party/lance-index" }
+
 # https://github.com/rerun-io/arrow-datafusion/pull/1 - workaround for https://github.com/rerun-io/rerun/issues/9440 :
 # datafusion = { git = "https://github.com/rerun-io/arrow-datafusion.git", branch = "emilk/patch-duration" }
 # datafusion-catalog = { git = "https://github.com/rerun-io/arrow-datafusion.git", branch = "emilk/patch-duration" }

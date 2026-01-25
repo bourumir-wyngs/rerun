@@ -29,7 +29,7 @@ IS_IN_RERUN_WORKSPACE = "yes"
 #
 # If you need to build outside of pixi, you may run `python scripts/generate_pyo3_config.py`
 # manually. But, mixing this with any pixi invocations will result in spurious rebuilds.
-PYO3_CONFIG_FILE = { value = "rerun_py/pyo3-build.cfg", relative = true }
+#PYO3_CONFIG_FILE = { value = "rerun_py/pyo3-build.cfg", relative = true }
 
 [target.osx-arm64.activation.env]
 AR = "llvm-ar" # Various Wasm targets fail on mac without llvm-ar
