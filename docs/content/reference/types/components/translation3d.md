@@ -5,8 +5,8 @@ title: "Translation3D"
 
 A translation vector in 3D space.
 
-## Rerun datatype
-[`Vec3D`](../datatypes/vec3d.md)
+## Rerun encoding
+[`Vec3D`](../encodings/vec3d.md)
 
 
 ## Arrow datatype
@@ -26,6 +26,7 @@ FixedSizeList(3 x non-null Float32)
 * [`Capsules3D`](../archetypes/capsules3d.md)
 * [`Cylinders3D`](../archetypes/cylinders3d.md)
 * [`Ellipsoids3D`](../archetypes/ellipsoids3d.md)
-* [`GridMap`](../archetypes/grid_map.md?speculative-link)
+* [`GridMap`](../archetypes/grid_map.md)
 * [`InstancePoses3D`](../archetypes/instance_poses3d.md)
 * [`Transform3D`](../archetypes/transform3d.md)
+* [`VoxelGridMap`](../archetypes/voxel_grid_map.md)

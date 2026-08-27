@@ -3,7 +3,7 @@ use ndarray::ArrayViewD;
 use re_sdk_types::tensor_data::TensorDataType;
 
 /// Stats about a tensor or image.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, re_byte_size::SizeBytes)]
 pub struct TensorStats {
     /// The range of values, ignoring `NaN`s.
     ///
@@ -17,18 +17,8 @@ pub struct TensorStats {
     pub finite_range: (f64, f64),
 }
 
-impl re_byte_size::SizeBytes for TensorStats {
-    fn heap_size_bytes(&self) -> u64 {
-        0
-    }
-
-    fn is_pod() -> bool {
-        true
-    }
-}
-
 impl TensorStats {
-    pub fn from_tensor(tensor: &re_sdk_types::datatypes::TensorData) -> Self {
+    pub fn from_tensor(tensor: &re_sdk_types::encodings::TensorData) -> Self {
         re_tracing::profile_function!();
 
         macro_rules! declare_tensor_range_int {
@@ -175,13 +165,7 @@ impl TensorStats {
             };
 
             // If we didn't find a finite range, set it to None.
-            finite_range.and_then(|r| {
-                if r.0.is_finite() && r.1.is_finite() {
-                    Some(r)
-                } else {
-                    None
-                }
-            })
+            finite_range.filter(|&r| r.0.is_finite() && r.1.is_finite())
         }
         .unwrap_or_else(|| (tensor.dtype().min_value(), tensor.dtype().max_value()));
 

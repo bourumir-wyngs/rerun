@@ -1,5 +1,5 @@
 #[expect(unused_imports, clippy::unused_trait_names)] // used in docstrings
-use crate::{Component, Loggable};
+use crate::Component;
 use crate::{ComponentDescriptor, DeserializationResult};
 
 // ---
@@ -86,10 +86,15 @@ pub trait Archetype {
     where
         Self: Sized,
     {
-        Self::from_arrow_components(
-            data.into_iter()
-                .map(|(field, array)| (ComponentDescriptor::from(field), array)),
-        )
+        let components = data
+            .into_iter()
+            .map(|(field, array)| {
+                let descr = ComponentDescriptor::try_from(field)
+                    .map_err(|err| crate::DeserializationError::ValidationError(err.to_string()))?;
+                Ok((descr, array))
+            })
+            .collect::<DeserializationResult<Vec<_>>>()?;
+        Self::from_arrow_components(components)
     }
 
     /// Given an iterator of Arrow arrays and their respective [`ComponentDescriptor`]s, deserializes them
@@ -117,9 +122,12 @@ pub trait ArchetypeReflectionMarker {}
 
 // ---
 
-re_string_interner::declare_new_type!(
+re_string_interner::declare_new_type_nonempty!(
     /// The fully-qualified name of an [`Archetype`], e.g. `rerun.archetypes.Points3D`.
-    #[cfg_attr(feature = "serde", derive(::serde::Deserialize, ::serde::Serialize))]
+    ///
+    /// This name is used both as an identifier and as a display label: it is part of what
+    /// identifies a column (see [`crate::ComponentDescriptor`]) and is used as a map key,
+    /// and it is also shown in short form to the user, via [`ArchetypeName::short_name`].
     pub struct ArchetypeName;
 );
 
@@ -180,8 +188,29 @@ impl ArchetypeName {
 
 // ---
 
-re_string_interner::declare_new_type!(
-    /// An identifier for a component, i.e. a field in an [`Archetype`].
-    #[cfg_attr(feature = "serde", derive(::serde::Deserialize, ::serde::Serialize))]
+re_string_interner::declare_new_type_nonempty!(
+    /// Uniquely identifies a component (a field of data) within an entity.
+    ///
+    /// It comes in one of two shapes:
+    /// * **Archetype-qualified**: the archetype's [short name][`ArchetypeName::short_name`] and the
+    ///   field name joined by a colon, e.g. `Points3D:positions`, `Scalars:scalars`, or
+    ///   `user.CustomPoints:colors` for a custom archetype. This is the common case for data logged
+    ///   through an archetype; construct it with [`ComponentIdentifier::from_archetype_field`].
+    /// * **Bare field name**: just the field name, e.g. `positions`, used for data logged without an
+    ///   archetype (see [`crate::DynamicArchetype`] and `AnyValues`).
+    ///
+    /// The empty string is not a valid identifier.
     pub struct ComponentIdentifier;
 );
+
+impl ComponentIdentifier {
+    /// Construct from an archetype name and a field name, e.g. `Points3D:positions`.
+    ///
+    /// Uses the archetype's [short name][`ArchetypeName::short_name`].
+    #[inline]
+    pub fn from_archetype_field(archetype: ArchetypeName, field: &str) -> Self {
+        // The result always contains a `:`, so it can never be empty:
+        Self::try_new(format!("{}:{field}", archetype.short_name()))
+            .expect("`archetype:field` is never empty")
+    }
+}

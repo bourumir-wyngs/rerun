@@ -9,7 +9,6 @@ use re_ui::list_item::{self, ListItemContentButtonsExt as _, PropertyContent};
 use re_ui::{UiExt as _, icons};
 use re_viewer_context::{AppContext, StoreViewContext, StoredBlobCacheKey, UiLayout};
 
-use crate::image_ui::ImageUi;
 use crate::video_ui::VideoUi;
 use crate::{EntityDataUi, find_and_deserialize_archetype_mono_component};
 
@@ -86,7 +85,7 @@ impl EntityDataUi for Blob {
 }
 
 /// Show EXIF data about the given blob (image), if possible.
-fn exif_ui(ui: &mut egui::Ui, key: StoredBlobCacheKey, blob: &re_sdk_types::datatypes::Blob) {
+fn exif_ui(ui: &mut egui::Ui, key: StoredBlobCacheKey, blob: &re_sdk_types::encodings::Blob) {
     let exif_result = ui.memory_mut(|mem| {
         // Cache EXIF parsing to avoid re-parsing every frame.
         // The parsing is really fast, so this is not really needed.
@@ -124,10 +123,7 @@ fn exif_ui(ui: &mut egui::Ui, key: StoredBlobCacheKey, blob: &re_sdk_types::data
 /// Utility for displaying additional UI for blobs.
 pub struct BlobUi {
     component: ComponentIdentifier,
-    blob: re_sdk_types::datatypes::Blob,
-
-    /// Additional image ui if any.
-    image: Option<ImageUi>,
+    blob: re_sdk_types::encodings::Blob,
 
     /// Additional video ui if the blob is a video.
     video: Option<VideoUi>,
@@ -195,35 +191,25 @@ impl BlobUi {
         entity_path: &re_log_types::EntityPath,
         blob_component_descriptor: &ComponentDescriptor,
         blob_row_id: Option<RowId>,
-        blob: re_sdk_types::datatypes::Blob,
+        blob: re_sdk_types::encodings::Blob,
         media_type: Option<&MediaType>,
         video_timestamp: Option<VideoTimestamp>,
     ) -> Self {
-        let (image, video) = if let Some(blob_row_id) = blob_row_id {
-            (
-                ImageUi::from_blob(
-                    ctx,
-                    blob_row_id,
-                    blob_component_descriptor,
-                    &blob,
-                    media_type,
-                ),
-                VideoUi::from_blob(
-                    ctx,
-                    entity_path,
-                    blob_row_id,
-                    blob_component_descriptor,
-                    &blob,
-                    media_type,
-                    video_timestamp,
-                ),
+        let video = if let Some(blob_row_id) = blob_row_id {
+            VideoUi::from_blob(
+                ctx,
+                entity_path,
+                blob_row_id,
+                blob_component_descriptor,
+                &blob,
+                media_type,
+                video_timestamp,
             )
         } else {
-            (None, None)
+            None
         };
 
         Self {
-            image,
             video,
             row_id: blob_row_id,
             component: blob_component_descriptor.component,
@@ -236,11 +222,8 @@ impl BlobUi {
         &'a self,
         ctx: &'a AppContext<'_>,
         entity_path: &'a EntityPath,
-        mut property_content: list_item::PropertyContent<'a>,
+        property_content: list_item::PropertyContent<'a>,
     ) -> list_item::PropertyContent<'a> {
-        if let Some(image) = &self.image {
-            property_content = image.inline_copy_button(ctx, property_content);
-        }
         property_content.with_action_button(&icons::DOWNLOAD, "Save blob…", || {
             let mut file_name = entity_path
                 .last()
@@ -268,7 +251,7 @@ impl BlobUi {
         ctx: &StoreViewContext<'_>,
         ui: &mut egui::Ui,
         ui_layout: UiLayout,
-        entity_path: &EntityPath,
+        _entity_path: &EntityPath,
     ) {
         if let Some(row_id) = self.row_id
             && ui_layout == UiLayout::SelectionPanel
@@ -278,10 +261,6 @@ impl BlobUi {
                 StoredBlobCacheKey::new(row_id, self.component),
                 &self.blob,
             );
-        }
-
-        if let Some(image) = &self.image {
-            image.data_ui(ctx, ui, ui_layout, entity_path);
         }
 
         if let Some(video) = &self.video {

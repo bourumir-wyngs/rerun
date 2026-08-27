@@ -16,10 +16,11 @@ mod error;
 #[cfg(not(target_arch = "wasm32"))]
 mod provider;
 
+mod claims;
 mod service;
 mod token;
 
-/// Rerun Cloud permissions
+/// Rerun Hub permissions
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Permission {
     /// User can read data.
@@ -61,12 +62,13 @@ pub mod oauth;
 #[cfg(all(feature = "oauth", not(target_arch = "wasm32")))]
 pub mod callback_server;
 
+pub use claims::{Claims, RedapClaims};
 #[cfg(not(target_arch = "wasm32"))]
 pub use error::Error;
 #[cfg(all(feature = "oauth", not(target_arch = "wasm32")))]
 pub use oauth::login_flow::{DeviceCodeFlow, OauthLoginFlow};
 #[cfg(not(target_arch = "wasm32"))]
-pub use provider::{Claims, RedapProvider, SecretKey, VerificationOptions};
+pub use provider::{RedapProvider, SecretKey, VerificationOptions};
 pub use service::client;
 #[cfg(not(target_arch = "wasm32"))]
 pub use service::server;

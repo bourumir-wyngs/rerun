@@ -5,172 +5,43 @@ use ahash::HashMap;
 use arrow::array::Array as _;
 use itertools::Itertools as _;
 
-use re_byte_size::SizeBytes;
 use re_chunk::{Chunk, EntityPath, RowId};
 use re_log::debug_assert;
-use re_log_encoding::{RrdManifest, RrdManifestTemporalMapEntry};
+use re_sdk_types::{Archetype as _, ArchetypeName, archetypes};
 
+use crate::lineage::TrackedDirectChunkLineage;
+use crate::lineage_dropping::LineageDroppingCtx;
 use crate::store::ChunkIdSetPerTime;
 use crate::{
-    ChunkDirectLineage, ChunkDirectLineageReport, ChunkId, ChunkStore, ChunkStoreChunkStats,
-    ChunkStoreConfig, ChunkStoreDiff, ChunkStoreDiffAddition, ChunkStoreError, ChunkStoreEvent,
+    ChunkDeletionReason, ChunkDirectLineage, ChunkDirectLineageReport, ChunkId, ChunkStore,
+    ChunkStoreChunkStats, ChunkStoreDiff, ChunkStoreDiffAddition, ChunkStoreError, ChunkStoreEvent,
     ChunkStoreResult,
 };
+
+/// Does this component belong to a transform archetype whose static data must be preserved in full?
+///
+/// [Sometime ago](https://github.com/rerun-io/rerun/pull/7518), we introduced a mechanism to auto-
+/// delete static chunks that are "shadowed" by a newly inserted static chunk.
+/// The reason for that is that in the basic data model, a latest-at query only ever returns the
+/// most recent value for a given `(entity, component)`, so superseded static chunks can be safely
+/// dropped, giving the benefit of "insta-GC" through logging with static data.
+///
+/// Named transform data is the exception: it is interpreted in full, not latest-at. A single entity
+/// can carry many distinct frames across multiple static chunks (e.g. a `/tf_static` topic logging
+/// transforms over its lifetime.
+///
+/// See RR-4887 for more info.
+pub fn preserves_static_transforms(archetype_name: Option<ArchetypeName>) -> bool {
+    // Note: these are "named transform" archetypes, aka those which have parent/child frame
+    // references
+    archetype_name.is_some_and(|archetype| {
+        archetype == archetypes::Transform3D::name() || archetype == archetypes::Pinhole::name()
+    })
+}
 
 // ---
 
 impl ChunkStore {
-    /// This insert a batch of virtual chunks into the store, according to the given [`RrdManifest`].
-    ///
-    /// All queries will return partial results until the missing physical data gets loaded in.
-    #[must_use = "The chunk store events should be handled"]
-    pub fn insert_rrd_manifest(&mut self, rrd_manifest: Arc<RrdManifest>) -> Vec<ChunkStoreEvent> {
-        re_tracing::profile_function!();
-
-        let Self {
-            id: _,
-            config: _,
-            schema: _,                            // handled below
-            physical_chunks_per_chunk_id: _,      // physical data only
-            physical_chunk_ids_per_min_row_id: _, // physical data only
-            chunks_lineage,
-            dangling_splits: _, // cannot split during virtual insert
-            split_on_ingest: _,
-            leaky_compactions: _, // cannot compact during virtual insert
-            temporal_chunk_ids_per_entity_per_component,
-            temporal_chunk_ids_per_entity,
-            temporal_physical_chunks_stats: _, // stats are for physical data only
-            static_chunk_ids_per_entity,
-            static_chunks_stats: _, // stats are for physical data only
-            queried_chunk_id_tracker: _,
-            insert_id: _,
-            gc_id: _,
-            event_id: _,
-        } = self;
-
-        let native_static_map = rrd_manifest.static_map();
-        chunks_lineage.extend(
-            native_static_map
-                .values()
-                .flat_map(|per_component| per_component.values())
-                .map(|chunk_id| {
-                    (
-                        *chunk_id,
-                        ChunkDirectLineage::RootFromManifest { is_static: true },
-                    )
-                }),
-        );
-        for (entity_path, per_component) in native_static_map {
-            static_chunk_ids_per_entity
-                .entry(entity_path.clone())
-                .or_default()
-                .extend(per_component.iter().map(|(&k, &v)| (k, v)));
-        }
-
-        let native_temporal_map = rrd_manifest.temporal_map();
-        chunks_lineage.extend(
-            native_temporal_map
-                .values()
-                .flat_map(|per_timeline| per_timeline.values())
-                .flat_map(|per_component| per_component.values())
-                .flat_map(|per_chunk| per_chunk.keys())
-                .map(|chunk_id| {
-                    (
-                        *chunk_id,
-                        ChunkDirectLineage::RootFromManifest { is_static: false },
-                    )
-                }),
-        );
-        for (entity_path, per_timeline) in native_temporal_map {
-            for (timeline, per_component) in per_timeline {
-                for (&component, per_chunk) in per_component {
-                    for (&chunk_id, &entry) in per_chunk {
-                        let RrdManifestTemporalMapEntry {
-                            time_range,
-                            num_rows: _,
-                        } = entry;
-                        // with component
-                        {
-                            let per_timeline = temporal_chunk_ids_per_entity_per_component
-                                .entry(entity_path.clone())
-                                .or_default();
-                            let per_component = per_timeline.entry(*timeline.name()).or_default();
-                            let ChunkIdSetPerTime {
-                                max_interval_length,
-                                per_start_time,
-                                per_end_time,
-                            } = per_component.entry(component).or_default();
-                            *max_interval_length =
-                                (*max_interval_length).max(time_range.abs_length());
-                            per_start_time
-                                .entry(time_range.min)
-                                .or_default()
-                                .insert(chunk_id);
-                            per_end_time
-                                .entry(time_range.max)
-                                .or_default()
-                                .insert(chunk_id);
-                        }
-
-                        // without component
-                        {
-                            let per_timeline = temporal_chunk_ids_per_entity
-                                .entry(entity_path.clone())
-                                .or_default();
-                            let ChunkIdSetPerTime {
-                                max_interval_length,
-                                per_start_time,
-                                per_end_time,
-                            } = per_timeline.entry(*timeline.name()).or_default();
-                            *max_interval_length =
-                                (*max_interval_length).max(time_range.abs_length());
-                            per_start_time
-                                .entry(time_range.min)
-                                .or_default()
-                                .insert(chunk_id);
-                            per_end_time
-                                .entry(time_range.max)
-                                .or_default()
-                                .insert(chunk_id);
-                        }
-                    }
-                }
-            }
-        }
-
-        let event = ChunkStoreEvent {
-            store_id: self.id.clone(),
-            store_generation: self.generation(),
-            event_id: self
-                .event_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            diff: ChunkStoreDiff::virtual_addition(rrd_manifest),
-        };
-
-        let new_columns = self.schema.on_events(std::slice::from_ref(&event));
-
-        let mut events = vec![event];
-
-        if !new_columns.is_empty() {
-            events.push(ChunkStoreEvent {
-                store_id: self.id.clone(),
-                store_generation: self.generation(),
-                event_id: self
-                    .event_id
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                diff: ChunkStoreDiff::SchemaAddition(crate::ChunkStoreDiffSchemaAddition {
-                    new_columns,
-                }),
-            });
-        }
-
-        if self.config.enable_changelog {
-            Self::on_events(&events);
-        }
-
-        events
-    }
-
     /// Inserts a [`Chunk`] in the store.
     ///
     /// Iff the store was modified, all registered subscribers will be notified and the
@@ -187,6 +58,56 @@ impl ChunkStore {
 
         let diffs = self.insert_chunk_impl(chunk, ChunkDirectLineageReport::Volatile)?;
         Ok(self.finalize_events(diffs))
+    }
+
+    fn insert_lineage_if_missing(&mut self, chunk_id: ChunkId, lineage: &ChunkDirectLineageReport) {
+        let lineage: ChunkDirectLineage = lineage.into();
+
+        let descends_from_manifest = match &lineage {
+            ChunkDirectLineage::SplitFrom(chunk_id, _) => self.descends_from_manifest(chunk_id),
+            ChunkDirectLineage::CompactedFrom(chunks) => {
+                chunks.iter().any(|c| self.descends_from_manifest(c))
+            }
+            ChunkDirectLineage::RootFromManifest { .. } => true,
+            ChunkDirectLineage::Volatile => false,
+        };
+
+        match self.chunks_lineage.entry(chunk_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(TrackedDirectChunkLineage {
+                    // Zero for now, add to this later.
+                    ref_count: 0,
+                    descends_from_manifest,
+                    lineage: lineage.clone(),
+                });
+
+                for chunk_id in lineage.iter_referenced_chunks() {
+                    let Some(l) = self.chunks_lineage.get_mut(chunk_id) else {
+                        continue;
+                    };
+
+                    l.ref_count += 1;
+                }
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if cfg!(debug_assertions) {
+                    if matches!(
+                        entry.get().lineage,
+                        ChunkDirectLineage::RootFromManifest { .. }
+                    ) && matches!(lineage, ChunkDirectLineage::Volatile)
+                    {
+                        // If we've already indicated that this chunk is from the manifest, don't
+                        // override with the default lineage `Volatile`.
+                    } else {
+                        re_log::debug_assert_eq!(
+                            entry.get().lineage,
+                            lineage,
+                            "Lineage for a specific chunk id should never change ({chunk_id})",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn insert_chunk_impl(
@@ -234,9 +155,11 @@ impl ChunkStore {
             return Ok(all_diffs);
         }
 
-        if !chunk.is_sorted() {
+        if !chunk.is_row_ids_sorted() {
             return Err(ChunkStoreError::UnsortedChunk);
         }
+
+        chunk.warn_if_out_of_order();
 
         re_tracing::profile_function!();
 
@@ -273,9 +196,13 @@ impl ChunkStore {
             // The fix is simple: always unconditionally clean up the indexes when a virtual chunk
             // gets physically inserted.
             all_diffs.extend(
-                self.remove_chunks_deep(vec![chunk.clone()], None)
-                    .into_iter()
-                    .map(Into::into),
+                self.remove_chunks_deep(
+                    vec![chunk.clone()],
+                    None,
+                    ChunkDeletionReason::VirtualToPhysicalReplacement,
+                )
+                .into_iter()
+                .map(Into::into),
             );
         }
 
@@ -294,16 +221,15 @@ impl ChunkStore {
                         })
                         .collect(),
                     None,
+                    ChunkDeletionReason::DanglingSplitCleanup,
                 )
                 .into_iter()
                 .map(Into::into),
             );
         }
 
-        self.chunks_lineage
-            .entry(chunk.id())
-            // `.or_insert_with` because we don't want to lose the RRD manifest lineage if there is one.
-            .or_insert_with(|| (&lineage).into());
+        // "if missing" because we don't want to lose the RRD manifest lineage if there is one.
+        self.insert_lineage_if_missing(chunk.id(), &lineage);
 
         // Splitting a static chunk just seems like a terrible idea in general.
         let chunk_is_static = chunk.is_static();
@@ -403,6 +329,7 @@ impl ChunkStore {
 
         let chunk_before_processing = Arc::clone(chunk); // we'll need it to create the store event
 
+        //TODO(RR-4887): we should NEVER delete chunks
         let (chunk_after_processing, diffs) = if chunk.is_static() {
             // Static data: make sure to keep the most recent chunk available for each component column.
             re_tracing::profile_scope!("static");
@@ -425,6 +352,8 @@ impl ChunkStore {
                 else {
                     continue;
                 };
+
+                let is_transform = preserves_static_transforms(column.descriptor.archetype);
 
                 self.static_chunk_ids_per_entity
                     .entry(chunk.entity_path().clone())
@@ -460,7 +389,9 @@ impl ChunkStore {
                                     chunk.row_id_range().map(|(row_id_min, _)| row_id_min)
                                 });
 
-                            if let Some(cur_row_id_min_for_chunk) = cur_row_id_min_for_chunk {
+                            if let Some(cur_row_id_min_for_chunk) = cur_row_id_min_for_chunk
+                                && !is_transform
+                            {
                                 overwritten_chunk_ids
                                     .insert(*cur_chunk_id, cur_row_id_min_for_chunk);
                             }
@@ -512,16 +443,29 @@ impl ChunkStore {
 
                         let chunk_id_removed = self
                             .physical_chunk_ids_per_min_row_id
-                            .remove(&chunk_row_id_min);
-                        debug_assert!(chunk_id_removed.is_some());
+                            .remove(&(chunk_row_id_min, chunk_id));
+                        debug_assert!(chunk_id_removed);
 
                         let chunk_removed = self.physical_chunks_per_chunk_id.remove(&chunk_id);
                         debug_assert!(chunk_removed.is_some());
 
                         if let Some(chunk_removed) = chunk_removed {
+                            Self::drop_lineage_reference(
+                                &mut LineageDroppingCtx {
+                                    chunks_lineage: &mut self.chunks_lineage,
+                                    leaky_compactions: &mut self.leaky_compactions,
+                                    split_on_ingest: &mut self.split_on_ingest,
+                                    dangling_splits: &mut self.dangling_splits,
+                                },
+                                &chunk_id,
+                            );
+
                             self.static_chunks_stats -=
                                 ChunkStoreChunkStats::from_chunk(&chunk_removed);
-                            diffs.push(ChunkStoreDiff::deletion(chunk_removed));
+                            diffs.push(ChunkStoreDiff::deletion(
+                                chunk_removed,
+                                ChunkDeletionReason::Overwrite,
+                            ));
                         }
                     }
                 }
@@ -538,21 +482,7 @@ impl ChunkStore {
                 let elected_chunk = self.find_and_elect_compaction_candidate(chunk);
 
                 let chunk_or_compacted = if let Some(elected_chunk) = &elected_chunk {
-                    let chunk_rowid_min = chunk.row_id_range().map(|(min, _)| min);
-                    let elected_rowid_min = elected_chunk.row_id_range().map(|(min, _)| min);
-
-                    let mut compacted = if elected_rowid_min < chunk_rowid_min {
-                        re_tracing::profile_scope!("concat");
-                        elected_chunk.concatenated(chunk)?
-                    } else {
-                        re_tracing::profile_scope!("concat");
-                        chunk.concatenated(elected_chunk)?
-                    };
-
-                    {
-                        re_tracing::profile_scope!("sort");
-                        compacted.sort_if_unsorted();
-                    }
+                    let compacted = Chunk::concat_and_sort(elected_chunk, chunk)?;
 
                     re_log::trace!(
                         "compacted {} ({} rows) and {} ({} rows) together, resulting in {} ({} rows)",
@@ -667,15 +597,22 @@ impl ChunkStore {
             };
             if let Some(elected_chunk) = &elected_chunk {
                 // NOTE: The chunk that we've just added has been compacted already!
-                let srcs: BTreeMap<_, _> =
-                    std::iter::once((chunk_before_processing.id(), chunk_before_processing))
-                        .chain(
-                            // NOTE: deep removal, we don't want a compacted chunk to linger on!
-                            self.remove_chunks_deep(vec![elected_chunk.clone()], None)
-                                .into_iter()
-                                .map(|diff| (diff.chunk.id(), diff.chunk)),
-                        )
-                        .collect();
+                //
+                // We build `srcs` eagerly from the chunks we already have in hand, then wire up
+                // `leaky_compactions` and the new compacted chunk's lineage entry *before* removing
+                // the elected chunk. That way the elected chunk's `ref_count` is bumped by the new
+                // compacted chunk's lineage, and the cascading cleanup inside `remove_chunks_deep`
+                // sees a ref > 0 and leaves it (and the leaky_compactions entries that point to it)
+                // alone.
+                let srcs: BTreeMap<ChunkId, Arc<Chunk>> = [
+                    (
+                        chunk_before_processing.id(),
+                        Arc::clone(&chunk_before_processing),
+                    ),
+                    (elected_chunk.id(), Arc::clone(elected_chunk)),
+                ]
+                .into_iter()
+                .collect();
 
                 for source_id in srcs.keys().copied() {
                     let found = self
@@ -698,7 +635,17 @@ impl ChunkStore {
                     }
                 }
 
-                add.direct_lineage = ChunkDirectLineageReport::CompactedFrom(srcs);
+                let direct_lineage = ChunkDirectLineageReport::CompactedFrom(srcs);
+                self.insert_lineage_if_missing(chunk_or_compacted.id(), &direct_lineage);
+
+                // NOTE: deep removal, we don't want a compacted chunk to linger on!
+                self.remove_chunks_deep(
+                    vec![elected_chunk.clone()],
+                    None,
+                    ChunkDeletionReason::Compaction,
+                );
+
+                add.direct_lineage = direct_lineage;
             }
 
             (chunk_or_compacted, vec![add.into()])
@@ -706,205 +653,22 @@ impl ChunkStore {
 
         self.physical_chunks_per_chunk_id
             .insert(chunk_after_processing.id(), chunk_after_processing.clone());
-
-        for diff in &diffs {
-            if let ChunkStoreDiff::Addition(add) = diff
-                && let report @ ChunkDirectLineageReport::CompactedFrom(_) = &add.direct_lineage
-            {
-                self.chunks_lineage
-                    .insert(add.chunk_after_processing.id(), report.into());
-            }
+        // Account for the physical reference. The matching decrement happens in
+        // `remove_chunks_shallow` (via `drop_lineage_reference`).
+        if let Some(l) = self.chunks_lineage.get_mut(&chunk_after_processing.id()) {
+            l.ref_count += 1;
         }
+
         all_diffs.extend(diffs);
 
         // NOTE: ⚠️Make sure to recompute the Row ID range! The chunk might have been compacted
         // with another one, which might or might not have modified the range.
-        if let Some(min_row_id) = chunk_after_processing.row_id_range().map(|(min, _)| min)
-            && self
-                .physical_chunk_ids_per_min_row_id
-                .insert(min_row_id, chunk_after_processing.id())
-                .is_some()
-        {
-            re_log::warn_once!(
-                "Detected duplicated RowId in the data, this might lead to undefined behavior"
-            );
+        if let Some(min_row_id) = chunk_after_processing.row_id_range().map(|(min, _)| min) {
+            self.physical_chunk_ids_per_min_row_id
+                .insert((min_row_id, chunk_after_processing.id()));
         }
 
         Ok(all_diffs)
-    }
-
-    /// Finds the most appropriate candidate for compaction.
-    ///
-    /// The algorithm is simple: for each incoming [`Chunk`], we take a look at its future neighbors.
-    /// Each neighbor is a potential candidate for compaction.
-    ///
-    /// Because the chunk is going to be inserted into many different indices -- for each of its timelines
-    /// and components -- it will have many direct neighbors.
-    /// Everytime we encounter a neighbor, it earns points.
-    ///
-    /// The neighbor with the most points at the end of the process is elected.
-    fn find_and_elect_compaction_candidate(&self, chunk: &Arc<Chunk>) -> Option<Arc<Chunk>> {
-        re_tracing::profile_function!();
-
-        // Early exit if the newly added Chunk is already the result of a split, directly or indirectly.
-        // Compacting chunks coming from a split lineage is generally a mistake, as that is likely
-        // to lead to overlaps that weren't there in the first place.
-        if self.descends_from_a_split(&chunk.id()) {
-            return None;
-        }
-
-        {
-            // Make sure to early exit if the newly added Chunk is already beyond the compaction thresholds
-            // on its own.
-
-            let ChunkStoreConfig {
-                enable_changelog: _,
-                chunk_max_bytes,
-                chunk_max_rows,
-                chunk_max_rows_if_unsorted,
-            } = self.config;
-
-            let total_bytes = <Chunk as SizeBytes>::total_size_bytes(chunk);
-            let is_below_bytes_threshold = total_bytes <= chunk_max_bytes;
-
-            let total_rows = (chunk.num_rows()) as u64;
-            let is_below_rows_threshold = if chunk.is_time_sorted() {
-                total_rows <= chunk_max_rows
-            } else {
-                total_rows <= chunk_max_rows_if_unsorted
-            };
-
-            if !(is_below_bytes_threshold && is_below_rows_threshold) {
-                return None;
-            }
-        }
-
-        let mut candidates_below_threshold: HashMap<ChunkId, u64> = HashMap::default();
-        let mut check_if_chunk_below_threshold =
-            |store: &Self, candidate_chunk_id: ChunkId| -> u64 {
-                let ChunkStoreConfig {
-                    enable_changelog: _,
-                    chunk_max_bytes,
-                    chunk_max_rows,
-                    chunk_max_rows_if_unsorted,
-                } = store.config;
-
-                *candidates_below_threshold
-                    .entry(candidate_chunk_id)
-                    .or_insert_with(|| {
-                        store
-                            .physical_chunks_per_chunk_id
-                            .get(&candidate_chunk_id)
-                            .map_or(0, |candidate| {
-                                if chunk.id() == candidate_chunk_id {
-                                    return 0;
-                                }
-
-                                if !chunk.concatenable(candidate) {
-                                    return 0;
-                                }
-
-                                // Refuse the candidate if it descends from a split chunk, directly or indirectly.
-                                // Compacting chunks coming from a split lineage is generally a mistake, as that is likely
-                                // to lead to overlaps that weren't there in the first place.
-                                if self.descends_from_a_split(&candidate_chunk_id) {
-                                    return 0;
-                                }
-
-                                let total_bytes = <Chunk as SizeBytes>::total_size_bytes(chunk)
-                                    + <Chunk as SizeBytes>::total_size_bytes(candidate);
-                                let is_below_bytes_threshold = total_bytes <= chunk_max_bytes;
-
-                                let total_rows = (chunk.num_rows() + candidate.num_rows()) as u64;
-                                let is_below_rows_threshold = if candidate.is_time_sorted() {
-                                    total_rows <= chunk_max_rows
-                                } else {
-                                    total_rows <= chunk_max_rows_if_unsorted
-                                };
-
-                                if is_below_bytes_threshold && is_below_rows_threshold {
-                                    return candidate.num_rows() as u64;
-                                }
-
-                                0
-                            })
-                    })
-            };
-
-        let mut candidates: HashMap<ChunkId, u64> = HashMap::default();
-
-        let temporal_chunk_ids_per_timeline = self
-            .temporal_chunk_ids_per_entity_per_component
-            .get(chunk.entity_path())?;
-
-        for (timeline, time_range_per_component) in chunk.time_range_per_component() {
-            let Some(temporal_chunk_ids_per_component) =
-                temporal_chunk_ids_per_timeline.get(&timeline)
-            else {
-                continue;
-            };
-
-            for (component, time_range) in time_range_per_component {
-                let Some(temporal_chunk_ids_per_time) =
-                    temporal_chunk_ids_per_component.get(&component)
-                else {
-                    continue;
-                };
-
-                {
-                    // Direct neighbors (before): 1 point each.
-                    if let Some((_data_time, chunk_id_set)) = temporal_chunk_ids_per_time
-                        .per_start_time
-                        .range(..time_range.min())
-                        .next_back()
-                    {
-                        for &chunk_id in chunk_id_set {
-                            *candidates.entry(chunk_id).or_default() +=
-                                check_if_chunk_below_threshold(self, chunk_id);
-                        }
-                    }
-
-                    // Direct neighbors (after): 1 point each.
-                    if let Some((_data_time, chunk_id_set)) = temporal_chunk_ids_per_time
-                        .per_start_time
-                        .range(time_range.max().inc()..)
-                        .next()
-                    {
-                        for &chunk_id in chunk_id_set {
-                            *candidates.entry(chunk_id).or_default() +=
-                                check_if_chunk_below_threshold(self, chunk_id);
-                        }
-                    }
-
-                    // Shared start times: 2 points each.
-                    {
-                        let chunk_id_set = temporal_chunk_ids_per_time
-                            .per_start_time
-                            .get(&time_range.min());
-                        for chunk_id in chunk_id_set.iter().flat_map(|set| set.iter().copied()) {
-                            *candidates.entry(chunk_id).or_default() +=
-                                check_if_chunk_below_threshold(self, chunk_id) * 2;
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut candidates = candidates.into_iter().collect_vec();
-        {
-            re_tracing::profile_scope!("sort_candidates");
-            candidates.sort_by_key(|(_chunk_id, points)| *points);
-            candidates.reverse();
-        }
-
-        candidates
-            .into_iter()
-            .filter(|(_chunk_id, points)| *points > 0)
-            .find_map(|(chunk_id, _points)| {
-                self.physical_chunks_per_chunk_id
-                    .get(&chunk_id)
-                    .map(Arc::clone)
-            })
     }
 
     /// Unconditionally drops all the data for a given `entity_path`.
@@ -952,7 +716,7 @@ impl ChunkStore {
                     .get(chunk_id)
                     .and_then(|chunk| chunk.row_id_range().map(|(min, _)| min))
                 {
-                    chunk_ids_per_min_row_id.remove(&min_row_id);
+                    chunk_ids_per_min_row_id.remove(&(min_row_id, *chunk_id));
                 }
             }
 
@@ -984,7 +748,7 @@ impl ChunkStore {
                     .get(chunk_id)
                     .and_then(|chunk| chunk.row_id_range().map(|(min, _)| min))
                 {
-                    chunk_ids_per_min_row_id.remove(&min_row_id);
+                    chunk_ids_per_min_row_id.remove(&(min_row_id, *chunk_id));
                 }
             }
 
@@ -1005,10 +769,8 @@ impl ChunkStore {
                 *temporal_physical_chunks_stats -= ChunkStoreChunkStats::from_chunk(chunk);
             });
 
-        let diffs: Vec<_> = dropped_static_chunks
-            .into_iter()
-            .chain(dropped_temporal_chunks)
-            .map(ChunkStoreDiff::deletion)
+        let diffs: Vec<_> = std::iter::chain(dropped_static_chunks, dropped_temporal_chunks)
+            .map(|chunk| ChunkStoreDiff::deletion(chunk, ChunkDeletionReason::ExplicitDrop))
             .collect();
 
         self.finalize_events(diffs)
@@ -1017,211 +779,16 @@ impl ChunkStore {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     use re_chunk::{TimeInt, TimePoint, Timeline};
     use re_log_types::example_components::{MyColor, MyLabel, MyPoint, MyPoints};
     use re_log_types::{build_frame_nr, build_log_time};
-    use re_sdk_types::components::Blob;
-    use re_types_core::ComponentDescriptor;
     use similar_asserts::assert_eq;
 
+    use crate::ChunkStoreConfig;
+
     use super::*;
-
-    // TODO(cmc): We could have more test coverage here, especially regarding thresholds etc.
-    // For now the development and maintenance cost doesn't seem to be worth it.
-    // We can re-assess later if things turns out to be shaky in practice.
-
-    #[test]
-    fn compaction_simple() -> anyhow::Result<()> {
-        re_log::setup_logging();
-
-        let mut store = ChunkStore::new(
-            re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "test_app"),
-            Default::default(),
-        );
-
-        let entity_path = EntityPath::from("this/that");
-
-        let row_id1 = RowId::new();
-        let row_id2 = RowId::new();
-        let row_id3 = RowId::new();
-        let row_id4 = RowId::new();
-        let row_id5 = RowId::new();
-        let row_id6 = RowId::new();
-        let row_id7 = RowId::new();
-        let row_id8 = RowId::new();
-        let row_id9 = RowId::new();
-        let row_id10 = RowId::new();
-
-        let timepoint1 = [(Timeline::new_sequence("frame"), 1)];
-        let timepoint2 = [(Timeline::new_sequence("frame"), 3)];
-        let timepoint3 = [(Timeline::new_sequence("frame"), 5)];
-        let timepoint4 = [(Timeline::new_sequence("frame"), 7)];
-        let timepoint5 = [(Timeline::new_sequence("frame"), 9)];
-
-        let points1 = &[MyPoint::new(1.0, 1.0)];
-        let points2 = &[MyPoint::new(2.0, 2.0)];
-        let points3 = &[MyPoint::new(3.0, 3.0)];
-        let points4 = &[MyPoint::new(4.0, 4.0)];
-        let points5 = &[MyPoint::new(5.0, 5.0)];
-
-        let chunk1 = Chunk::builder(entity_path.clone())
-            .with_component_batches(
-                row_id1,
-                timepoint1,
-                [(MyPoints::descriptor_points(), points1 as _)],
-            )
-            .with_component_batches(
-                row_id2,
-                timepoint2,
-                [(MyPoints::descriptor_points(), points2 as _)],
-            )
-            .with_component_batches(
-                row_id3,
-                timepoint3,
-                [(MyPoints::descriptor_points(), points3 as _)],
-            )
-            .build()?;
-        let chunk2 = Chunk::builder(entity_path.clone())
-            .with_component_batches(
-                row_id4,
-                timepoint4,
-                [(MyPoints::descriptor_points(), points4 as _)],
-            )
-            .with_component_batches(
-                row_id5,
-                timepoint5,
-                [(MyPoints::descriptor_points(), points5 as _)],
-            )
-            .build()?;
-        let chunk3 = Chunk::builder(entity_path.clone())
-            .with_component_batches(
-                row_id6,
-                timepoint1,
-                [(MyPoints::descriptor_points(), points1 as _)],
-            )
-            .with_component_batches(
-                row_id7,
-                timepoint2,
-                [(MyPoints::descriptor_points(), points2 as _)],
-            )
-            .with_component_batches(
-                row_id8,
-                timepoint3,
-                [(MyPoints::descriptor_points(), points3 as _)],
-            )
-            .build()?;
-        let chunk4 = Chunk::builder(entity_path.clone())
-            .with_component_batches(
-                row_id9,
-                timepoint4,
-                [(MyPoints::descriptor_points(), points4 as _)],
-            )
-            .with_component_batches(
-                row_id10,
-                timepoint5,
-                [(MyPoints::descriptor_points(), points5 as _)],
-            )
-            .build()?;
-
-        let chunk1 = Arc::new(chunk1);
-        let chunk2 = Arc::new(chunk2);
-        let chunk3 = Arc::new(chunk3);
-        let chunk4 = Arc::new(chunk4);
-
-        eprintln!("---\n{store}\ninserting {}", chunk1.id());
-
-        store.insert_chunk(&chunk1)?;
-
-        eprintln!("---\n{store}\ninserting {}", chunk2.id());
-
-        store.insert_chunk(&chunk2)?;
-
-        eprintln!("---\n{store}\ninserting {}", chunk3.id());
-
-        store.insert_chunk(&chunk3)?;
-
-        eprintln!("---\n{store}\ninserting {}", chunk4.id());
-
-        store.insert_chunk(&chunk4)?;
-
-        eprintln!("---\n{store}");
-
-        let got = store
-            .physical_chunks_per_chunk_id
-            .first_key_value()
-            .map(|(_id, chunk)| chunk)
-            .unwrap();
-
-        let expected = Chunk::builder_with_id(got.id(), entity_path.clone())
-            .with_component_batches(
-                row_id1,
-                timepoint1,
-                [(MyPoints::descriptor_points(), points1 as _)],
-            )
-            .with_component_batches(
-                row_id2,
-                timepoint2,
-                [(MyPoints::descriptor_points(), points2 as _)],
-            )
-            .with_component_batches(
-                row_id3,
-                timepoint3,
-                [(MyPoints::descriptor_points(), points3 as _)],
-            )
-            .with_component_batches(
-                row_id4,
-                timepoint4,
-                [(MyPoints::descriptor_points(), points4 as _)],
-            )
-            .with_component_batches(
-                row_id5,
-                timepoint5,
-                [(MyPoints::descriptor_points(), points5 as _)],
-            )
-            .with_component_batches(
-                row_id6,
-                timepoint1,
-                [(MyPoints::descriptor_points(), points1 as _)],
-            )
-            .with_component_batches(
-                row_id7,
-                timepoint2,
-                [(MyPoints::descriptor_points(), points2 as _)],
-            )
-            .with_component_batches(
-                row_id8,
-                timepoint3,
-                [(MyPoints::descriptor_points(), points3 as _)],
-            )
-            .with_component_batches(
-                row_id9,
-                timepoint4,
-                [(MyPoints::descriptor_points(), points4 as _)],
-            )
-            .with_component_batches(
-                row_id10,
-                timepoint5,
-                [(MyPoints::descriptor_points(), points5 as _)],
-            )
-            .build()?;
-
-        assert_eq!(1, store.physical_chunks_per_chunk_id.len());
-        assert_eq!(
-            expected,
-            **got,
-            "{}",
-            similar_asserts::SimpleDiff::from_str(
-                &format!("{expected}"),
-                &format!("{got}"),
-                "expected",
-                "got",
-            ),
-        );
-
-        Ok(())
-    }
 
     #[test]
     fn no_components() -> anyhow::Result<()> {
@@ -1454,6 +1021,93 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test for RR-4880: `rrd optimize` / `.collect(optimize=…)` lose static transforms.
+    ///
+    /// Both optimize paths route every chunk through `ChunkStore::insert_chunk`, which applies
+    /// auto-delete shadowed static chunk semantics. See [`preserves_static_transforms`] and RR-4887
+    /// for more info.
+    ///
+    /// This test reproduces that loss with three static chunks on the same entity, each carrying a
+    /// `Transform3D` for a distinct child frame. All three must be preserved.
+    #[test]
+    fn static_transforms_spread_across_chunks_are_preserved() -> anyhow::Result<()> {
+        re_log::setup_logging();
+
+        let mut store = ChunkStore::new(
+            re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "test_app"),
+            Default::default(),
+        );
+
+        let entity_path = EntityPath::from("tf_static");
+
+        // Three distinct frames, each in its own static chunk, all on the same entity, with
+        // increasing RowIds (as if logged over time). They share the same component columns but
+        // carry different child frames, so last-write-wins would clobber all but the last.
+        let child_frames = ["child0", "child1", "child2"];
+
+        for (i, child_frame) in child_frames.iter().enumerate() {
+            let transform = archetypes::Transform3D::default()
+                .with_child_frame(*child_frame)
+                .with_translation([i as f32, i as f32, i as f32]);
+            let chunk = Chunk::builder(entity_path.clone())
+                .with_archetype(RowId::new(), TimePoint::STATIC, &transform)
+                .build()?;
+            store.insert_chunk(&Arc::new(chunk))?;
+        }
+
+        let ChunkStoreChunkStats { num_rows, .. } = store.stats().static_chunks;
+        assert_eq!(
+            num_rows,
+            child_frames.len() as u64,
+            "all static transform rows spread across chunks should be preserved, \
+             but {num_rows} of {} survived",
+            child_frames.len(),
+        );
+
+        Ok(())
+    }
+
+    /// Counterpart to [`static_transforms_spread_across_chunks_are_preserved`]: non-transform
+    /// static data must *still* be deduplicated to the latest value.
+    //TODO(RR-4887): this test should no longer pass with this issue is resolved.
+    #[test]
+    fn static_non_transform_data_spread_across_chunks_is_deduplicated() -> anyhow::Result<()> {
+        re_log::setup_logging();
+
+        let mut store = ChunkStore::new(
+            re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "test_app"),
+            Default::default(),
+        );
+
+        let entity_path = EntityPath::from("camera");
+
+        let values = [
+            MyPoint::new(1.0, 1.0),
+            MyPoint::new(2.0, 2.0),
+            MyPoint::new(3.0, 3.0),
+        ];
+
+        for value in &values {
+            let chunk = Chunk::builder(entity_path.clone())
+                .with_component_batches(
+                    RowId::new(),
+                    TimePoint::STATIC,
+                    [(MyPoints::descriptor_points(), &[*value] as _)],
+                )
+                .build()?;
+            store.insert_chunk(&Arc::new(chunk))?;
+        }
+
+        let ChunkStoreChunkStats { num_rows, .. } = store.stats().static_chunks;
+        assert_eq!(
+            num_rows, 1,
+            "non-transform static data should be deduplicated to the latest value, \
+             but {num_rows} rows survived",
+        );
+
+        Ok(())
+    }
+
     /// Temporal data first, then static: `is_static` should transition and re-emit a `SchemaAddition`.
     #[test]
     fn schema_temporal_then_static() -> anyhow::Result<()> {
@@ -1524,136 +1178,6 @@ mod tests {
         Ok(())
     }
 
-    /// `insert_rrd_manifest` should emit a `SchemaAddition` with the manifest's columns.
-    #[test]
-    fn schema_addition_from_manifest() -> anyhow::Result<()> {
-        re_log::setup_logging();
-
-        let store_id =
-            re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "test_app");
-        let mut store = ChunkStore::new(store_id.clone(), Default::default());
-
-        let entity_path = EntityPath::from("this/that");
-        let tl = Timeline::new_sequence("frame");
-        let point = MyPoint::new(1.0, 1.0);
-
-        let chunks: Vec<Arc<Chunk>> = [10, 20]
-            .into_iter()
-            .map(|t| {
-                Arc::new(
-                    Chunk::builder(entity_path.clone())
-                        .with_component_batch(
-                            RowId::new(),
-                            TimePoint::from_iter([(tl, t)]),
-                            (MyPoints::descriptor_points(), &[point] as _),
-                        )
-                        .build()
-                        .unwrap(),
-                )
-            })
-            .collect();
-
-        let rrd_manifest = re_log_encoding::RrdManifest::build_in_memory_from_chunks(
-            store_id,
-            chunks.iter().map(|c| &**c),
-        )?;
-
-        let events = store.insert_rrd_manifest(rrd_manifest);
-        assert_eq!(events.len(), 2);
-        assert!(events[0].is_virtual_addition());
-        let schema_add = match &events[1].diff {
-            ChunkStoreDiff::SchemaAddition(sa) => sa,
-            other => panic!("expected SchemaAddition, got {other:?}"),
-        };
-        assert_eq!(schema_add.new_columns.len(), 1);
-        assert_eq!(schema_add.new_columns[0].entity_path, entity_path);
-        assert!(!schema_add.new_columns[0].components.is_empty());
-
-        // Inserting the same manifest again should NOT emit a second SchemaAddition.
-        let rrd_manifest2 = re_log_encoding::RrdManifest::build_in_memory_from_chunks(
-            re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "test_app"),
-            chunks.iter().map(|c| &**c),
-        )?;
-        let events2 = store.insert_rrd_manifest(rrd_manifest2);
-        assert!(
-            !events2.iter().any(|e| e.is_schema_addition()),
-            "re-inserting a manifest with the same columns should not emit SchemaAddition"
-        );
-
-        Ok(())
-    }
-
-    /// Manifest with temporal data followed by manifest with static data:
-    /// `is_static` should transition and re-emit a `SchemaAddition`.
-    #[test]
-    fn schema_static_transition_from_manifest() -> anyhow::Result<()> {
-        re_log::setup_logging();
-
-        let store_id =
-            re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "test_app");
-        let mut store = ChunkStore::new(store_id.clone(), Default::default());
-
-        let entity_path = EntityPath::from("this/that");
-        let tl = Timeline::new_sequence("frame");
-        let point = MyPoint::new(1.0, 1.0);
-
-        // First manifest: temporal-only data.
-        let temporal_chunk = Arc::new(
-            Chunk::builder(entity_path.clone())
-                .with_component_batch(
-                    RowId::new(),
-                    TimePoint::from_iter([(tl, 10)]),
-                    (MyPoints::descriptor_points(), &[point] as _),
-                )
-                .build()?,
-        );
-        let manifest_temporal = re_log_encoding::RrdManifest::build_in_memory_from_chunks(
-            store_id.clone(),
-            std::iter::once(&*temporal_chunk),
-        )?;
-
-        let events = store.insert_rrd_manifest(manifest_temporal);
-        assert_eq!(events.len(), 2);
-        assert!(events[0].is_virtual_addition());
-        let schema_add = match &events[1].diff {
-            ChunkStoreDiff::SchemaAddition(sa) => sa,
-            other => panic!("expected SchemaAddition, got {other:?}"),
-        };
-        assert!(
-            !schema_add.new_columns[0].components[0].is_static,
-            "first manifest is temporal-only"
-        );
-
-        // Second manifest: same component but with static data.
-        let static_chunk = Arc::new(
-            Chunk::builder(entity_path.clone())
-                .with_component_batch(
-                    RowId::new(),
-                    TimePoint::STATIC,
-                    (MyPoints::descriptor_points(), &[point] as _),
-                )
-                .build()?,
-        );
-        let manifest_static = re_log_encoding::RrdManifest::build_in_memory_from_chunks(
-            store_id,
-            std::iter::once(&*static_chunk),
-        )?;
-
-        let events = store.insert_rrd_manifest(manifest_static);
-        assert_eq!(events.len(), 2);
-        assert!(events[0].is_virtual_addition());
-        let schema_add = match &events[1].diff {
-            ChunkStoreDiff::SchemaAddition(sa) => sa,
-            other => panic!("expected SchemaAddition for is_static transition, got {other:?}"),
-        };
-        assert!(
-            schema_add.new_columns[0].components[0].is_static,
-            "component should now be is_static after static manifest"
-        );
-
-        Ok(())
-    }
-
     #[test]
     fn row_id_min_overwrites() -> anyhow::Result<()> {
         re_log::setup_logging();
@@ -1691,7 +1215,7 @@ mod tests {
             chunks: impl IntoIterator<Item = (RowId, ChunkId)>,
         ) {
             assert_eq!(
-                chunks.into_iter().collect::<BTreeMap<_, _>>(),
+                chunks.into_iter().collect::<BTreeSet<_>>(),
                 store.physical_chunk_ids_per_min_row_id
             );
         }
@@ -1765,191 +1289,6 @@ mod tests {
                 .unwrap()
                 .id();
             assert_chunk_ids_per_min_row_id(&store, [(row_id1_1, compacted_chunk_id)]);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn compaction_blobs() -> anyhow::Result<()> {
-        #![expect(clippy::cloned_ref_to_slice_refs)]
-
-        re_log::setup_logging();
-
-        // Create a store with a specific byte limit for testing
-        // Default chunk_max_bytes is 12 * 8 * 4096 = 393,216 bytes
-        let chunk_max_bytes = 300_000u64; // 300KB limit for easier testing
-        let mut store = ChunkStore::new(
-            re_log_types::StoreId::random(re_log_types::StoreKind::Recording, "test_app"),
-            ChunkStoreConfig {
-                chunk_max_bytes,
-                ..Default::default()
-            },
-        );
-
-        let entity_path = EntityPath::from("blob/data");
-
-        // Calculate blob sizes relative to the limit
-        let blob_size_1_3rd = (chunk_max_bytes / 3) as usize; // ~100KB
-        let blob_size_1_2nd = (chunk_max_bytes / 2) as usize; // ~150KB
-
-        // Create test data
-        let row_id1 = RowId::new();
-        let row_id2 = RowId::new();
-        let row_id3 = RowId::new();
-        let row_id4 = RowId::new();
-        let row_id5 = RowId::new();
-
-        let timepoint1 = [(Timeline::new_sequence("frame"), 1)];
-        let timepoint2 = [(Timeline::new_sequence("frame"), 2)];
-        let timepoint3 = [(Timeline::new_sequence("frame"), 3)];
-        let timepoint4 = [(Timeline::new_sequence("frame"), 4)];
-        let timepoint5 = [(Timeline::new_sequence("frame"), 5)];
-
-        // Create blobs of different sizes
-        let blob1 = Blob::from(vec![1u8; blob_size_1_3rd]); // 1/3 limit
-        let blob2 = Blob::from(vec![2u8; blob_size_1_2nd]); // 1/2 limit
-        let blob3 = Blob::from(vec![3u8; blob_size_1_2nd]); // 1/2 limit
-        let blob4 = Blob::from(vec![4u8; blob_size_1_2nd]); // 1/2 limit
-        let blob5 = Blob::from(vec![5u8; blob_size_1_3rd]); // 1/3 limit
-
-        // Create a simple descriptor for blob components
-        let blob_descriptor = ComponentDescriptor::partial("blob");
-
-        // Create chunks according to the pattern:
-        // 1. Chunk with blob 1/3rd the limit
-        let chunk1 = Chunk::builder(entity_path.clone())
-            .with_component_batches(
-                row_id1,
-                timepoint1,
-                [(
-                    blob_descriptor.clone(),
-                    &[blob1.clone()] as &dyn re_types_core::ComponentBatch,
-                )],
-            )
-            .build()?;
-
-        // 2. Chunk with three blobs 1/2 the limit (will be split across multiple chunks)
-        let chunk2 = Chunk::builder(entity_path.clone())
-            .with_component_batches(
-                row_id2,
-                timepoint2,
-                [(
-                    blob_descriptor.clone(),
-                    &[blob2.clone()] as &dyn re_types_core::ComponentBatch,
-                )],
-            )
-            .with_component_batches(
-                row_id3,
-                timepoint3,
-                [(
-                    blob_descriptor.clone(),
-                    &[blob3.clone()] as &dyn re_types_core::ComponentBatch,
-                )],
-            )
-            .with_component_batches(
-                row_id4,
-                timepoint4,
-                [(
-                    blob_descriptor.clone(),
-                    &[blob4.clone()] as &dyn re_types_core::ComponentBatch,
-                )],
-            )
-            .build()?;
-
-        // 3. Chunk with blob 1/3rd the limit
-        let chunk3 = Chunk::builder(entity_path.clone())
-            .with_component_batches(
-                row_id5,
-                timepoint5,
-                [(
-                    blob_descriptor.clone(),
-                    &[blob5.clone()] as &dyn re_types_core::ComponentBatch,
-                )],
-            )
-            .build()?;
-
-        let chunk1 = Arc::new(chunk1);
-        let chunk2 = Arc::new(chunk2);
-        let chunk3 = Arc::new(chunk3);
-
-        eprintln!(
-            "Inserting chunk1 (blob 1/3 limit: {} bytes)",
-            <Chunk as SizeBytes>::total_size_bytes(&chunk1),
-        );
-        store.insert_chunk(&chunk1)?;
-        eprintln!(
-            "Store has {} chunks",
-            store.physical_chunks_per_chunk_id.len()
-        );
-
-        eprintln!(
-            "Inserting chunk2 (3 blobs 1/2 limit each: {} bytes)",
-            <Chunk as SizeBytes>::total_size_bytes(&chunk2),
-        );
-        store.insert_chunk(&chunk2)?;
-        eprintln!(
-            "Store has {} chunks",
-            store.physical_chunks_per_chunk_id.len()
-        );
-
-        eprintln!(
-            "Inserting chunk3 (blob 1/3 limit: {} bytes)",
-            <Chunk as SizeBytes>::total_size_bytes(&chunk3),
-        );
-        store.insert_chunk(&chunk3)?;
-        eprintln!(
-            "Store has {} chunks",
-            store.physical_chunks_per_chunk_id.len()
-        );
-
-        // Verify the expected compaction results:
-        // Expected:
-        // - The first chunk was left untouched.
-        // - The second chunk was split into 3 smaller chunks.
-        // - The third chunk was left untouched.
-        // So we expect 5 chunks total.
-
-        eprintln!("Final store state:");
-        eprintln!("{store}");
-
-        // Check that we have the expected number of chunks after compaction
-        assert_eq!(
-            5,
-            store.physical_chunks_per_chunk_id.len(),
-            "Expected 4 chunks after compaction: [blob1], [blob2], [blob3], [blob4], [blob5]"
-        );
-
-        // Verify the chunks contain the expected data by checking their sizes
-        let mut chunk_sizes: Vec<_> = store
-            .physical_chunks_per_chunk_id
-            .values()
-            .map(|chunk| <Chunk as SizeBytes>::total_size_bytes(chunk))
-            .collect();
-        chunk_sizes.sort();
-
-        eprintln!("Chunk sizes: {chunk_sizes:?}");
-
-        let smallest_expected = <Chunk as SizeBytes>::total_size_bytes(&chunk1);
-        let largest_expected = <Chunk as SizeBytes>::total_size_bytes(&chunk2) / 3;
-
-        // Allow some tolerance for metadata overhead
-        let tolerance = 10_000u64; // 10KB tolerance
-
-        for &chunk_size in &chunk_sizes[0..2] {
-            assert!(
-                chunk_size >= smallest_expected.saturating_sub(tolerance)
-                    && chunk_size <= smallest_expected + tolerance,
-                "Smallest chunk size {chunk_size} should be around {smallest_expected} ± {tolerance}",
-            );
-        }
-
-        for &chunk_size in &chunk_sizes[2..] {
-            assert!(
-                chunk_size >= largest_expected.saturating_sub(tolerance)
-                    && chunk_size <= largest_expected + tolerance,
-                "Largest chunk size {chunk_size} should be around {largest_expected} ± {tolerance}",
-            );
         }
 
         Ok(())

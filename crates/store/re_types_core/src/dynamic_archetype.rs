@@ -5,7 +5,7 @@ use nohash_hasher::IntMap;
 use crate::reflection::ComponentDescriptorExt as _;
 use crate::{
     ArchetypeName, AsComponents, Component, ComponentDescriptor, ComponentIdentifier,
-    ComponentType, Loggable, SerializedComponentBatch, try_serialize_field,
+    ComponentType, SerializedComponentBatch, ToArrow, try_serialize_field,
 };
 
 /// A helper for logging a dynamically defined archetype to Rerun.
@@ -42,10 +42,9 @@ impl DynamicArchetype {
     #[inline]
     pub fn with_component_from_data(
         mut self,
-        field: impl AsRef<str>,
+        field: impl Into<ComponentIdentifier>,
         array: arrow::array::ArrayRef,
     ) -> Self {
-        let field = field.as_ref();
         let component = field.into();
 
         self.batches.insert(
@@ -68,7 +67,7 @@ impl DynamicArchetype {
     #[inline]
     pub fn with_component<C: Component>(
         self,
-        field: impl AsRef<str>,
+        field: impl Into<ComponentIdentifier>,
         loggable: impl IntoIterator<Item = impl Into<C>>,
     ) -> Self {
         self.with_component_override(field, C::name(), loggable)
@@ -78,13 +77,12 @@ impl DynamicArchetype {
     ///
     /// This method can be used to override the component type.
     #[inline]
-    pub fn with_component_override<L: Loggable>(
+    pub fn with_component_override<L: ToArrow>(
         mut self,
-        field: impl AsRef<str>,
+        field: impl Into<ComponentIdentifier>,
         component_type: impl Into<ComponentType>,
         loggable: impl IntoIterator<Item = impl Into<L>>,
     ) -> Self {
-        let field = field.as_ref();
         let component = field.into();
         let mut desc =
             ComponentDescriptor::partial(component).with_component_type(component_type.into());

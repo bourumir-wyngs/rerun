@@ -52,11 +52,11 @@ pub fn try_decode_message<'d, T: Deserialize<'d>>(msg: &'d [u8]) -> Result<T, Cd
 
     // Skip the representation identifier bytes (2), and the representation option bytes (2).
     if representation_identifier.is_big_endian() {
-        cdr_encoding::from_bytes::<T, byteorder::BigEndian>(&msg[4..])
+        re_cdr::from_bytes::<T, byteorder::BigEndian>(&msg[4..])
             .map(|(v, _)| v)
             .map_err(CdrError::CdrEncoding)
     } else {
-        cdr_encoding::from_bytes::<T, byteorder::LittleEndian>(&msg[4..])
+        re_cdr::from_bytes::<T, byteorder::LittleEndian>(&msg[4..])
             .map(|(v, _)| v)
             .map_err(CdrError::CdrEncoding)
     }
@@ -66,7 +66,7 @@ pub fn try_decode_message<'d, T: Deserialize<'d>>(msg: &'d [u8]) -> Result<T, Cd
 #[derive(Error, Debug)]
 pub enum CdrError {
     #[error("Failed to deserialize CDR-encoded message: {0}")]
-    CdrEncoding(#[from] cdr_encoding::Error),
+    CdrEncoding(#[from] re_cdr::Error),
 
     #[error("Failed to parse DDS message: {0}")]
     Dds(#[from] super::dds::DdsError),
@@ -74,6 +74,6 @@ pub enum CdrError {
     #[error("Message is not encoded using a CDR representation: `{0:?}`")]
     UnsupportedRepresentation(RepresentationIdentifier),
 
-    #[error("{0}")]
+    #[error("{0:#}")]
     Other(#[from] anyhow::Error),
 }

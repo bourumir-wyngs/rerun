@@ -3,8 +3,9 @@
 use arrow::array::RecordBatch;
 use pyo3::prelude::*;
 use pyo3::{Bound, PyResult};
-use re_grpc_client::write_table::viewer_client;
+use re_grpc_client::write_table::channel;
 use re_protos::sdk_comms::v1alpha1::message_proxy_service_client::MessageProxyServiceClient;
+use re_protos::sdk_comms::v1alpha1::viewer_control_service_client::ViewerControlServiceClient;
 
 use crate::catalog::to_py_err;
 use crate::utils::wait_for_future;
@@ -68,19 +69,28 @@ impl PyViewerClientInternal {
 
 /// Connection handle to the message proxy service.
 ///
-/// This handle is modelled after [`crate::catalog::ConnectionHandle`] and only concerned with
+/// This handle is modelled after [`crate::catalog::PyConnectionHandle`] and only concerned with
 /// table-related operations, most importantly `WriteTable`.
 // TODO(grtlr): In the future, we probably want to merge this with the other APIs.
 #[derive(Clone)]
 pub struct ViewerConnectionHandle {
     client: MessageProxyServiceClient<tonic::transport::Channel>,
+    control_client: ViewerControlServiceClient<tonic::transport::Channel>,
 }
 
 impl ViewerConnectionHandle {
     pub fn new(py: Python<'_>, origin: re_uri::Origin) -> PyResult<Self> {
-        let client = wait_for_future(py, viewer_client(origin.clone())).map_err(to_py_err)?;
+        let channel = wait_for_future(py, channel(origin.clone())).map_err(to_py_err)?;
 
-        Ok(Self { client })
+        let client = MessageProxyServiceClient::new(channel.clone())
+            .max_decoding_message_size(re_grpc_client::MAX_DECODING_MESSAGE_SIZE);
+        let control_client = ViewerControlServiceClient::new(channel)
+            .max_decoding_message_size(re_grpc_client::MAX_DECODING_MESSAGE_SIZE);
+
+        Ok(Self {
+            client,
+            control_client,
+        })
     }
 }
 
@@ -112,11 +122,9 @@ impl ViewerConnectionHandle {
     ) -> PyResult<()> {
         wait_for_future(
             py,
-            self.client
-                .save_screenshot(re_protos::sdk_comms::v1alpha1::SaveScreenshotRequest {
-                    view_id,
-                    file_path,
-                }),
+            self.control_client.save_screenshot(
+                re_protos::sdk_comms::v1alpha1::SaveScreenshotRequest { view_id, file_path },
+            ),
         )
         .map_err(to_py_err)?;
 

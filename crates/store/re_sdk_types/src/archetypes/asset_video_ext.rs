@@ -45,9 +45,9 @@ impl AssetVideo {
     /// Panics if the serialized blob data doesn't have the right datatype.
     #[cfg(feature = "video")]
     pub fn read_frame_timestamps_nanos(&self) -> Result<Vec<i64>, re_video::VideoLoadError> {
-        use re_types_core::Loggable as _;
+        use re_types_core::FromArrow as _;
 
-        use crate::datatypes::Blob;
+        use crate::encodings::Blob;
 
         re_tracing::profile_function!();
 
@@ -68,7 +68,6 @@ impl AssetVideo {
             blob_bytes,
             media_type.as_str(),
             "AssetVideo",
-            re_log_types::external::re_tuid::Tuid::new(),
         )?
         .frame_timestamps_nanos()
         .ok_or(re_video::VideoLoadError::NoTimescale)?

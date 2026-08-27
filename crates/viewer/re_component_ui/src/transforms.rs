@@ -1,10 +1,10 @@
 use re_sdk_types::components::TransformMat3x3;
-use re_sdk_types::datatypes::Mat3x3;
+use re_sdk_types::encodings::Mat3x3;
 use re_ui::UiExt as _;
 use re_viewer_context::MaybeMutRef;
 
 pub fn singleline_view_transform_mat3x3(
-    _ctx: &re_viewer_context::StoreViewContext<'_>,
+    _ctx: &re_viewer_context::AppContext<'_>,
     ui: &mut egui::Ui,
     value: &mut MaybeMutRef<'_, TransformMat3x3>,
 ) -> egui::Response {
@@ -16,7 +16,7 @@ pub fn singleline_view_transform_mat3x3(
 }
 
 pub fn multiline_view_transform_mat3x3(
-    _ctx: &re_viewer_context::StoreViewContext<'_>,
+    _ctx: &re_viewer_context::AppContext<'_>,
     ui: &mut egui::Ui,
     value: &mut MaybeMutRef<'_, TransformMat3x3>,
 ) -> egui::Response {

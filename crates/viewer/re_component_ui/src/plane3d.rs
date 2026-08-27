@@ -3,7 +3,7 @@ use re_sdk_types::external::glam;
 use re_ui::UiExt as _;
 use re_viewer_context::MaybeMutRef;
 
-use crate::datatype_uis::{edit_f32_float_raw, edit_or_view_vec3d_raw};
+use crate::encoding_uis::{edit_f32_float_raw, edit_or_view_vec3d_raw};
 use crate::response_utils::response_with_changes_of_inner;
 
 #[derive(PartialEq, Eq, Copy, Clone)]
@@ -75,7 +75,7 @@ impl TryFrom<AxisDirection> for glam::Vec3 {
 }
 
 pub fn edit_or_view_plane3d(
-    _ctx: &re_viewer_context::StoreViewContext<'_>,
+    _ctx: &re_viewer_context::AppContext<'_>,
     ui: &mut egui::Ui,
     value: &mut MaybeMutRef<'_, components::Plane3D>,
 ) -> egui::Response {
@@ -130,7 +130,7 @@ pub fn edit_or_view_plane3d(
 }
 
 pub fn multiline_edit_or_view_plane3d(
-    _ctx: &re_viewer_context::StoreViewContext<'_>,
+    _ctx: &re_viewer_context::AppContext<'_>,
     ui: &mut egui::Ui,
     value: &mut MaybeMutRef<'_, components::Plane3D>,
 ) -> egui::Response {

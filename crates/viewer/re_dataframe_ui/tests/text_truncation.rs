@@ -1,14 +1,16 @@
+mod common;
+
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use arrow::array::{Int32Array, RecordBatch, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use datafusion::prelude::SessionContext;
-use egui_kittest::Harness;
-use parking_lot::Mutex;
-use re_dataframe_ui::{DataFusionTableWidget, TableStatus};
+use re_async::AsyncRuntimeHandle;
+use re_dataframe_ui::{DataFusionTableWidget, TableBlueprints};
 use re_test_context::TestContext;
-use re_viewer_context::AsyncRuntimeHandle;
+use re_viewer_context::TableReference;
+
+use common::run_async_harness;
 
 #[tokio::test]
 async fn test_text_truncation() {
@@ -16,20 +18,27 @@ async fn test_text_truncation() {
     let test_context = TestContext::new();
     let runtime_handle = AsyncRuntimeHandle::from_current_tokio_runtime_or_wasmbindgen().unwrap();
 
-    let table_status = Arc::new(Mutex::new(None::<TableStatus>));
     let mut harness = test_context
         .setup_kittest_for_rendering_ui([2500.0, 200.0])
         .build_ui(|ui| {
             test_context.run_recording(&ui.ctx().clone(), |ctx| {
-                let status = DataFusionTableWidget::new(Arc::clone(&session_context), table_ref)
-                    .title("Text truncation")
-                    .show(ctx, &runtime_handle, ui);
-
-                table_status.lock().replace(status);
+                DataFusionTableWidget::new(
+                    Arc::clone(&session_context),
+                    table_ref,
+                    TableReference::local("test_table"),
+                )
+                .title("Text truncation")
+                .show(
+                    ctx.app_ctx,
+                    &runtime_handle,
+                    ui,
+                    &TableBlueprints::default(),
+                    &mut test_context.view_states.lock(),
+                );
             });
         });
 
-    run_async_harness(&mut harness, &table_status).await;
+    run_async_harness(&mut harness).await;
     // TODO(rerun-io/egui_table#50): We should add a `max_default_width` field to egui_table
     // to truncate the root-level arrow strings
     harness.snapshot("test_text_truncation");
@@ -75,30 +84,4 @@ fn prepare_session_context() -> (Arc<SessionContext>, &'static str) {
         .expect("Failed to register the table");
 
     (session_context, table_ref)
-}
-
-async fn run_async_harness(
-    harness: &mut Harness<'_>,
-    table_status: &Arc<Mutex<Option<TableStatus>>>,
-) {
-    let timeout = Duration::from_secs(20);
-    let start = Instant::now();
-    loop {
-        assert!(
-            start.elapsed() <= timeout,
-            "Test timed out waiting for table to load"
-        );
-
-        harness.run_steps(2);
-
-        tokio::task::yield_now().await;
-
-        let status = table_status.lock();
-        match status.as_ref() {
-            Some(TableStatus::InitialLoading | TableStatus::Updating) => {}
-            Some(TableStatus::Loaded) => break,
-            Some(TableStatus::Error(err)) => panic!("Failed to load the table: {err}"),
-            None => panic!("No table status (should not happen)"),
-        }
-    }
 }

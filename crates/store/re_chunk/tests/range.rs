@@ -3,7 +3,7 @@ use nohash_hasher::IntMap;
 use re_chunk::{Chunk, RangeQuery, RowId, TimePoint, Timeline, TimelineName};
 use re_log_types::AbsoluteTimeRange;
 use re_log_types::example_components::{MyColor, MyLabel, MyPoint, MyPoints};
-use re_types_core::{ComponentDescriptor, Loggable as _};
+use re_types_core::{ArrowDatatype as _, ComponentDescriptor};
 
 // ---
 
@@ -76,7 +76,7 @@ fn temporal_sorted() -> anyhow::Result<()> {
 
     {
         let query =
-            RangeQuery::with_extras(TimelineName::new("frame"), AbsoluteTimeRange::EVERYTHING);
+            RangeQuery::with_extras(TimelineName::from("frame"), AbsoluteTimeRange::EVERYTHING);
 
         let expected = Chunk::builder_with_id(chunk.id(), ENTITY_PATH)
             .with_sparse_component_batches(
@@ -354,7 +354,7 @@ fn static_sorted() -> anyhow::Result<()> {
         .build()?;
 
     let queries = [
-        RangeQuery::with_extras(TimelineName::new("frame"), AbsoluteTimeRange::EVERYTHING),
+        RangeQuery::with_extras(TimelineName::from("frame"), AbsoluteTimeRange::EVERYTHING),
         RangeQuery::with_extras(TimelineName::log_time(), AbsoluteTimeRange::new(1020, 1050)),
     ];
 
@@ -447,7 +447,7 @@ fn static_unsorted() -> anyhow::Result<()> {
         .build()?;
 
     let queries = [
-        RangeQuery::with_extras(TimelineName::new("frame"), AbsoluteTimeRange::EVERYTHING),
+        RangeQuery::with_extras(TimelineName::from("frame"), AbsoluteTimeRange::EVERYTHING),
         RangeQuery::with_extras(TimelineName::log_time(), AbsoluteTimeRange::new(1020, 1050)),
     ];
 

@@ -2,16 +2,18 @@ use egui::WidgetText;
 use re_chunk::EntityPath;
 use re_data_ui::item_ui::guess_instance_path_icon;
 use re_entity_db::InstancePath;
+use re_entity_db::entity_db::EntityDbClass;
 use re_log_types::{ComponentPath, TableId};
 use re_sdk_types::archetypes::RecordingInfo;
-use re_sdk_types::components::Timestamp;
+use re_sdk_types::components::{Name, Timestamp};
+use re_ui::list_item::LabelContent;
 use re_ui::syntax_highlighting::{
     InstanceInBrackets as InstanceWithBrackets, SyntaxHighlightedBuilder,
 };
 use re_ui::{SyntaxHighlighting as _, icons};
 use re_viewer_context::{
-    ContainerId, Contents, DataResultInteractionAddress, Item, ViewId, ViewerContext,
-    contents_name_style,
+    ContainerId, Contents, DataResultInteractionAddress, Item, RedapEntryKind, ViewId,
+    ViewerContext, contents_name_style,
 };
 use re_viewport_blueprint::ViewportBlueprint;
 
@@ -82,7 +84,12 @@ impl ItemTitle {
             }
 
             // TODO(#10566): There should be an `EntryName` in this `Item` arm.
-            Item::RedapEntry(entry) => Self::new(entry.entry_id.to_string(), &icons::DATASET),
+            Item::RedapEntry { kind, .. } => match kind {
+                RedapEntryKind::Entry(id) => Self::new(id.to_string(), &icons::DATASET),
+                RedapEntryKind::Folder(path_prefix) => {
+                    Self::new(path_prefix.clone(), &icons::DATASET)
+                }
+            },
 
             // TODO(lucasmerlin): Icon?
             Item::RedapServer(origin) => Self::new(origin.to_string(), &icons::DATASET),
@@ -94,13 +101,29 @@ impl ItemTitle {
     }
 
     pub fn from_store_id(ctx: &ViewerContext<'_>, store_id: &re_log_types::StoreId) -> Self {
+        // Match the priority used in the sources panel:
+        // 1. User-set recording name
+        // 2. Dataset segment ID (for remote data)
+        // 3. Start timestamp (most useful local fallback)
+        // 4. Application ID as last resort
         let title = if let Some(entity_db) = ctx.store_bundle().get(store_id) {
-            if let Some(started) = entity_db.recording_info_property::<Timestamp>(
+            if let Some(name) = entity_db
+                .recording_info_property::<Name>(RecordingInfo::descriptor_name().component)
+            {
+                name.to_string()
+            } else if let EntityDbClass::DatasetSegment(url) = entity_db.store_class()
+                && let Some(segment_id) = &url.segment_id
+            {
+                segment_id.as_str().to_owned()
+            } else if let Some(started) = entity_db.recording_info_property::<Timestamp>(
                 RecordingInfo::descriptor_start_time().component,
             ) {
+                // Use the same %H:%M:%S format the recording panel shows.
                 let time = re_log_types::Timestamp::from(started.0)
-                    .format_time_compact(ctx.app_options().timestamp_format);
-                format!("{} - {time}", store_id.application_id())
+                    .to_jiff_zoned(ctx.app_options().timestamp_format)
+                    .strftime("%H:%M:%S")
+                    .to_string();
+                format!("{} — {time}", store_id.application_id())
             } else {
                 store_id.application_id().to_string()
             }
@@ -163,12 +186,7 @@ impl ItemTitle {
                 &icons::COMPONENT_TEMPORAL
             },
         )
-        .with_tooltip(format!(
-            "{} component {} of entity '{}'",
-            if is_static { "Static" } else { "Temporal" },
-            component,
-            entity_path
-        ))
+        .with_tooltip(format!("{entity_path}:{component}"))
     }
 
     pub fn from_contents(
@@ -190,7 +208,7 @@ impl ItemTitle {
                     container_blueprint.container_kind,
                 )
             } else {
-                format!("{:?} container", container_blueprint.container_kind,)
+                format!("{:?} container", container_blueprint.container_kind)
             };
 
             let container_name = container_blueprint.display_name_or_default();
@@ -218,7 +236,7 @@ impl ItemTitle {
             let view_class = view.class(ctx.view_class_registry());
 
             let hover_text = if let Some(display_name) = view.display_name.as_ref() {
-                format!("{} view {display_name:?}", view_class.display_name(),)
+                format!("{} view {display_name:?}", view_class.display_name())
             } else {
                 format!("{} view", view_class.display_name())
             };
@@ -235,6 +253,15 @@ impl ItemTitle {
             Self::new(format!("Unknown view {view_id}"), &icons::VIEW_UNKNOWN)
                 .with_tooltip("Failed to find view in blueprint")
         }
+    }
+
+    /// The icon, label and label style as the content of a list item.
+    pub fn to_label_content(&self) -> LabelContent<'static> {
+        let mut content = LabelContent::new(self.label.clone()).with_icon(self.icon);
+        if let Some(label_style) = self.label_style {
+            content = content.label_style(label_style);
+        }
+        content
     }
 
     fn new(name: impl Into<egui::WidgetText>, icon: &'static re_ui::Icon) -> Self {

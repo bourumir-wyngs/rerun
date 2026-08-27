@@ -4,7 +4,9 @@ mod colormap;
 mod image_to_gpu;
 mod re_renderer_callback;
 
-pub use colormap::{colormap_edit_or_view_ui, colormap_to_re_renderer};
+pub use colormap::{
+    colormap_edit_or_view_ui, colormap_edit_or_view_ui_with_selection, colormap_to_re_renderer,
+};
 pub use image_to_gpu::{
     image_data_range_heuristic, image_to_gpu, required_shader_decode,
     texture_creation_desc_from_color_image,
@@ -18,32 +20,6 @@ use re_renderer::{
     },
 };
 pub use re_renderer_callback::new_renderer_callback;
-
-use crate::TensorStats;
-
-// ----------------------------------------------------------------------------
-
-/// Return whether a tensor should be assumed to be encoded in sRGB color space ("gamma space", no EOTF applied).
-pub fn tensor_decode_srgb_gamma_heuristic(
-    tensor_stats: &TensorStats,
-    data_type: re_sdk_types::tensor_data::TensorDataType,
-    channels: u32,
-) -> bool {
-    if matches!(channels, 1 | 3 | 4) {
-        let (min, max) = tensor_stats.finite_range;
-        if 0.0 <= min && max <= 255.0 {
-            // If the range is suspiciously reminding us of a "regular image", assume sRGB.
-            true
-        } else if data_type.is_float() && 0.0 <= min && max <= 1.0 {
-            // Floating point images between 0 and 1 are often sRGB as well.
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    }
-}
 
 // ----------------------------------------------------------------------------
 
@@ -105,6 +81,7 @@ pub fn render_image(
     image_rect_on_screen: egui::Rect,
     colormapped_texture: ColormappedTexture,
     texture_options: egui::TextureOptions,
+    view_id: re_renderer::ViewBuilderId,
     debug_name: re_renderer::Label,
 ) -> anyhow::Result<()> {
     re_tracing::profile_function!();
@@ -171,7 +148,7 @@ pub fn render_image(
         ..Default::default()
     };
 
-    let mut view_builder = ViewBuilder::new(render_ctx, target_config)?;
+    let mut view_builder = ViewBuilder::new(render_ctx, target_config, view_id)?;
 
     view_builder.queue_draw(
         render_ctx,

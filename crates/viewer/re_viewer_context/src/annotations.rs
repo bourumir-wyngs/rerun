@@ -11,13 +11,13 @@ use re_entity_db::EntityPath;
 use re_log_types::StoreId;
 use re_sdk_types::archetypes;
 use re_sdk_types::components::AnnotationContext;
-use re_sdk_types::datatypes::{AnnotationInfo, ClassDescription, ClassId, KeypointId, Utf8};
+use re_sdk_types::encodings::{AnnotationInfo, ClassDescription, ClassId, KeypointId};
 
 use super::auto_color_egui;
 
 const MISSING_ROW_ID: RowId = RowId::ZERO;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
 pub struct Annotations {
     row_id: RowId,
     class_map: HashMap<ClassId, CachedClassDescription>,
@@ -61,7 +61,7 @@ impl Annotations {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
 struct CachedClassDescription {
     class_description: ClassDescription,
     keypoint_map: HashMap<KeypointId, AnnotationInfo>,
@@ -100,7 +100,7 @@ impl ResolvedClassDescription<'_> {
     /// Merges class annotation info with keypoint annotation info (if existing respectively).
     pub fn annotation_info_with_keypoint(
         &self,
-        keypoint_id: re_sdk_types::datatypes::KeypointId,
+        keypoint_id: re_sdk_types::encodings::KeypointId,
     ) -> ResolvedAnnotationInfo {
         if let (Some(desc), Some(keypoint_map)) = (self.class_description, self.keypoint_map) {
             // Assuming that keypoint annotation is the rarer case, merging the entire annotation ahead of time
@@ -131,7 +131,7 @@ impl ResolvedClassDescription<'_> {
 
 // ----------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, re_byte_size::SizeBytes)]
 pub struct ResolvedAnnotationInfo {
     pub class_id: Option<ClassId>,
     pub annotation_info: Option<AnnotationInfo>,
@@ -168,48 +168,19 @@ impl ResolvedAnnotationInfo {
                 .map(|label| label.to_string())
         }
     }
-
-    #[inline]
-    pub fn label_utf8(&self, label: Option<Utf8>) -> Option<Utf8> {
-        if let Some(label) = label {
-            Some(label)
-        } else {
-            self.annotation_info.as_ref()?.label.clone()
-        }
-    }
-}
-
-impl re_byte_size::SizeBytes for ResolvedAnnotationInfo {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            class_id,
-            annotation_info,
-        } = self;
-        class_id.heap_size_bytes() + annotation_info.heap_size_bytes()
-    }
 }
 
 // ----------------------------------------------------------------------------
 
 /// Many [`ResolvedAnnotationInfo`], with optimization
 /// for a common case where they are all the same.
+#[derive(re_byte_size::SizeBytes)]
 pub enum ResolvedAnnotationInfos {
     /// All the same
     Same(usize, ResolvedAnnotationInfo),
 
     /// All different
     Many(Vec<ResolvedAnnotationInfo>),
-}
-
-impl re_byte_size::SizeBytes for ResolvedAnnotationInfos {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        match self {
-            Self::Same(_count, info) => info.heap_size_bytes(),
-            Self::Many(infos) => infos.heap_size_bytes(),
-        }
-    }
 }
 
 impl ResolvedAnnotationInfos {
@@ -241,7 +212,7 @@ impl ResolvedAnnotationInfos {
 
 // ----------------------------------------------------------------------------
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, re_byte_size::SizeBytes)]
 pub struct AnnotationMap(pub BTreeMap<EntityPath, Arc<Annotations>>);
 
 impl AnnotationMap {
@@ -321,6 +292,13 @@ impl AnnotationContextStoreSubscriber {
     pub fn subscription_handle() -> ChunkStoreSubscriberHandle {
         static SUBSCRIPTION: OnceLock<ChunkStoreSubscriberHandle> = OnceLock::new();
         *SUBSCRIPTION.get_or_init(ChunkStore::register_per_store_subscriber::<Self>)
+    }
+}
+
+impl re_byte_size::MemUsageTreeCapture for AnnotationContextStoreSubscriber {
+    fn capture_mem_usage_tree(&self) -> re_byte_size::MemUsageTree {
+        use re_byte_size::SizeBytes as _;
+        re_byte_size::MemUsageTree::Bytes(self.entities_with_annotation_context.total_size_bytes())
     }
 }
 

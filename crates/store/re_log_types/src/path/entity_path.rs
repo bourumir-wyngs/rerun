@@ -12,15 +12,8 @@ use crate::hash::Hash64;
 // ----------------------------------------------------------------------------
 
 /// A 64 bit hash of [`EntityPath`] with very small risk of collision.
-#[derive(Copy, Clone, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Eq, PartialOrd, Ord, re_byte_size::SizeBytes)]
 pub struct EntityPathHash(Hash64);
-
-impl re_byte_size::SizeBytes for EntityPathHash {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        self.0.heap_size_bytes()
-    }
-}
 
 impl EntityPathHash {
     /// Sometimes used as the hash of `None`.
@@ -97,13 +90,14 @@ impl std::fmt::Debug for EntityPathHash {
 ///     ])
 /// );
 /// ```
-#[derive(Clone, Eq)]
+#[derive(Clone, Eq, SizeBytes)]
 pub struct EntityPath {
     /// precomputed hash
     hash: EntityPathHash,
 
     // [`Arc`] used for cheap cloning, and to keep down the size of [`EntityPath`].
     // We mostly use the hash for lookups and comparisons anyway!
+    #[size_bytes(ignore)] // NOTE: we assume it's amortized due to the `Arc`
     parts: Arc<Vec<EntityPathPart>>,
 }
 
@@ -225,7 +219,8 @@ impl EntityPath {
             return true; // optimization!
         }
 
-        prefix.len() <= self.len() && self.iter().zip(prefix.iter()).all(|(a, b)| a == b)
+        prefix.len() <= self.len()
+            && std::iter::zip(self.iter(), prefix.iter()).all(|(a, b)| a == b)
     }
 
     /// If this path starts with the given prefix,
@@ -243,13 +238,14 @@ impl EntityPath {
     /// Is this a strict descendant of the given path.
     #[inline]
     pub fn is_descendant_of(&self, other: &Self) -> bool {
-        other.len() < self.len() && self.iter().zip(other.iter()).all(|(a, b)| a == b)
+        other.len() < self.len() && std::iter::zip(self.iter(), other.iter()).all(|(a, b)| a == b)
     }
 
     /// Is this a direct child of the other path.
     #[inline]
     pub fn is_child_of(&self, other: &Self) -> bool {
-        other.len() + 1 == self.len() && self.iter().zip(other.iter()).all(|(a, b)| a == b)
+        other.len() + 1 == self.len()
+            && std::iter::zip(self.iter(), other.iter()).all(|(a, b)| a == b)
     }
 
     /// Number of parts
@@ -290,7 +286,9 @@ impl EntityPath {
     }
 
     pub fn join(&self, other: &Self) -> Self {
-        self.iter().chain(other.iter()).cloned().collect()
+        std::iter::chain(self.iter(), other.iter())
+            .cloned()
+            .collect()
     }
 
     /// Helper function to iterate over all incremental [`EntityPath`]s from start to end, NOT including start itself.
@@ -315,7 +313,7 @@ impl EntityPath {
     /// If both paths are the same, the common ancestor is the path itself.
     pub fn common_ancestor(&self, other: &Self) -> Self {
         let mut common = Vec::new();
-        for (a, b) in self.iter().zip(other.iter()) {
+        for (a, b) in std::iter::zip(self.iter(), other.iter()) {
             if a == b {
                 common.push(a.clone());
             } else {
@@ -408,13 +406,6 @@ impl EntityPath {
     }
 }
 
-impl SizeBytes for EntityPath {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        0 // NOTE: we assume it's amortized due to the `Arc`
-    }
-}
-
 impl FromIterator<EntityPathPart> for EntityPath {
     fn from_iter<T: IntoIterator<Item = EntityPathPart>>(parts: T) -> Self {
         Self::new(parts.into_iter().collect())
@@ -459,14 +450,18 @@ impl From<EntityPath> for String {
     }
 }
 
-impl From<re_types_core::datatypes::EntityPath> for EntityPath {
+// Make `quiver::Column<EntityPath>` work (backed by a `Utf8` column).
+// Reading parses with `parse_forgiving` (via `From<String>`).
+quiver::newtype_datatype!(EntityPath, quiver::Utf8);
+
+impl From<re_types_core::encodings::EntityPath> for EntityPath {
     #[inline]
-    fn from(value: re_types_core::datatypes::EntityPath) -> Self {
+    fn from(value: re_types_core::encodings::EntityPath) -> Self {
         Self::parse_forgiving(&value.0)
     }
 }
 
-impl From<&EntityPath> for re_types_core::datatypes::EntityPath {
+impl From<&EntityPath> for re_types_core::encodings::EntityPath {
     #[inline]
     fn from(value: &EntityPath) -> Self {
         Self(value.to_string().into())
@@ -546,30 +541,20 @@ impl std::ops::Div<&'static str> for EntityPath {
 
 // ----------------------------------------------------------------------------
 
-use re_types_core::Loggable;
+use re_types_core::{ArrowDatatype, FromArrow, ToArrow};
 
 use super::entity_path_part::RESERVED_NAMESPACE_PREFIX;
 
 re_types_core::macros::impl_into_cow!(EntityPath);
 
-impl Loggable for EntityPath {
+impl ArrowDatatype for EntityPath {
     #[inline]
     fn arrow_datatype() -> arrow::datatypes::DataType {
-        re_types_core::datatypes::Utf8::arrow_datatype()
+        re_types_core::encodings::Utf8::arrow_datatype()
     }
+}
 
-    fn to_arrow_opt<'a>(
-        _data: impl IntoIterator<Item = Option<impl Into<std::borrow::Cow<'a, Self>>>>,
-    ) -> re_types_core::SerializationResult<arrow::array::ArrayRef>
-    where
-        Self: 'a,
-    {
-        Err(re_types_core::SerializationError::not_implemented(
-            "rerun.controls.EntityPath",
-            "EntityPaths are never nullable, use `to_arrow()` instead",
-        ))
-    }
-
+impl ToArrow for EntityPath {
     #[inline]
     fn to_arrow<'a>(
         data: impl IntoIterator<Item = impl Into<std::borrow::Cow<'a, Self>>>,
@@ -577,17 +562,19 @@ impl Loggable for EntityPath {
     where
         Self: 'a,
     {
-        re_types_core::datatypes::Utf8::to_arrow(
+        re_types_core::encodings::Utf8::to_arrow(
             data.into_iter()
                 .map(Into::into)
-                .map(|ent_path| re_types_core::datatypes::Utf8(ent_path.to_string().into())),
+                .map(|ent_path| re_types_core::encodings::Utf8(ent_path.to_string().into())),
         )
     }
+}
 
+impl FromArrow for EntityPath {
     fn from_arrow(
         array: &dyn ::arrow::array::Array,
     ) -> re_types_core::DeserializationResult<Vec<Self>> {
-        Ok(re_types_core::datatypes::Utf8::from_arrow(array)?
+        Ok(re_types_core::encodings::Utf8::from_arrow(array)?
             .into_iter()
             .map(|utf8| Self::from(utf8.to_string()))
             .collect())
@@ -596,7 +583,6 @@ impl Loggable for EntityPath {
 
 // ----------------------------------------------------------------------------
 
-#[cfg(feature = "serde")]
 impl serde::Serialize for EntityPath {
     #[inline]
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -604,7 +590,6 @@ impl serde::Serialize for EntityPath {
     }
 }
 
-#[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for EntityPath {
     #[inline]
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -762,7 +747,7 @@ mod tests {
                 .collect_vec();
             let result = EntityPath::short_names_with_disambiguation(paths.clone());
 
-            for (path, shortened) in paths.iter().zip(entities.iter().map(|e| e.1)) {
+            for (path, shortened) in std::iter::zip(&paths, entities.iter().map(|e| e.1)) {
                 assert_eq!(result[path], shortened);
             }
         }

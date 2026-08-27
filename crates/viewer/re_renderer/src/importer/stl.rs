@@ -26,7 +26,7 @@ pub fn load_stl_from_buffer(
     // https://github.com/hmeyer/stl_io/pull/26
     let name = Label::from("");
 
-    let (normals, triangles): (Vec<_>, Vec<_>) = reader
+    let triangles_and_normals: Vec<_> = reader
         .into_iter()
         .map(|triangle_res| {
             triangle_res.map(|triangle| {
@@ -40,16 +40,15 @@ pub fn load_stl_from_buffer(
                 )
             })
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(StlImportError::StlIoError)?
-        .into_iter()
-        .unzip();
+        .try_collect()
+        .map_err(StlImportError::StlIoError)?;
+    let (normals, triangles): (Vec<_>, Vec<_>) = triangles_and_normals.into_iter().unzip();
 
     let num_vertices = triangles.len() * 3;
 
     let material = mesh::Material {
         label: name.clone(),
-        index_range: 0..num_vertices as u32,
+        index_range: re_span::Span::from_start_len(0, num_vertices as u32),
         albedo: ctx.texture_manager_2d.white_texture_unorm_handle().clone(),
         albedo_factor: crate::Rgba::WHITE,
     };

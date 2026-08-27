@@ -16,5 +16,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-serde.workspace = true
+itertools.workspace = true
+re_cdr.workspace = true
+re_span.workspace = true
 thiserror.workspace = true

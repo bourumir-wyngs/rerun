@@ -8,8 +8,8 @@ Degree of transparency ranging from 0.0 (fully transparent) to 1.0 (fully opaque
 The final opacity value may be a result of multiplication with alpha values as specified by other color sources.
 Unless otherwise specified, the default value is 1.
 
-## Rerun datatype
-[`Float32`](../datatypes/float32.md)
+## Rerun encoding
+[`Float32`](../encodings/float32.md)
 
 
 ## Arrow datatype
@@ -26,8 +26,9 @@ Float32
 ## Used by
 
 * [`EncodedImage`](../archetypes/encoded_image.md)
-* [`GridMap`](../archetypes/grid_map.md?speculative-link)
+* [`GridMap`](../archetypes/grid_map.md)
 * [`Image`](../archetypes/image.md)
 * [`SegmentationImage`](../archetypes/segmentation_image.md)
 * [`VideoFrameReference`](../archetypes/video_frame_reference.md)
 * [`VideoStream`](../archetypes/video_stream.md)
+* [`VoxelGridMap`](../archetypes/voxel_grid_map.md)

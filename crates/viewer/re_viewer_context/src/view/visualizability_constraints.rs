@@ -147,13 +147,21 @@ impl SingleRequiredComponentConstraint {
                 component_type: incoming_component_type,
             }),
 
-            (false, true) => {
+            (false, true) => extract_nested_fields(incoming_arrow_datatype, |dt| {
+                self.physical_types.contains(dt)
+            })
+            .map(|selectors| DatatypeMatch::PhysicalDatatypeOnly {
+                arrow_datatype: incoming_arrow_datatype.clone(),
+                component_type: incoming_component_type,
+                selectors: selectors.into(),
+            })
+            .or_else(|| {
                 re_log::warn_once!(
                     "Component {incoming_component:?} matched semantic type {:?} but none of the expected physical arrow types {incoming_arrow_datatype:?} for this semantic type.",
                     self.semantic_type,
                 );
                 None
-            }
+            }),
         }
     }
 }
@@ -232,11 +240,11 @@ impl BufferAndFormatConstraint {
 
     /// The arrow datatype used to match the buffer component.
     ///
-    /// This is always [`re_sdk_types::datatypes::Blob`]'s arrow datatype, since all image-like
+    /// This is always [`re_sdk_types::encodings::Blob`]'s arrow datatype, since all image-like
     /// buffers are opaque byte blobs regardless of the specific image archetype.
     // TODO(andreas): It would be great if we could support `BinaryArray` as well!
     pub fn buffer_arrow_datatype() -> arrow::datatypes::DataType {
-        <re_sdk_types::datatypes::Blob as re_types_core::Loggable>::arrow_datatype()
+        <re_sdk_types::encodings::Blob as re_types_core::ArrowDatatype>::arrow_datatype()
     }
 
     /// The buffer component slot on the visualizer.

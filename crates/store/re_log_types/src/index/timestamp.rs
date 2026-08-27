@@ -50,8 +50,8 @@ impl Timestamp {
 // ------------------------------------------
 // Rerun types converters
 
-impl From<re_types_core::datatypes::TimeInt> for Timestamp {
-    fn from(time_int: re_types_core::datatypes::TimeInt) -> Self {
+impl From<re_types_core::encodings::TimeInt> for Timestamp {
+    fn from(time_int: re_types_core::encodings::TimeInt) -> Self {
         Self(time_int.0)
     }
 }
@@ -229,7 +229,7 @@ impl Timestamp {
                     }
                 };
 
-                format!("{formatted}{nanos}{suffix}",)
+                format!("{formatted}{nanos}{suffix}")
             }
         }
     }

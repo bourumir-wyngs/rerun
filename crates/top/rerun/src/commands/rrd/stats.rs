@@ -1,6 +1,10 @@
+use std::collections::BTreeMap;
+
 use ahash::{HashMap, HashMapExt as _};
 use itertools::Itertools as _;
+use re_chunk::Chunk;
 use re_log_encoding::ToApplication as _;
+use re_log_types::{EntityPath, TimelineName};
 use re_protos::log_msg::v1alpha1::log_msg::Msg;
 use re_quota_channel::send_crossbeam;
 
@@ -37,6 +41,9 @@ impl StatsCommand {
         let mut num_chunks_per_entity: HashMap<String, u64> = HashMap::new();
         let mut num_chunks_per_index: HashMap<String, u64> = HashMap::new();
         let mut num_chunks_per_component: HashMap<String, u64> = HashMap::new();
+        // Per entity, per timeline: `true` iff every chunk seen so far has this timeline sorted.
+        let mut timeline_is_sorted: BTreeMap<EntityPath, BTreeMap<TimelineName, bool>> =
+            BTreeMap::new();
         let mut num_rows = Vec::with_capacity(num_chunks as _);
         let mut num_static = 0u64;
         let mut num_indexes = Vec::with_capacity(num_chunks as _);
@@ -46,7 +53,7 @@ impl StatsCommand {
         let mut ipc_schema_size_bytes_uncompressed = Vec::with_capacity(num_chunks as _);
         let mut ipc_data_size_bytes_uncompressed = Vec::with_capacity(num_chunks as _);
 
-        let (rx_raw, _) = read_raw_rrd_streams_from_file_or_stdin(path_to_input_rrds);
+        let (rx_raw, rx_footers) = read_raw_rrd_streams_from_file_or_stdin(path_to_input_rrds);
 
         // Each message is accompanied by the original compressed payload size (in bytes).
         // For uncompressed messages, this equals the payload size.
@@ -122,6 +129,16 @@ impl StatsCommand {
                                 num_static += (stats.num_indexes == 0) as u64;
                                 num_indexes.push(stats.num_indexes);
                                 num_components.push(stats.num_components);
+                                for (entity_path, timeline_name, sorted) in
+                                    stats.timeline_sortedness
+                                {
+                                    let entry = timeline_is_sorted
+                                        .entry(entity_path)
+                                        .or_default()
+                                        .entry(timeline_name)
+                                        .or_insert(true);
+                                    *entry &= sorted;
+                                }
                             }
 
                             ipc_size_bytes_compressed
@@ -259,7 +276,7 @@ impl StatsCommand {
         }
 
         let print_ipc_size_bytes_stats = |mut ipc_size_bytes: Vec<u64>| {
-            ipc_size_bytes.sort();
+            ipc_size_bytes.sort_unstable();
 
             let ipc_size_bytes_total = ipc_size_bytes.iter().copied().sum::<u64>() as f64;
             let ipc_size_bytes_avg = ipc_size_bytes_total / ipc_size_bytes.len() as f64;
@@ -324,7 +341,233 @@ impl StatsCommand {
         println!("------------------------------");
         print_ipc_size_bytes_stats(ipc_data_size_bytes_uncompressed);
 
+        if !*no_decode {
+            println!();
+            println!("Unsorted timelines");
+            println!("------------------");
+            let entities_with_unsorted: Vec<&EntityPath> = timeline_is_sorted
+                .iter()
+                .filter(|(_, timelines)| timelines.values().any(|sorted| !*sorted))
+                .map(|(entity, _)| entity)
+                .collect();
+
+            if entities_with_unsorted.is_empty() {
+                println!("(none — every timeline on every chunk is sorted)");
+            } else {
+                println!(
+                    "{} entity(ies) had at least one chunk with an unsorted timeline. \
+                     For each such entity, all of its timelines are listed below:",
+                    re_format::format_uint(entities_with_unsorted.len())
+                );
+                for entity in entities_with_unsorted {
+                    println!("  {entity}");
+                    for (timeline, sorted) in &timeline_is_sorted[entity] {
+                        let status = if *sorted { "sorted" } else { "UNSORTED" };
+                        println!("    {timeline}: {status}");
+                    }
+                }
+            }
+        }
+
+        // The chunk index is parsed straight from the raw bytes, so these stats are available
+        // even with `--no-decode`.
+        println!();
+        println!("Chunk index");
+        println!("-----------");
+        let chunk_indexes = if let Ok((_size_bytes, footers)) = rx_footers.recv() {
+            print_chunk_index_stats(footers, *continue_on_error)?
+        } else {
+            println!("(none — the input stream did not contain any chunk index)");
+            Vec::new()
+        };
+
+        println!();
+        println!("Chunk index analysis");
+        println!("--------------------");
+
+        let recording_chunk_indexes: Vec<_> = chunk_indexes
+            .iter()
+            .filter(|chunk_index| chunk_index.store_id.is_recording())
+            .collect();
+
+        if recording_chunk_indexes.is_empty() {
+            println!(
+                "(not available — the input stream did not contain any chunk index; run `rerun rrd migrate` to migrate older files)"
+            );
+        } else {
+            for chunk_index in recording_chunk_indexes {
+                print_chunk_index_analysis(chunk_index);
+            }
+        }
+
         Ok(())
+    }
+}
+
+/// Prints statistics about the chunk index(es) carried by the trailing `::End` message(s) of the
+/// stream, i.e. the RRD footer.
+///
+/// Each chunk index catalogs every chunk in a single recording without requiring any of that chunk
+/// data to be decoded, so all of these stats are derived purely from the index.
+fn print_chunk_index_stats(
+    footers: Vec<(
+        crate::commands::InputSource,
+        anyhow::Result<re_log_encoding::RawRrdManifest>,
+    )>,
+    continue_on_error: bool,
+) -> anyhow::Result<Vec<re_log_encoding::RawRrdManifest>> {
+    if footers.is_empty() {
+        println!("(none — no chunk index was found)");
+        return Ok(Vec::new());
+    }
+
+    let num_chunk_indexes = footers.iter().filter(|(_, res)| res.is_ok()).count();
+    println!(
+        "num_chunk_indexes = {} (one per recording)",
+        re_format::format_uint(num_chunk_indexes)
+    );
+
+    let mut chunk_indexes = Vec::new();
+
+    for (source, res) in footers {
+        let chunk_index = match res {
+            Ok(chunk_index) => chunk_index,
+            Err(err) => {
+                re_log::error_once!(
+                    "failed to parse chunk index from {source}: {}",
+                    re_error::format(err)
+                );
+                if !continue_on_error {
+                    anyhow::bail!(
+                        "one or more corrupt chunk indexes in the input stream (check logs)"
+                    )
+                }
+                continue;
+            }
+        };
+
+        let num_chunks = chunk_index.data.num_rows() as u64;
+        let num_static_chunks = chunk_index.col_chunk_is_static()?.filter(|s| *s).count() as u64;
+        let num_entity_paths = chunk_index.col_chunk_entity_path()?.unique().count();
+        let byte_size_total: u64 = chunk_index.col_chunk_byte_size()?.sum();
+        let byte_size_uncompressed_total: u64 =
+            chunk_index.col_chunk_byte_size_uncompressed()?.sum();
+
+        let sha256 = re_log_encoding::sha256_to_hex(&chunk_index.sorbet_schema_sha256);
+
+        println!();
+        println!("Chunk index for {:?}", chunk_index.store_id);
+        println!(
+            "  num_chunks_indexed = {}",
+            re_format::format_uint(num_chunks)
+        );
+        println!(
+            "  num_static_chunks = {}",
+            re_format::format_uint(num_static_chunks)
+        );
+        println!(
+            "  num_entity_paths = {}",
+            re_format::format_uint(num_entity_paths)
+        );
+        println!(
+            "  num_columns = {}",
+            re_format::format_uint(chunk_index.data.num_columns())
+        );
+        println!(
+            "  sorbet_schema_num_fields = {}",
+            re_format::format_uint(chunk_index.sorbet_schema.fields.len())
+        );
+        println!("  sorbet_schema_sha256 = {sha256}");
+        println!(
+            "  chunk_byte_size_total (native) = {}",
+            re_format::format_bytes(byte_size_total as f64)
+        );
+        println!(
+            "  chunk_byte_size_uncompressed_total = {}",
+            re_format::format_bytes(byte_size_uncompressed_total as f64)
+        );
+
+        chunk_indexes.push(chunk_index);
+    }
+
+    Ok(chunk_indexes)
+}
+
+fn print_chunk_index_analysis(chunk_index: &re_log_encoding::RawRrdManifest) {
+    use re_chunk_optimizer::analyze_chunk_index;
+
+    let chunk_max_bytes = re_chunk_store::OptimizationProfile::OBJECT_STORE.chunk_max_bytes;
+    let analysis = match analyze_chunk_index(chunk_index, chunk_max_bytes) {
+        Ok(analysis) => analysis,
+        Err(err) => {
+            re_log::error_once!(
+                "failed to analyze chunk index for {:?}: {err}",
+                chunk_index.store_id
+            );
+            return;
+        }
+    };
+    let merge = &analysis.merge;
+
+    println!();
+    println!("Store {:?}", chunk_index.store_id);
+    println!(
+        "chunk index columns: {}",
+        re_format::format_uint(analysis.num_columns),
+    );
+
+    println!();
+    println!(
+        "Optimization check based on a {} chunk size target (`--profile object-store`)",
+        re_format::format_bytes(chunk_max_bytes as f64),
+    );
+
+    if merge.actual_chunks == 0 {
+        println!("(nothing to check — this recording has no temporal chunks)");
+        return;
+    }
+
+    // Label, value, and an optional trailing annotation. Values are right-aligned against each
+    // other so the magnitudes are comparable at a glance.
+    let rows = [
+        (
+            "theoretical lower bound",
+            re_format::format_uint(merge.achievable_chunks),
+            String::new(),
+        ),
+        (
+            "effective",
+            re_format::format_uint(merge.actual_chunks),
+            format!(" ({:.1}\u{d7})", merge.factor),
+        ),
+        (
+            "excess",
+            re_format::format_uint(merge.excess_chunks),
+            String::new(),
+        ),
+    ];
+
+    let label_width = rows
+        .iter()
+        .map(|(label, _, _)| label.chars().count() + 1) // +1 for the colon
+        .max()
+        .unwrap_or_default();
+    let value_width = rows
+        .iter()
+        .map(|(_, value, _)| value.chars().count())
+        .max()
+        .unwrap_or_default();
+
+    for (label, value, annotation) in &rows {
+        let label = format!("{label}:");
+        println!("  - {label:<label_width$} {value:>value_width$} chunks{annotation}");
+    }
+
+    println!();
+    if merge.looks_unoptimized() {
+        println!(
+            "\u{26a0}\u{fe0f} This recording may be unoptimized — consider running `rerun rrd optimize`"
+        );
     }
 }
 
@@ -354,6 +597,9 @@ struct ChunkStatsApplication {
     num_rows: u64,
     num_indexes: u64,
     num_components: u64,
+
+    /// Per-timeline sortedness for this chunk, scoped to its entity path.
+    timeline_sortedness: Vec<(EntityPath, TimelineName, bool)>,
 }
 
 fn compute_stats(app: bool, compressed_size: u64, msg: &Msg) -> anyhow::Result<Option<ChunkStats>> {
@@ -452,6 +698,23 @@ fn compute_stats(app: bool, compressed_size: u64, msg: &Msg) -> anyhow::Result<O
                 .collect_vec();
             let num_components = components.len() as _;
 
+            // Promote the batch to a `Chunk` so we can inspect per-timeline sortedness.
+            // Errors here mean the chunk is malformed in some other way — surface as an
+            // empty list rather than failing the whole stats run.
+            let timeline_sortedness = match Chunk::from_arrow_msg(&decoded) {
+                Ok(chunk) => chunk
+                    .timelines()
+                    .iter()
+                    .map(|(name, tc)| (chunk.entity_path().clone(), *name, tc.is_sorted()))
+                    .collect(),
+                Err(err) => {
+                    re_log::warn_once!(
+                        "Failed to promote ArrowMsg into a Chunk for sorted-timeline check: {err}"
+                    );
+                    Vec::new()
+                }
+            };
+
             Some(ChunkStatsApplication {
                 entity_path,
 
@@ -461,6 +724,8 @@ fn compute_stats(app: bool, compressed_size: u64, msg: &Msg) -> anyhow::Result<O
                 num_rows: decoded.batch.num_rows() as _,
                 num_indexes,
                 num_components,
+
+                timeline_sortedness,
             })
         } else {
             None

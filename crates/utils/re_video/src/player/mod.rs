@@ -2,12 +2,14 @@
 
 mod sample_decoder;
 
-use std::ops::Range;
 use std::time::Duration;
 
 use web_time::Instant;
 
-use crate::{DecodeSettings, FrameInfo, KeyframeIndex, SampleIndex, Time, VideoDeliveryMethod};
+use crate::{
+    DecodeSettings, FrameInfo, KeyframeIndex, SampleIndex, Span, Time, VideoDeliveryMethod,
+    VideoSource,
+};
 
 pub use sample_decoder::VideoSampleDecoder;
 
@@ -105,7 +107,9 @@ impl VideoPlayerError {
         match self {
             Self::UnloadedSampleData(_) => VideoPlaybackIssueSeverity::Loading,
             Self::Decoding(decode_error) => decode_error.severity(),
-            Self::InsufficientSampleData(_) => VideoPlaybackIssueSeverity::Informational,
+            Self::InsufficientSampleData(_) | Self::NegativeTimestamp => {
+                VideoPlaybackIssueSeverity::Informational
+            }
             _ => VideoPlaybackIssueSeverity::Error,
         }
     }
@@ -135,6 +139,28 @@ impl VideoPlaybackIssueSeverity {
             other => other,
         }
     }
+}
+
+pub trait GetVideoSource {
+    fn get_video_chunk(&self, source: VideoSource) -> &[u8];
+
+    fn require_video_source(&self, source: VideoSource);
+    fn indicate_video_source(&self, source: VideoSource);
+}
+
+pub struct VideoSliceSource<'a>(pub &'a [u8]);
+
+impl GetVideoSource for VideoSliceSource<'_> {
+    fn get_video_chunk(&self, source: VideoSource) -> &[u8] {
+        match source {
+            VideoSource::Span(span) => &self.0[span.range_usize()],
+            VideoSource::Id { .. } => &[],
+        }
+    }
+
+    fn require_video_source(&self, _source: VideoSource) {}
+
+    fn indicate_video_source(&self, _source: VideoSource) {}
 }
 
 /// Describes whether a decoder is lagging behind or not.
@@ -194,18 +220,8 @@ impl DecoderDelayState {
 ///
 /// A single video may use several decoders at a time to simultaneously decode frames at different timestamps.
 /// The id does not need to be globally unique, just unique enough to distinguish streams of the same video.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, re_byte_size::SizeBytes)]
 pub struct VideoPlayerStreamId(pub u64);
-
-impl re_byte_size::SizeBytes for VideoPlayerStreamId {
-    fn heap_size_bytes(&self) -> u64 {
-        0
-    }
-
-    fn is_pod() -> bool {
-        true
-    }
-}
 
 // --- Player configuration ---
 
@@ -329,22 +345,22 @@ impl<T: Default> Drop for VideoPlayer<T> {
 /// Looks backwards from the given sample index, and either request the first
 /// missing sample we find, or stop if we find a keyframe.
 ///
-/// This will also make sure to call `get_buffer` for all loaded samples between
+/// This will also make sure to call `get_video_chunk` for all loaded samples between
 /// the found index and the returned index, even if we hit an unloaded sample
 /// while looking for the keyframe. This ensures that we get an opportunity to
 /// mark those buffers as still being in use so that they don't get unloaded.
 ///
 /// Returns the index of the keyframe if found.
-pub fn request_keyframe_before<'a>(
+pub fn request_keyframe_before(
     video_description: &crate::VideoDataDescription,
     idx: SampleIndex,
-    get_buffer: &dyn Fn(re_tuid::Tuid) -> &'a [u8],
+    video_source: &dyn GetVideoSource,
 ) -> Result<KeyframeIndex, VideoPlayerError> {
     // Need to start from at least `samples.min_index()` since that's the index of the first sample.
-    let range = video_description.samples.min_index()..idx + 1;
+    let range = Span::from_start_end(video_description.samples.min_index(), idx + 1);
     if let Some((from_idx, s)) = video_description
         .samples
-        .iter_index_range_clamped(&range)
+        .iter_index_range_clamped(range)
         .rev()
         .find(|(_, s)| match s {
             crate::SampleMetadataState::Present(s) => s.is_sync,
@@ -368,14 +384,17 @@ pub fn request_keyframe_before<'a>(
             from_idx
         };
 
-        // Request all the sources from the unloaded/keyframe up until the current index to
-        // indicate that they should stay loaded.
+        // Touch every source from the unloaded/keyframe up until the current index
+        // so the host marks them as still in use. We don't need any specific
+        // sample's bytes here, so we pass `sub_id: None`.
         for (_, sample) in video_description
             .samples
-            .iter_index_range_clamped(&(from_idx..idx + 1))
+            .iter_index_range_clamped(Span::from_start_end(from_idx, idx + 1))
             .rev()
         {
-            get_buffer(sample.source_id());
+            if let Some(source) = sample.source_to_mark_in_use() {
+                video_source.require_video_source(source);
+            }
         }
 
         match s {
@@ -416,7 +435,10 @@ impl<T: Default> VideoPlayer<T> {
             description.human_readable_codec_string()
         );
 
-        if let Some(details) = description.encoding_details.as_ref()
+        // Image sequences can display images with higher bit depth.
+        let is_image_sequence = matches!(description.codec, crate::VideoCodec::ImageSequence(_));
+        if !is_image_sequence
+            && let Some(details) = description.encoding_details.as_ref()
             && let Some(bit_depth) = details.bit_depth
         {
             if bit_depth < 8 {
@@ -467,12 +489,12 @@ impl<T: Default> VideoPlayer<T> {
     /// The video data description may change over time by adding and removing samples and GOPs,
     /// but other properties are expected to be stable.
     // TODO(andreas): have to detect when decoder is playing catch-up and don't show images that we're not interested in.
-    pub fn frame_at<'a>(
+    pub fn frame_at(
         &mut self,
         requested_pts: Time,
         video_description: &crate::VideoDataDescription,
         update_output: &mut dyn FnMut(&mut T, &crate::Frame) -> Result<(), VideoPlayerError>,
-        get_video_buffer: &dyn Fn(re_tuid::Tuid) -> &'a [u8],
+        video_source: &dyn GetVideoSource,
     ) -> Result<PlayerFrameStatus, VideoPlayerError> {
         if requested_pts.0 < 0 {
             return Err(VideoPlayerError::NegativeTimestamp);
@@ -484,7 +506,7 @@ impl<T: Default> VideoPlayer<T> {
                 Ok(sample_idx) => sample_idx,
                 Err(sample_idx) => {
                     if let Some(sample_idx) = sample_idx {
-                        request_keyframe_before(video_description, sample_idx, get_video_buffer)?;
+                        request_keyframe_before(video_description, sample_idx, video_source)?;
                     }
 
                     self.reset(video_description)?;
@@ -505,29 +527,33 @@ impl<T: Default> VideoPlayer<T> {
             .and_then(|s| s.sample()); // This is only `None` if we no longer have the sample around, or the sample hasn't loaded yet.
         let requested_sample_pts =
             requested_sample.map_or(requested_pts, |s| s.presentation_timestamp);
+        let requested_sample_source = requested_sample.map(|s| s.source);
 
         // Ensure we have enough samples enqueued to the decoder to cover the request.
         // (This method also makes sure that the next few frames become available, so call this even if we already have the frame we want.)
-        self.enqueue_samples(video_description, requested_sample_idx, get_video_buffer)?;
+        self.enqueue_samples(video_description, requested_sample_idx, video_source)?;
 
         // Grab best decoded frame for the requested PTS and discard all earlier frames to save memory.
         self.sample_decoder
             // Use the `requested_pts` which may be a bit higher than the PTS of the latest-at sample for `requested_pts`.
             // This is to hedge against not well-behaved decoders, that may produce PTS values that
             // don't show up in the input data (that in and on its own is a bug, but this makes it more robust)
-            .process_incoming_frames_and_drop_earlier_than(requested_pts);
+            .process_incoming_frames_and_drop_earlier_than(requested_pts, video_description);
         if let Some(decoded_frame) = self.sample_decoder.oldest_available_frame() {
             self.decoder_delay_state = self.determine_new_decoder_delay_state(
                 video_description,
                 requested_sample,
-                decoded_frame.info.presentation_timestamp,
+                requested_sample_idx,
+                &decoded_frame.info,
             );
 
             // Update the output if it isn't already up to date and we're not waiting for the decoder to catch up.
             let current_frame_info = self.frame_info.as_ref();
-            if current_frame_info
-                .is_none_or(|info| info.presentation_timestamp != requested_sample_pts)
-                && self.decoder_delay_state != DecoderDelayState::Behind
+            if !is_frame_of_sample(
+                current_frame_info,
+                requested_sample_pts,
+                requested_sample_source,
+            ) && self.decoder_delay_state != DecoderDelayState::Behind
             {
                 let output = self.output.get_or_insert_with(T::default);
                 update_output(output, decoded_frame)?; // Update errors are very unusual, error out on those immediately.
@@ -540,14 +566,12 @@ impl<T: Default> VideoPlayer<T> {
         } else {
             // If the sample decoder didn't report a frame we naturally still use the last output.
             // This output may or may not be up to date, update the delay state accordingly!
-            let current_frame_info = self.frame_info.as_ref();
-            self.decoder_delay_state = if let Some(last_decoded_pts) =
-                current_frame_info.map(|info| info.presentation_timestamp)
-            {
+            self.decoder_delay_state = if let Some(last_decoded_frame) = self.frame_info.as_ref() {
                 self.determine_new_decoder_delay_state(
                     video_description,
                     requested_sample,
-                    last_decoded_pts,
+                    requested_sample_idx,
+                    last_decoded_frame,
                 )
             } else {
                 DecoderDelayState::Behind
@@ -595,11 +619,11 @@ impl<T: Default> VideoPlayer<T> {
     }
 
     /// Makes sure enough samples have been enqueued to cover the requested presentation timestamp.
-    fn enqueue_samples<'a>(
+    fn enqueue_samples(
         &mut self,
         video_description: &crate::VideoDataDescription,
         requested_sample_idx: SampleIndex,
-        get_video_buffer: &dyn Fn(re_tuid::Tuid) -> &'a [u8],
+        video_source: &dyn GetVideoSource,
     ) -> Result<(), VideoPlayerError> {
         re_tracing::profile_function!();
 
@@ -625,7 +649,7 @@ impl<T: Default> VideoPlayer<T> {
         // required for the encoder to work if we've already enqueued the frames,
         // but it does make it more stable to still have those in-memory.
         let requested_keyframe_idx =
-            request_keyframe_before(video_description, requested_sample_idx, get_video_buffer)
+            request_keyframe_before(video_description, requested_sample_idx, video_source)
                 .inspect_err(|_err| {
                     // We're already returning an error here.
                     let _res = self.reset(video_description);
@@ -659,7 +683,7 @@ impl<T: Default> VideoPlayer<T> {
                     video_description,
                     requested_keyframe_idx,
                     requested_sample_idx,
-                    get_video_buffer,
+                    video_source,
                 )?;
 
                 requested_keyframe_idx
@@ -673,7 +697,7 @@ impl<T: Default> VideoPlayer<T> {
                 video_description,
                 requested_keyframe_idx,
                 requested_sample_idx,
-                get_video_buffer,
+                video_source,
             )?;
 
             requested_keyframe_idx
@@ -701,19 +725,26 @@ impl<T: Default> VideoPlayer<T> {
                     source_id,
                     min_dts: _,
                 }) => {
-                    // So far we have only requested backwards from the requested
-                    // sample. This will request forward for when we're enqueueing
-                    // infront of a sample.
-                    get_video_buffer(*source_id);
-
                     // We require all samples and one additional we're enqueuing before the requested
                     // sample to be present.
                     //
                     // Usually `last_enqueued` is greater than `requested_sample_idx`
                     // since we stay ahead of the requested sample as described above.
                     if last_enqueued <= requested_sample_idx {
+                        video_source.require_video_source(crate::VideoSource::Id {
+                            id: *source_id,
+                            sub_id: None,
+                        });
+
                         return Err(UnloadedSampleDataError::ExpectedSampleNotLoaded.into());
                     }
+                    // So far we have only requested backwards from the requested
+                    // sample. This will request forward for when we're enqueueing
+                    // infront of a sample.
+                    video_source.indicate_video_source(crate::VideoSource::Id {
+                        id: *source_id,
+                        sub_id: None,
+                    });
 
                     break;
                 }
@@ -735,7 +766,7 @@ impl<T: Default> VideoPlayer<T> {
                     video_description,
                     next_keyframe_idx,
                     requested_sample_idx,
-                    get_video_buffer,
+                    video_source,
                 )?;
 
                 keyframe_idx = next_keyframe_idx;
@@ -746,18 +777,23 @@ impl<T: Default> VideoPlayer<T> {
                     .gop_sample_range_for_keyframe(keyframe_idx)
                     .ok_or(VideoPlayerError::BadData)?;
 
-                // Ensure the keyframe stays in memory by requesting its buffer.
-                if let Some(sample) = video_description.samples.get(keyframe_range.start) {
-                    get_video_buffer(sample.source_id());
+                // Touch the keyframe's source so the host marks it as still in
+                // use. We don't need the sample's bytes here.
+                if let Some(sample) = video_description.samples.get(keyframe_range.start)
+                    && let Some(source) = sample.source_to_mark_in_use()
+                {
+                    video_source.require_video_source(source);
                 }
 
-                let range = (last_enqueued + 1)
-                    ..keyframe_range.end.min(
+                let range = Span::from_start_end(
+                    last_enqueued + 1,
+                    keyframe_range.end().min(
                         requested_sample_idx
                             + self.sample_decoder.max_num_samples_to_enqueue_ahead()
                             + 1,
-                    );
-                self.enqueue_sample_range(video_description, &range, get_video_buffer)?;
+                    ),
+                );
+                self.enqueue_sample_range(video_description, range, video_source)?;
             }
         }
 
@@ -872,12 +908,12 @@ impl<T: Default> VideoPlayer<T> {
         Ok(())
     }
 
-    fn enqueue_keyframe_range<'a>(
+    fn enqueue_keyframe_range(
         &mut self,
         video_description: &crate::VideoDataDescription,
         keyframe_idx: KeyframeIndex,
         requested_sample_idx: SampleIndex,
-        get_video_buffer: &dyn Fn(re_tuid::Tuid) -> &'a [u8],
+        video_source: &dyn GetVideoSource,
     ) -> Result<(), VideoPlayerError> {
         let max_last_sample_idx =
             requested_sample_idx + self.sample_decoder.max_num_samples_to_enqueue_ahead();
@@ -886,9 +922,12 @@ impl<T: Default> VideoPlayer<T> {
             .ok_or(VideoPlayerError::BadData)?;
 
         if sample_range.start < max_last_sample_idx {
-            let sample_range = sample_range.start..sample_range.end.min(max_last_sample_idx + 1);
+            let sample_range = Span::from_start_end(
+                sample_range.start,
+                sample_range.end().min(max_last_sample_idx + 1),
+            );
 
-            self.enqueue_sample_range(video_description, &sample_range, get_video_buffer)
+            self.enqueue_sample_range(video_description, sample_range, video_source)
         } else {
             re_log::debug_panic!(
                 "[DEBUG] Tried to enqueue gop starting after max samples to enqueue"
@@ -900,11 +939,11 @@ impl<T: Default> VideoPlayer<T> {
     /// Enqueues sample range *within* a keyframe range.
     ///
     /// All samples have to belong to the same keyframe.
-    fn enqueue_sample_range<'a>(
+    fn enqueue_sample_range(
         &mut self,
         video_description: &crate::VideoDataDescription,
-        sample_range: &Range<SampleIndex>,
-        get_video_buffer: &dyn Fn(re_tuid::Tuid) -> &'a [u8],
+        sample_range: Span<SampleIndex>,
+        video_source: &dyn GetVideoSource,
     ) -> Result<(), VideoPlayerError> {
         for (sample_idx, sample) in video_description
             .samples
@@ -918,7 +957,7 @@ impl<T: Default> VideoPlayer<T> {
                 }
             };
             let chunk = sample
-                .get(get_video_buffer, sample_idx)
+                .get(video_source, sample_idx)
                 .ok_or(VideoPlayerError::BadData)?;
             self.sample_decoder.decode(chunk)?;
 
@@ -938,6 +977,7 @@ impl<T: Default> VideoPlayer<T> {
         self.last_requested = None;
         self.last_enqueued = None;
         self.signaled_end_of_video = false;
+        self.last_time_caught_up = None;
         // Do *not* reset the error state or last output.
         //
         // We want to keep track of the last error, and also be able to display
@@ -978,15 +1018,22 @@ impl<T: Default> VideoPlayer<T> {
         &self,
         video_description: &crate::VideoDataDescription,
         requested_sample: Option<&crate::SampleMetadata>,
-        last_decoded_frame_pts: Time,
+        requested_sample_idx: SampleIndex,
+        last_decoded_frame: &crate::FrameInfo,
     ) -> DecoderDelayState {
+        let last_decoded_frame_pts = last_decoded_frame.presentation_timestamp;
+
         let Some(requested_sample) = requested_sample else {
             // Desired sample doesn't exist. This should only happen if the video is being GC'ed from the back.
             // We're technically not catching up, but we may as well behave as if we are.
             return DecoderDelayState::Behind;
         };
 
-        if requested_sample.presentation_timestamp == last_decoded_frame_pts {
+        if is_frame_of_sample(
+            Some(last_decoded_frame),
+            requested_sample.presentation_timestamp,
+            Some(requested_sample.source),
+        ) {
             return DecoderDelayState::UpToDate;
         }
 
@@ -1001,9 +1048,14 @@ impl<T: Default> VideoPlayer<T> {
                 min_num_samples_to_enqueue_ahead + self.config.tolerated_output_delay_in_num_frames;
 
             let sample_idx_end = video_description.samples.next_index();
-            for (_, sample) in video_description.samples.iter_index_range_clamped(
-                &(sample_idx_end.saturating_sub(allowed_delay + 1)..sample_idx_end),
-            ) {
+            for (_, sample) in
+                video_description
+                    .samples
+                    .iter_index_range_clamped(Span::from_start_end(
+                        sample_idx_end.saturating_sub(allowed_delay + 1),
+                        sample_idx_end,
+                    ))
+            {
                 let Some(sample) = sample.sample() else {
                     continue;
                 };
@@ -1021,7 +1073,8 @@ impl<T: Default> VideoPlayer<T> {
                 if is_significantly_behind(
                     video_description,
                     requested_sample,
-                    last_decoded_frame_pts,
+                    requested_sample_idx,
+                    last_decoded_frame,
                     self.config.tolerated_output_delay_in_num_frames,
                 ) {
                     DecoderDelayState::Behind
@@ -1057,18 +1110,47 @@ fn treat_video_as_live_stream(
     }
 }
 
+/// Is this the frame decoded from the given sample?
+///
+/// Samples can share a presentation timestamp, so the source decides which of them a frame came from.
+///
+/// If either side doesn't know its source, the presentation timestamp is all we have to go on.
+fn is_frame_of_sample(
+    frame: Option<&crate::FrameInfo>,
+    sample_pts: Time,
+    sample_source: Option<VideoSource>,
+) -> bool {
+    frame.is_some_and(|frame| {
+        frame.presentation_timestamp == sample_pts
+            && Option::zip(frame.source, sample_source)
+                .is_none_or(|(frame_source, sample_source)| frame_source == sample_source)
+    })
+}
+
 /// Determine whether the decoder is catching up with the requested frame within a certain tolerance.
 fn is_significantly_behind(
     video_description: &crate::VideoDataDescription,
     requested_sample: &crate::SampleMetadata,
-    decoded_frame_pts: Time,
+    requested_sample_idx: SampleIndex,
+    decoded_frame: &crate::FrameInfo,
     tolerated_output_delay_in_num_frames: usize,
 ) -> bool {
     let requested_pts = requested_sample.presentation_timestamp;
+    let decoded_frame_pts = decoded_frame.presentation_timestamp;
 
     if decoded_frame_pts == requested_pts {
-        // Decoder caught up with request!
-        return false;
+        // Samples can share a timestamp, so measure the distance in samples.
+        // Only the source tells us which of them the frame was decoded from.
+        let Some(decoded_sample_idx) = decoded_frame
+            .source
+            .and_then(|source| video_description.sample_index_of_source(requested_pts, source))
+        else {
+            // Without a source we can't tell samples with the same timestamp apart.
+            return false;
+        };
+
+        return requested_sample_idx.saturating_sub(decoded_sample_idx)
+            > tolerated_output_delay_in_num_frames;
     }
 
     if decoded_frame_pts > requested_pts {

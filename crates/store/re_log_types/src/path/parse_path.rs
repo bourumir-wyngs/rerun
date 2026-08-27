@@ -11,6 +11,12 @@ use crate::{ComponentPath, DataPath, EntityPath, EntityPathPart, Instance, hash:
 static FORGIVING_PARSE_CACHE: LazyLock<RwLock<IntMap<Hash64, EntityPath>>> =
     LazyLock::new(|| RwLock::new(IntMap::default()));
 
+/// Approximate heap usage of the global forgiving path parse cache.
+pub fn forgiving_parse_cache_bytes_used() -> u64 {
+    use re_byte_size::SizeBytes as _;
+    FORGIVING_PARSE_CACHE.read().heap_size_bytes()
+}
+
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum PathParseError {
     #[error("Expected path, found empty string")]
@@ -42,6 +48,9 @@ pub enum PathParseError {
 
     #[error("Missing component")]
     MissingComponentIdentifier,
+
+    #[error(transparent)]
+    InvalidComponentIdentifier(#[from] re_types_core::InvalidComponentIdentifierError),
 
     #[error("Found trailing colon (:)")]
     TrailingColon,
@@ -107,7 +116,7 @@ impl std::str::FromStr for DataPath {
 
                 let field = join(&component_tokens[0..component_tokens_end]);
 
-                component = Some(field.into());
+                component = Some(ComponentIdentifier::try_new(field)?);
 
                 tokens.truncate(first_colon);
             } else {
@@ -279,9 +288,8 @@ fn entity_path_parts_from_tokens_strict(mut tokens: &[&str]) -> Result<Vec<Entit
 
         if token == "/" {
             return Err(PathParseError::DoubleSlash);
-        } else {
-            parts.push(EntityPathPart::parse_strict(token)?);
         }
+        parts.push(EntityPathPart::parse_strict(token)?);
 
         if let Some(next_token) = tokens.first() {
             if *next_token == "/" {
@@ -354,6 +362,7 @@ pub fn tokenize_by<'s>(path: &'s str, special_chars: &[u8]) -> Vec<&'s str> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::fmt::{Debug, Display};
     use std::str::FromStr;
 
@@ -412,14 +421,14 @@ mod tests {
         assert_eq!(parse("foo//bar"), Err(PathParseError::DoubleSlash));
 
         assert_eq!(parse("foo/bar/"), Err(PathParseError::TrailingSlash));
-        assert!(matches!(
+        assert_matches!(
             parse(r#"entity:component"#),
             Err(PathParseError::UnexpectedComponent { .. })
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             parse(r#"entity[#123]"#),
             Err(PathParseError::UnexpectedInstance(Instance(123)))
-        ));
+        );
 
         assert_eq!(parse("hallådär"), Ok(entity_path_vec!("hallådär")));
     }
@@ -461,7 +470,7 @@ mod tests {
     #[test]
     fn test_parse_component_path() {
         #[track_caller]
-        fn parse_ok(src: &str, entity_path: &str, component: &str) {
+        fn parse_ok(src: &str, entity_path: &str, component: &'static str) {
             test_parse_ok(
                 src,
                 &ComponentPath {
@@ -507,7 +516,12 @@ mod tests {
     #[test]
     fn test_parse_data_path() {
         #[track_caller]
-        fn parse_ok(src: &str, entity_path: &str, instance: Option<u64>, component: Option<&str>) {
+        fn parse_ok(
+            src: &str,
+            entity_path: &str,
+            instance: Option<u64>,
+            component: Option<&'static str>,
+        ) {
             test_parse_ok(
                 src,
                 &DataPath {
@@ -539,10 +553,10 @@ mod tests {
         parse_ok("/world/points", "/world/points", None, None);
 
         // Check that we catch invalid characters in identifiers/names:
-        assert!(matches!(
+        assert_matches!(
             DataPath::from_str(r#"hello there"#),
             Err(PathParseError::MissingEscape(' '))
-        ));
+        );
         assert!(DataPath::from_str(r#"hello_there"#).is_ok());
         assert!(DataPath::from_str(r#"hello-there"#).is_ok());
         assert!(DataPath::from_str(r#"hello.there"#).is_ok());

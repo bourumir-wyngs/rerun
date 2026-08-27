@@ -96,6 +96,7 @@ pub struct RenderContext {
     pub queue: wgpu::Queue,
 
     device_caps: DeviceCaps,
+    adapter_info: wgpu::AdapterInfo,
     config: RenderConfig,
     output_format_color: wgpu::TextureFormat,
 
@@ -222,6 +223,35 @@ impl Renderers {
             .get(key.0 as usize)
             .map(|r| r.as_ref())
     }
+
+    /// Returns a remap table where `remap[key.bits()]` is the `u8` sort key for that renderer.
+    ///
+    /// The sort key is the rank of each renderer's Rust type name ([`RendererExt::name`])
+    /// among all currently registered renderers, compared lexicographically. Because type
+    /// names are stable within a build, the relative ordering of any two renderers is too —
+    /// regardless of which was registered first in this session. This is what makes draw
+    /// order deterministic across sessions.
+    ///
+    /// Intended for use at sort time on packed `u8` [`RendererTypeId`] values.
+    pub(crate) fn name_sort_remap(&self) -> [u8; 256] {
+        // Unused slots remain 0; they won't appear in any drawable.
+        let mut remap = [0u8; 256];
+
+        // Sort (name, key) pairs by renderer type name.
+        let mut pairs: smallvec::SmallVec<[(&'static str, u8); 16]> = self
+            .renderers_by_key
+            .iter()
+            .enumerate()
+            .map(|(key, r)| (r.name(), key as u8))
+            .collect();
+        pairs.sort_by_key(|&(name, _)| name);
+
+        for (rank, (_name, key)) in pairs.into_iter().enumerate() {
+            remap[key as usize] = rank as u8;
+        }
+
+        remap
+    }
 }
 
 impl RenderContext {
@@ -272,6 +302,7 @@ impl RenderContext {
         }
 
         let device_caps = DeviceCaps::from_adapter(adapter)?;
+        let adapter_info = adapter.get_info();
         let config = config_provider(&device_caps);
 
         let frame_index_for_uncaptured_errors = Arc::new(AtomicU64::new(STARTUP_FRAME_IDX));
@@ -293,7 +324,7 @@ impl RenderContext {
             err_tracker
         };
 
-        log_adapter_info(&adapter.get_info());
+        log_adapter_info(&adapter_info);
 
         let mut gpu_resources = WgpuResourcePools::default();
         let global_bindings = GlobalBindings::new(&gpu_resources, &device);
@@ -333,6 +364,7 @@ impl RenderContext {
             device,
             queue,
             device_caps,
+            adapter_info,
             config,
             output_format_color,
             global_bindings,
@@ -535,14 +567,13 @@ This means, either a call to RenderContext::before_submit was omitted, or the pr
         self.renderers.read()
     }
 
-    /// Returns the global frame index of the active frame.
-    pub fn active_frame_idx(&self) -> u64 {
-        self.active_frame.frame_index
-    }
-
     /// Returns the device's capabilities.
     pub fn device_caps(&self) -> &DeviceCaps {
         &self.device_caps
+    }
+
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        &self.adapter_info
     }
 
     /// Returns the active render config.
@@ -670,6 +701,7 @@ pub fn adapter_info_summary(info: &wgpu::AdapterInfo) -> String {
         subgroup_min_size: _,
         subgroup_max_size: _,
         transient_saves_memory: _,
+        limit_bucket: _,
     } = &info;
 
     // Example values:

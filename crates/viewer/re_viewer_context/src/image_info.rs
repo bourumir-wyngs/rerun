@@ -4,7 +4,7 @@ use std::ops::RangeInclusive;
 use re_chunk::RowId;
 use re_log_types::hash::Hash64;
 use re_sdk_types::components::{self, Colormap};
-use re_sdk_types::datatypes::{Blob, ChannelDatatype, ColorModel, ImageFormat};
+use re_sdk_types::encodings::{Blob, ChannelDatatype, ColorModel, ImageFormat};
 use re_sdk_types::image::{ImageKind, rgb_from_yuv};
 use re_sdk_types::tensor_data::TensorElement;
 use re_sdk_types::{ComponentIdentifier, archetypes};
@@ -55,22 +55,23 @@ pub fn resolution_of_image_at(
         let video = ctx
             .store_context
             .memoizer(|c: &mut crate::VideoStreamCache| {
+                let codec = entity_db
+                    .latest_at_component::<components::VideoCodec>(
+                        entity_path,
+                        query,
+                        archetypes::EncodedImage::descriptor_media_type().component,
+                    )
+                    .map(|(_, c)| re_video::VideoCodec::from(c))
+                    .ok_or(crate::VideoStreamProcessingError::MissingCodec);
+                let codec = codec?;
+
                 c.entry(
                     entity_db,
                     entity_path,
                     *ctx.time_ctrl.timeline_name(),
                     ctx.app_options().video_decoder_settings(),
                     video_stream_sample_component,
-                    &|| {
-                        entity_db
-                            .latest_at_component::<components::VideoCodec>(
-                                entity_path,
-                                query,
-                                archetypes::EncodedImage::descriptor_media_type().component,
-                            )
-                            .map(|(_, c)| re_video::VideoCodec::from(c))
-                            .ok_or(crate::VideoStreamProcessingError::MissingCodec)
-                    },
+                    codec,
                 )
             });
 
@@ -83,74 +84,60 @@ pub fn resolution_of_image_at(
         }
     }
 
-    // Check for an encoded image.
-    let encoded_image_blob_component = archetypes::EncodedImage::descriptor_blob().component;
-    if let Some(((_time, _), _)) = entity_db.latest_at_component::<re_sdk_types::components::Blob>(
-        entity_path,
-        query,
-        encoded_image_blob_component,
-    ) {
-        let video = ctx
-            .store_context
-            .memoizer(|c: &mut crate::VideoStreamCache| {
-                c.entry(
-                    entity_db,
-                    entity_path,
-                    *ctx.time_ctrl.timeline_name(),
-                    ctx.app_options().video_decoder_settings(),
-                    encoded_image_blob_component,
-                    &|| {
-                        let media_type = entity_db
-                            .latest_at_component::<components::MediaType>(
-                                entity_path,
-                                query,
-                                archetypes::EncodedImage::descriptor_media_type().component,
-                            )
-                            .map(|(_, c)| c.to_string());
-
-                        Ok(re_video::VideoCodec::ImageSequence(media_type))
-                    },
-                )
-            });
-
-        if let Ok(video) = video
-            && let Some(encoding_details) = &video.read_arc().video_descr().encoding_details
-        {
-            return Some(components::Resolution::from(
-                encoding_details.coded_dimensions.map(|e| e as f32),
-            ));
-        }
-    }
-
-    // Check for an encoded depth image.
-    if let Some(((_time, row_id), blob)) = entity_db
-        .latest_at_component::<re_sdk_types::components::Blob>(
-            entity_path,
-            query,
-            archetypes::EncodedDepthImage::descriptor_blob().component,
-        )
-    {
-        let media_type = entity_db
-            .latest_at_component::<components::MediaType>(
+    // Check for an encoded image & encoded depth image.
+    let encoded_image_resolution = |image_blob_component, media_type_component| {
+        if let Some(((_time, _), _)) = entity_db
+            .latest_at_component::<re_sdk_types::components::Blob>(
                 entity_path,
                 query,
-                archetypes::EncodedDepthImage::descriptor_media_type().component,
+                image_blob_component,
             )
-            .map(|(_, c)| c);
+        {
+            let video = ctx
+                .store_context
+                .memoizer(|c: &mut crate::VideoStreamCache| {
+                    let media_type = entity_db
+                        .latest_at_component::<components::MediaType>(
+                            entity_path,
+                            query,
+                            media_type_component,
+                        )
+                        .map(|(_, c)| c.to_string());
 
-        let depth_image = ctx
-            .store_context
-            .memoizer(|c: &mut crate::ImageDecodeCache| {
-                c.entry_encoded_depth(
-                    row_id,
-                    archetypes::EncodedDepthImage::descriptor_blob().component,
-                    &blob,
-                    media_type.as_ref(),
-                )
-            });
+                    c.entry(
+                        entity_db,
+                        entity_path,
+                        *ctx.time_ctrl.timeline_name(),
+                        ctx.app_options().video_decoder_settings(),
+                        image_blob_component,
+                        re_video::VideoCodec::ImageSequence(media_type),
+                    )
+                });
 
-        if let Ok(depth_image) = depth_image {
-            return Some(depth_image.width_height_f32().into());
+            if let Ok(video) = video
+                && let Some(encoding_details) = &video.read_arc().video_descr().encoding_details
+            {
+                return Some(components::Resolution::from(
+                    encoding_details.coded_dimensions.map(|e| e as f32),
+                ));
+            }
+        }
+
+        None
+    };
+
+    for (image_blob_component, media_type_component) in [
+        (
+            archetypes::EncodedImage::descriptor_blob().component,
+            archetypes::EncodedImage::descriptor_media_type().component,
+        ),
+        (
+            archetypes::EncodedDepthImage::descriptor_blob().component,
+            archetypes::EncodedDepthImage::descriptor_media_type().component,
+        ),
+    ] {
+        if let Some(res) = encoded_image_resolution(image_blob_component, media_type_component) {
+            return Some(res);
         }
     }
 
@@ -185,18 +172,8 @@ impl ColormapWithRange {
 }
 
 /// Hash used for identifying blobs stored in a store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, re_byte_size::SizeBytes)]
 pub struct StoredBlobCacheKey(pub Hash64);
-
-impl re_byte_size::SizeBytes for StoredBlobCacheKey {
-    fn heap_size_bytes(&self) -> u64 {
-        0
-    }
-
-    fn is_pod() -> bool {
-        true
-    }
-}
 
 impl StoredBlobCacheKey {
     pub const ZERO: Self = Self(Hash64::ZERO);
@@ -580,7 +557,7 @@ fn get<T: bytemuck::Pod>(blob: &[u8], element_offset: usize) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use re_log_types::hash::Hash64;
-    use re_sdk_types::datatypes::ColorModel;
+    use re_sdk_types::encodings::ColorModel;
     use re_sdk_types::image::ImageChannelType;
 
     use super::ImageInfo;
@@ -593,8 +570,8 @@ mod tests {
         assert_eq!(elements.len(), 2 * 2);
         ImageInfo {
             buffer_content_hash: StoredBlobCacheKey(Hash64::ZERO), // unused
-            buffer: re_sdk_types::datatypes::Blob::from(bytemuck::cast_slice::<_, u8>(elements)),
-            format: re_sdk_types::datatypes::ImageFormat::from_color_model(
+            buffer: re_sdk_types::encodings::Blob::from(bytemuck::cast_slice::<_, u8>(elements)),
+            format: re_sdk_types::encodings::ImageFormat::from_color_model(
                 [2, 2],
                 color_model,
                 T::CHANNEL_TYPE,

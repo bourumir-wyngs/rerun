@@ -12,7 +12,7 @@ pub use write::Client;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod write_table;
 
-const MAX_DECODING_MESSAGE_SIZE: usize = u32::MAX as usize;
+pub const MAX_DECODING_MESSAGE_SIZE: usize = u32::MAX as usize;
 
 /// Wrapper with a nicer error message
 #[derive(Debug)]
@@ -39,26 +39,31 @@ impl TonicStatusError {
 
 impl std::fmt::Display for TonicStatusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // TODO(emilk): duplicated in `re_grpc_server`
-        let status = &self.0;
-
-        write!(f, "gRPC error")?;
-
-        if status.code() != tonic::Code::Unknown {
-            write!(f, ", code: '{}'", status.code())?;
-        }
-        if !status.message().is_empty() {
-            write!(f, ", message: {:?}", status.message())?;
-        }
-        // Binary data - not useful.
-        // if !status.details().is_empty() {
-        //     write!(f, ", details: {:?}", status.details())?;
-        // }
-        if !status.metadata().is_empty() {
-            write!(f, ", metadata: {:?}", status.metadata().as_ref())?;
-        }
-        Ok(())
+        // NOTE: duplicated in `re_grpc_server` and `re_redap_client`
+        fmt_tonic_status(f, &self.0)
     }
+}
+
+fn fmt_tonic_status(f: &mut std::fmt::Formatter<'_>, status: &tonic::Status) -> std::fmt::Result {
+    // The server message may come with details of its own, which must stay details:
+    // the status code belongs on the summary.
+    let mut error = re_error::StructuredError::parse(status.message());
+
+    if error.summary.is_empty() {
+        error.summary = "gRPC error".to_owned();
+    }
+
+    let code = status.code();
+    if code != tonic::Code::Unknown {
+        // The `Debug` name ("NotFound"), not tonic's long `Display` prose.
+        error.summary = format!("{} ({code:?})", error.summary);
+    }
+
+    if !status.metadata().is_empty() {
+        error.add_detail(format!("metadata: {:?}", status.metadata().as_ref()));
+    }
+
+    write!(f, "{error}")
 }
 
 impl From<tonic::Status> for TonicStatusError {
@@ -96,26 +101,4 @@ impl From<tonic::Status> for StreamError {
     fn from(value: tonic::Status) -> Self {
         Self::TonicStatus(value.into())
     }
-}
-
-// TODO(ab, andreas): This should be replaced by the use of `AsyncRuntimeHandle`. However, this
-// requires:
-// - `AsyncRuntimeHandle` to be moved lower in the crate hierarchy to be available here (unsure
-//   where).
-// - Make sure that all callers of `DataSource::stream` have access to an `AsyncRuntimeHandle`
-//   (maybe it should be in `AppContext`?).
-#[cfg(target_arch = "wasm32")]
-fn spawn_future<F>(future: F)
-where
-    F: std::future::Future<Output = ()> + 'static,
-{
-    wasm_bindgen_futures::spawn_local(future);
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn spawn_future<F>(future: F)
-where
-    F: std::future::Future<Output = ()> + 'static + Send,
-{
-    tokio::spawn(future);
 }

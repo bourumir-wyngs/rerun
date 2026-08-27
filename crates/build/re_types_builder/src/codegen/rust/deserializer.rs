@@ -3,9 +3,11 @@ use quote::{format_ident, quote};
 use re_log::debug_assert;
 
 use crate::codegen::rust::arrow::{
-    ArrowDataTypeTokenizer, is_backed_by_scalar_buffer, quote_fqname_as_type_path,
+    ArrowDataTypeTokenizer, quote_atomic_rust_type, quote_fqname_as_type_path,
 };
-use crate::codegen::rust::util::{is_tuple_struct_from_obj, quote_comment};
+use crate::codegen::rust::util::{
+    is_tuple_struct_from_obj, quote_comment, quote_default_value_for_datatype,
+};
 use crate::data_type::{AtomicDataType, DataType, UnionMode};
 use crate::{Object, Objects, TypeRegistry};
 
@@ -17,16 +19,22 @@ use crate::{Object, Objects, TypeRegistry};
 /// This short-circuits on error using the `try` (`?`) operator: the outer scope must be one that
 /// returns a `Result<_, DeserializationError>`!
 ///
-/// There is a 1:1 relationship between `quote_arrow_deserializer` and `Loggable::from_arrow_opt`:
+/// There is a 1:1 relationship between `quote_arrow_deserializer` and the two deserialization
+/// traits, selected by `elements_are_nullable`:
 /// ```ignore
 /// fn from_arrow_opt(data: &dyn ::arrow::array::Array) -> DeserializationResult<Vec<Option<Self>>> {
-///     Ok(#quoted_deserializer)
+///     Ok(#quoted_deserializer) // elements_are_nullable = true
+/// }
+///
+/// fn from_arrow(data: &dyn ::arrow::array::Array) -> DeserializationResult<Vec<Self>> {
+///     Ok(#quoted_deserializer) // elements_are_nullable = false
 /// }
 /// ```
 ///
 /// This tells you two things:
 /// - The runtime Arrow payload is always held in a variable `data`, identified as `data_src` below.
-/// - The returned `TokenStream` must always instantiates a `Vec<Option<Self>>`.
+/// - The returned `TokenStream` instantiates a `Vec<Option<Self>>` when the elements are nullable,
+///   and a `Vec<Self>` otherwise.
 ///
 /// ## Performance vs validation
 /// The deserializers are designed for maximum performance, assuming the incoming data is correct.
@@ -54,6 +62,7 @@ pub fn quote_arrow_deserializer(
     type_registry: &TypeRegistry,
     objects: &Objects,
     obj: &Object,
+    elements_are_nullable: bool,
 ) -> TokenStream {
     // Runtime identifier of the variable holding the Arrow payload (`&dyn ::arrow::array::Array`).
     let data_src = format_ident!("arrow_data");
@@ -63,55 +72,60 @@ pub fn quote_arrow_deserializer(
 
     let obj_fqname = obj.fqname.as_str();
     let is_enum = obj.is_enum();
-    let is_arrow_transparent = obj.datatype.is_none();
+    let is_arrow_transparent = obj.is_arrow_transparent();
     let is_tuple_struct = is_tuple_struct_from_obj(obj);
 
     if is_enum {
         // An enum is very similar to a transparent type.
-
-        // As a transparent type, it's not clear what this does or
-        // where it should come from. Also, it's not used in the internal
-        // implementation of `quote_arrow_field_deserializer` anyways.
-        // TODO(#6819): If we get rid of nullable components this will likely need to change.
-        let is_nullable = true; // Will be ignored
-
         let obj_field_fqname = format!("{obj_fqname}#enum");
 
         let quoted_deserializer = quote_arrow_field_deserializer(
             objects,
             datatype.to_logical_type(),
             &quoted_self_datatype, // we are transparent, so the datatype of `Self` is the datatype of our contents
-            is_nullable,
+            elements_are_nullable,
             &obj_field_fqname,
             &data_src,
             InnerRepr::NativeIterable,
         );
 
-        let quoted_remapping = quote! {
-            .map(|typ| {
-                match typ {
-                    Some(val) => {
-                        <Self as ::re_types_core::reflection::Enum>::try_from_integer(val).map(Some).ok_or_else(|| {
-                            DeserializationError::missing_union_arm(
-                                #quoted_self_datatype, "<invalid>", val as _,
-                            )
-                        })
-                    },
-                    None => Ok(None),
-                }
-            })
+        let quoted_remapping = if elements_are_nullable {
+            quote! {
+                .map(|typ| {
+                    match typ {
+                        Some(val) => {
+                            <Self as ::re_types_core::reflection::Enum>::try_from_integer(val).map(Some).ok_or_else(|| {
+                                DeserializationError::missing_union_arm(
+                                    #quoted_self_datatype, "<invalid>", val as _,
+                                )
+                            })
+                        },
+                        None => Ok(None),
+                    }
+                })
+            }
+        } else {
+            quote! {
+                .map(|val| {
+                    <Self as ::re_types_core::reflection::Enum>::try_from_integer(val).ok_or_else(|| {
+                        DeserializationError::missing_union_arm(
+                            #quoted_self_datatype, "<invalid>", val as _,
+                        )
+                    })
+                })
+            }
         };
 
         quote! {
             #quoted_deserializer
             #quoted_remapping
             // NOTE: implicit Vec<Result> to Result<Vec>
-            .collect::<DeserializationResult<Vec<Option<_>>>>()
+            .collect::<DeserializationResult<Vec<_>>>()
             .with_context(#obj_fqname)?
         }
     } else if is_arrow_transparent {
         // NOTE: Arrow transparent objects must have a single field, no more no less.
-        // The semantic pass would have failed already if this wasn't the case.
+        // The type registry asserts as much when it computes the datatype.
         let obj_field = &obj.fields[0];
         let obj_field_fqname = obj_field.fqname.as_str();
 
@@ -126,15 +140,36 @@ pub fn quote_arrow_deserializer(
 
         let field_datatype = type_registry.get(&obj_field.fqname);
 
+        // Plain values are only an option when nothing can be null — neither the elements nor the
+        // wrapped field — and the field's datatype has a non-nullable deserializer at all.
+        let field_is_nullable = elements_are_nullable
+            || obj_field.is_nullable
+            || !field_deserializer_handles_non_nullable(objects, &field_datatype);
+
         let quoted_deserializer = quote_arrow_field_deserializer(
             objects,
             &field_datatype,
             &quoted_self_datatype, // we are transparent, so the datatype of `Self` is the datatype of our contents
-            obj_field.is_nullable,
+            field_is_nullable,
             obj_field_fqname,
             &data_src,
             InnerRepr::NativeIterable,
         );
+
+        if !field_is_nullable {
+            // Plain, infallible values: no `Option` to unwrap and no `Result` to thread through.
+            let quoted_remapping = if is_tuple_struct {
+                quote!(.map(Self))
+            } else {
+                quote!(.map(|#data_dst| Self { #data_dst }))
+            };
+
+            return quote! {
+                #quoted_deserializer
+                #quoted_remapping
+                .collect::<Vec<_>>()
+            };
+        }
 
         let quoted_unwrapping = if obj_field.is_nullable {
             quote!(.map(Ok))
@@ -143,10 +178,11 @@ pub fn quote_arrow_deserializer(
             quote!(.map(|v| v.ok_or_else(DeserializationError::missing_data)))
         };
 
-        let quoted_remapping = if is_tuple_struct {
-            quote!(.map(|res| res.map(|v| Some(Self(v)))))
-        } else {
-            quote!(.map(|res| res.map(|#data_dst| Some(Self { #data_dst }))))
+        let quoted_remapping = match (is_tuple_struct, elements_are_nullable) {
+            (true, true) => quote!(.map(|res| res.map(|v| Some(Self(v))))),
+            (true, false) => quote!(.map(|res| res.map(Self))),
+            (false, true) => quote!(.map(|res| res.map(|#data_dst| Some(Self { #data_dst })))),
+            (false, false) => quote!(.map(|res| res.map(|#data_dst| Self { #data_dst }))),
         };
 
         quote! {
@@ -154,7 +190,7 @@ pub fn quote_arrow_deserializer(
             #quoted_unwrapping
             #quoted_remapping
             // NOTE: implicit Vec<Result> to Result<Vec>
-            .collect::<DeserializationResult<Vec<Option<_>>>>()
+            .collect::<DeserializationResult<Vec<_>>>()
             // NOTE: double context so the user can see the transparent shenanigans going on in the
             // error.
             .with_context(#obj_field_fqname)
@@ -162,7 +198,8 @@ pub fn quote_arrow_deserializer(
         }
     } else {
         // NOTE: This can only be struct or union/enum at this point.
-        match datatype.to_logical_type() {
+        // These branches always produce `Vec<Option<Self>>`; a non-nullable caller unwraps below.
+        let quoted_deserializer = match datatype.to_logical_type() {
             DataType::Struct(_) => {
                 let data_src_fields = format_ident!("{data_src}_fields");
                 let data_src_arrays = format_ident!("{data_src}_arrays");
@@ -176,7 +213,7 @@ pub fn quote_arrow_deserializer(
                         objects,
                         field_datatype,
                         &quote_datatype(field_datatype),
-                        obj_field.is_nullable,
+                        YIELD_OPTIONS,
                         obj_field.fqname.as_str(),
                         &data_src,
                         InnerRepr::NativeIterable,
@@ -237,11 +274,11 @@ pub fn quote_arrow_deserializer(
                     } else {
                         let (#data_src_fields, #data_src_arrays) = (#data_src.fields(), #data_src.columns());
 
-                        let arrays_by_name: ::std::collections::HashMap<_, _> = #data_src_fields
-                            .iter()
-                            .map(|field| field.name().as_str())
-                            .zip(#data_src_arrays)
-                            .collect();
+                        let arrays_by_name: ::std::collections::HashMap<_, _> = ::std::iter::zip(
+                            #data_src_fields.iter().map(|field| field.name().as_str()),
+                            #data_src_arrays,
+                        )
+                        .collect();
 
                         #(#quoted_field_deserializers;)*
 
@@ -315,7 +352,7 @@ pub fn quote_arrow_deserializer(
                     .enumerate()
                     .filter(|(_, obj_field)| {
                         // For unit fields we don't have to collect any data.
-                        obj_field.typ != crate::Type::Unit
+                        !obj_field.typ.is_unit()
                     })
                     .map(|(type_id, obj_field)| {
                         let data_dst = format_ident!("{}", obj_field.snake_case_name());
@@ -325,7 +362,7 @@ pub fn quote_arrow_deserializer(
                             objects,
                             field_datatype,
                             &quote_datatype(field_datatype),
-                            obj_field.is_nullable,
+                            YIELD_OPTIONS,
                             obj_field.fqname.as_str(),
                             &data_src,
                             InnerRepr::NativeIterable,
@@ -358,7 +395,7 @@ pub fn quote_arrow_deserializer(
                     let quoted_obj_field_name = format_ident!("{}", obj_field.snake_case_name());
                     let quoted_obj_field_type = format_ident!("{}", obj_field.pascal_case_name());
 
-                    if obj_field.typ == crate::Type::Unit {
+                    if obj_field.typ.is_unit() {
                         // TODO(andreas): Should we check there's enough nulls on the null array?
                         return quote! {
                             #typ => Self::#quoted_obj_field_type
@@ -455,6 +492,12 @@ pub fn quote_arrow_deserializer(
             }
 
             _ => unimplemented!("{datatype:#?}"),
+        };
+
+        if elements_are_nullable {
+            quoted_deserializer
+        } else {
+            quote_unwrap_options(&quoted_deserializer)
         }
     }
 }
@@ -469,14 +512,42 @@ enum InnerRepr {
     NativeIterable,
 }
 
+/// Passed as `yield_options` by callers that want `Option`s whatever the field's own nullability,
+/// because they inspect and unwrap them themselves.
+const YIELD_OPTIONS: bool = true;
+
+/// Does [`quote_arrow_field_deserializer`] yield plain values, rather than `Option`s, when told
+/// that the elements cannot be null?
+///
+/// Only the cheap cases are implemented; everything else still goes through `Option`s and is
+/// unwrapped by the caller.
+fn field_deserializer_handles_non_nullable(objects: &Objects, datatype: &DataType) -> bool {
+    datatype.enum_obj(objects).is_some()
+        || matches!(datatype.to_logical_type(), DataType::Atomic(_))
+}
+
+/// Unwraps a `Vec<Option<Self>>`-producing deserializer into a `Vec<Self>`-producing one.
+fn quote_unwrap_options(quoted_deserializer: &TokenStream) -> TokenStream {
+    quote! {
+        { #quoted_deserializer }
+            .into_iter()
+            .map(|v| v.ok_or_else(DeserializationError::missing_data))
+            .collect::<DeserializationResult<Vec<_>>>()?
+    }
+}
+
 /// This generates code that deserializes a runtime Arrow payload according to the specified `datatype`.
 ///
 /// The `datatype` comes from our compile-time Arrow registry, not from the runtime payload!
 /// If the datatype happens to be a struct or union, this will merely inject a runtime call to
-/// `Loggable::from_arrow_opt` and call it a day, preventing code bloat.
+/// `FromArrowOpt::from_arrow_opt` and call it a day, preventing code bloat.
 ///
 /// `data_src` is the runtime identifier of the variable holding the Arrow payload (`&dyn ::arrow::array::Array`).
-/// The returned `TokenStream` always instantiates a `Vec<Option<T>>`.
+///
+/// `yield_options` decides whether the generated iterator yields `Option<T>` or plain `T`.
+/// Plain values are cheaper — no validity bitmap to walk — but are only available for the
+/// datatypes listed in [`field_deserializer_handles_non_nullable`]; everything else ignores the
+/// flag and yields `Option`s regardless.
 ///
 /// This short-circuits on error using the `try` (`?`) operator: the outer scope must be one that
 /// returns a `Result<_, DeserializationError>`!
@@ -484,25 +555,30 @@ fn quote_arrow_field_deserializer(
     objects: &Objects,
     datatype: &DataType,
     quoted_datatype: &TokenStream,
-    is_nullable: bool,
+    yield_options: bool,
     obj_field_fqname: &str,
     data_src: &proc_macro2::Ident, // &dyn ::arrow::array::Array
     inner_repr: InnerRepr,
 ) -> TokenStream {
-    _ = is_nullable; // not yet used, will be needed very soon
-
     // If the inner object is an enum, then dispatch to its deserializer.
-    if let DataType::Object { fqname, .. } = datatype
-        && objects.get(fqname).is_some_and(|obj| obj.is_enum())
-    {
-        let fqname_use = quote_fqname_as_type_path(fqname);
-        return quote!(#fqname_use::from_arrow_opt(#data_src).with_context(#obj_field_fqname)?.into_iter());
+    if let Some(obj) = datatype.enum_obj(objects) {
+        let fqname_use = quote_fqname_as_type_path(&obj.fqname);
+        return if yield_options {
+            quote!(#fqname_use::from_arrow_opt(#data_src).with_context(#obj_field_fqname)?.into_iter())
+        } else {
+            quote!(#fqname_use::from_arrow(#data_src).with_context(#obj_field_fqname)?.into_iter())
+        };
     }
 
     match datatype.to_logical_type() {
         DataType::Atomic(atomic) => {
+            let iter_kind = if yield_options {
+                IteratorKind::OptionValue
+            } else {
+                IteratorKind::Value
+            };
             let quoted_iter_transparency =
-                quote_iterator_transparency(objects, datatype, IteratorKind::OptionValue, None);
+                quote_iterator_transparency(objects, datatype, iter_kind, None);
 
             let quoted_downcast = {
                 let cast_as = atomic.to_string();
@@ -515,6 +591,21 @@ fn quote_arrow_field_deserializer(
                     #quoted_downcast?
                     .values()
                 },
+                // NOTE: `into_iter` walks the validity bitmap to yield `Option`s. When the
+                // elements cannot be null, reading the values buffer skips that entirely.
+                InnerRepr::NativeIterable if !yield_options => {
+                    // A `BooleanBuffer` iterates by value; every other buffer iterates by reference.
+                    let quoted_copied =
+                        (atomic != &AtomicDataType::Boolean).then(|| quote!(.copied()));
+
+                    quote! {
+                        #quoted_downcast?
+                            .values()
+                            .iter()
+                            #quoted_copied
+                            #quoted_iter_transparency
+                    }
+                }
                 InnerRepr::NativeIterable => quote! {
                     #quoted_downcast?
                         .into_iter() // NOTE: automatically checks the bitmap on our behalf
@@ -538,13 +629,13 @@ fn quote_arrow_field_deserializer(
                     let arrow_data_buf = arrow_data.values();
                     let offsets = arrow_data.offsets();
 
-                    ZipValidity::new_with_validity(offsets.windows(2), arrow_data.nulls())
+                    ZipValidity::new_with_validity(offsets.array_windows(), arrow_data.nulls())
                         .map(|elem| {
-                            elem.map(|window| {
+                            elem.map(|&[start, end]| {
                                 // NOTE: Do _not_ use `Buffer::sliced`, it panics on malformed inputs.
 
-                                let start = window[0].as_usize();
-                                let end = window[1].as_usize();
+                                let start = start.as_usize();
+                                let end = end.as_usize();
                                 let len = end - start;
 
                                 // NOTE: It is absolutely crucial we explicitly handle the
@@ -605,14 +696,14 @@ fn quote_arrow_field_deserializer(
 
                 let offsets = #data_src.offsets();
                 ZipValidity::new_with_validity(
-                    offsets.windows(2),
+                    offsets.array_windows(),
                     #data_src.nulls(),
                 )
-                .map(|elem| elem.map(|window| {
+                .map(|elem| elem.map(|&[start, end]| {
                         // NOTE: Do _not_ use `Buffer::sliced`, it panics on malformed inputs.
 
-                        let start = window[0] as usize;
-                        let end = window[1] as usize;
+                        let start = start as usize;
+                        let end = end as usize;
                         let len = end - start;
 
                         // NOTE: It is absolutely crucial we explicitly handle the
@@ -644,7 +735,7 @@ fn quote_arrow_field_deserializer(
                 objects,
                 inner.data_type(),
                 &quote_datatype(inner.data_type()),
-                inner.is_nullable,
+                YIELD_OPTIONS,
                 obj_field_fqname,
                 &data_src_inner,
                 InnerRepr::NativeIterable,
@@ -662,6 +753,26 @@ fn quote_arrow_field_deserializer(
                 None,
             );
 
+            let is_enum = inner.data_type().enum_obj(objects).is_some();
+            let quoted_enum_missing_check = if is_enum {
+                quote! {
+                    if data.iter().any(Option::is_none) {
+                        return Err(DeserializationError::missing_data());
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            // Enums have no `Default` impl, so fall back to their first variant instead.
+            // (See the note below on why we need to fill in _something_ here.)
+            let quoted_unwrap = if is_enum {
+                let quoted_default_value =
+                    quote_default_value_for_datatype(objects, inner.data_type());
+                quote!(.map(|opt| opt.unwrap_or_else(|| #quoted_default_value)))
+            } else {
+                quote!(.map(Option::unwrap_or_default))
+            };
+
             let comment_note_unwrap =
                 quote_comment("NOTE: Unwrapping cannot fail: the length must be correct.");
 
@@ -674,7 +785,10 @@ fn quote_arrow_field_deserializer(
                     // datastructures for all of our children.
                     Vec::new()
                 } else {
-                    let offsets = (0..).step_by(#length).zip((#length..).step_by(#length).take(#data_src.len()));
+                    let offsets = ::std::iter::zip(
+                        (0..).step_by(#length),
+                        (#length..).step_by(#length).take(#data_src.len()),
+                    );
 
                     let #data_src_inner = {
                         let #data_src_inner = &**#data_src.values();
@@ -702,6 +816,8 @@ fn quote_arrow_field_deserializer(
                                 #[expect(unsafe_code, clippy::undocumented_unsafe_blocks)]
                                 let data = unsafe { #data_src_inner.get_unchecked(start..end) };
 
+                                #quoted_enum_missing_check
+
                                 // NOTE: The call to `Option::unwrap_or_default` is very important here.
                                 //
                                 // Since we can only get here if the outer entry is marked as
@@ -722,7 +838,7 @@ fn quote_arrow_field_deserializer(
                                 // is null.
                                 //
                                 // TODO(#2875): use MaybeUninit rather than requiring a default impl
-                                let data = data.iter().cloned().map(Option::unwrap_or_default);
+                                let data = data.iter().cloned() #quoted_unwrap;
                                 // The following would be the correct thing to do, but costs us way
                                 // too much performance-wise for something that only applies to
                                 // malformed inputs.
@@ -748,7 +864,7 @@ fn quote_arrow_field_deserializer(
         DataType::List(inner) => {
             let data_src_inner = format_ident!("{data_src}_inner");
 
-            let inner_repr = if is_backed_by_scalar_buffer(inner.data_type()) {
+            let inner_repr = if inner.data_type().backed_by_scalar_buffer() {
                 InnerRepr::ScalarBuffer
             } else {
                 InnerRepr::NativeIterable
@@ -758,7 +874,7 @@ fn quote_arrow_field_deserializer(
                 objects,
                 inner.data_type(),
                 &quote_datatype(inner.data_type()),
-                inner.is_nullable,
+                YIELD_OPTIONS,
                 obj_field_fqname,
                 &data_src_inner,
                 inner_repr,
@@ -832,14 +948,14 @@ fn quote_arrow_field_deserializer(
 
                     let offsets = #data_src.offsets();
                     ZipValidity::new_with_validity(
-                        offsets.windows(2),
+                        offsets.array_windows(),
                         #data_src.nulls(),
                     )
-                    .map(|elem| elem.map(|window| {
+                    .map(|elem| elem.map(|&[start, end]| {
                             // NOTE: Do _not_ use `Buffer::sliced`, it panics on malformed inputs.
 
-                            let start = window[0] as usize;
-                            let end = window[1] as usize;
+                            let start = start as usize;
+                            let end = end as usize;
 
                             // NOTE: It is absolutely crucial we explicitly handle the
                             // boundchecks manually first, otherwise rustc completely chokes
@@ -895,13 +1011,7 @@ fn quote_array_downcast(
     let cast_as = cast_as.to_token_stream();
     quote! {
         #arr
-            .as_any()
-            .downcast_ref::<#cast_as>()
-            .ok_or_else(|| {
-                let expected = #quoted_expected_datatype;
-                let actual = #arr.data_type().clone();
-                DeserializationError::datatype_mismatch(expected, actual)
-            })
+            .try_cast::<#cast_as>(|| #quoted_expected_datatype)
             .with_context(#location)
     }
 }
@@ -911,16 +1021,8 @@ enum IteratorKind {
     /// `Iterator<Item = DeserializationResult<Option<T>>>`.
     ResultOptionValue,
 
-    /// `Iterator<Item = Option<DeserializationResult<T>>>`.
-    #[expect(dead_code)] // currently unused
-    OptionResultValue,
-
     /// `Iterator<Item = Option<T>>`.
     OptionValue,
-
-    /// `Iterator<Item = DeserializationResult<T>>`.
-    #[expect(dead_code)] // currently unused
-    ResultValue,
 
     /// `Iterator<Item = T>`.
     Value,
@@ -949,7 +1051,8 @@ fn quote_iterator_transparency(
     } else {
         None
     };
-    let inner_is_arrow_transparent = inner_obj.is_some_and(|obj| obj.datatype.is_none());
+
+    let inner_is_arrow_transparent = inner_obj.is_some_and(|obj| obj.is_arrow_transparent());
 
     if inner_is_arrow_transparent {
         let inner_obj = inner_obj.as_ref().unwrap();
@@ -980,10 +1083,10 @@ fn quote_iterator_transparency(
         };
 
         match iter_kind {
-            IteratorKind::ResultOptionValue | IteratorKind::OptionResultValue => {
+            IteratorKind::ResultOptionValue => {
                 quote!(.map(|res_or_opt| res_or_opt.map(|res_or_opt| res_or_opt.map(#quoted_binding))))
             }
-            IteratorKind::OptionValue | IteratorKind::ResultValue => {
+            IteratorKind::OptionValue => {
                 quote!(.map(|res_or_opt| res_or_opt.map(#quoted_binding)))
             }
             IteratorKind::Value => quote!(.map(#quoted_binding)),
@@ -992,10 +1095,10 @@ fn quote_iterator_transparency(
         if let Some(extra_wrapper) = extra_wrapper {
             let quoted_binding = quote!(|v| #extra_wrapper(v));
             match iter_kind {
-                IteratorKind::ResultOptionValue | IteratorKind::OptionResultValue => {
+                IteratorKind::ResultOptionValue => {
                     quote!(.map(|res_or_opt| res_or_opt.map(|res_or_opt| res_or_opt.map(#quoted_binding))))
                 }
-                IteratorKind::OptionValue | IteratorKind::ResultValue => {
+                IteratorKind::OptionValue => {
                     quote!(.map(|res_or_opt| res_or_opt.map(#quoted_binding)))
                 }
                 IteratorKind::Value => quote!(.map(#quoted_binding)),
@@ -1013,7 +1116,7 @@ fn quote_iterator_transparency(
 /// allowing us to map directly to slices rather than iterating. The ability to use this optimization is
 /// determined by [`should_optimize_buffer_slice_deserialize`].
 ///
-/// There is a 1:1 relationship between `quote_arrow_deserializer_buffer_slice` and `Loggable::from_arrow`:
+/// There is a 1:1 relationship between `quote_arrow_deserializer_buffer_slice` and `FromArrow::from_arrow`:
 /// ```ignore
 /// fn from_arrow(data: &dyn ::arrow::array::Array) -> DeserializationResult<Vec<Self>> {
 ///     Ok(#quoted_deserializer_)
@@ -1031,12 +1134,12 @@ pub fn quote_arrow_deserializer_buffer_slice(
 
     let datatype = &type_registry.get(&obj.fqname);
 
-    let is_arrow_transparent = obj.datatype.is_none();
+    let is_arrow_transparent = obj.is_arrow_transparent();
     let is_tuple_struct = is_tuple_struct_from_obj(obj);
 
     if is_arrow_transparent {
         // NOTE: Arrow transparent objects must have a single field, no more no less.
-        // The semantic pass would have failed already if this wasn't the case.
+        // The type registry asserts as much when it computes the datatype.
         debug_assert!(obj.fields.len() == 1);
         let obj_field = &obj.fields[0];
         let obj_field_fqname = obj_field.fqname.as_str();
@@ -1131,24 +1234,61 @@ fn quote_arrow_field_deserializer_buffer_slice(
                 &data_src_inner,
             );
 
+            let quoted_datatype = quote_datatype(datatype);
+            let quoted_length = proc_macro2::Literal::i32_suffixed(
+                i32::try_from(*length).expect("fixed-size-list length must fit in an i32"),
+            );
             let quoted_downcast = {
                 let cast_as = quote!(arrow::array::FixedSizeListArray);
-                quote_array_downcast(
-                    obj_field_fqname,
-                    data_src,
-                    cast_as,
-                    &quote_datatype(datatype),
-                )
+                quote_array_downcast(obj_field_fqname, data_src, cast_as, &quoted_datatype)
             };
+
+            // Fully spell out the target type of the cast: type inference fails for
+            // nested fixed-size lists, where only the outermost type is pinned down.
+            let quoted_elem_type = quote_buffer_slice_element_type(datatype);
 
             quote! {{
                 let #data_src = #quoted_downcast?;
 
+                // Downcasting to `FixedSizeListArray` succeeds for _any_ list width,
+                // so check the width explicitly rather than let the cast below trip over it.
+                if #data_src.value_length() != #quoted_length {
+                    return Err(DeserializationError::datatype_mismatch(
+                        #quoted_datatype, #data_src.data_type().clone(),
+                    )).with_context(#obj_field_fqname);
+                }
+
                 let #data_src_inner = &**#data_src.values();
-                bytemuck::cast_slice::<_, [_; #length]>(#quoted_inner)
+
+                // NOTE: `try_cast_slice` rather than `cast_slice`: the child buffer of a
+                // `FixedSizeListArray` may be longer than `len * width`, and deserializers
+                // must never panic on malformed data.
+                bytemuck::try_cast_slice::<_, #quoted_elem_type>(#quoted_inner)
+                    .map_err(|err| DeserializationError::ValidationError(err.to_string()))
+                    .with_context(#obj_field_fqname)?
             }}
         }
 
+        _ => unimplemented!("{datatype:#?}"),
+    }
+}
+
+/// The native Rust type of a buffer-slice-deserialized element, fully spelled out
+/// (e.g. `[[half::f16; 3]; 15]`), so that the generated `bytemuck` casts don't have
+/// to rely on type inference.
+fn quote_buffer_slice_element_type(datatype: &DataType) -> TokenStream {
+    match datatype.to_logical_type() {
+        DataType::Atomic(atomic) => {
+            assert!(
+                atomic.backed_by_scalar_buffer(),
+                "{atomic:#?} not supported by the buffer-slice fast path"
+            );
+            quote_atomic_rust_type(*atomic)
+        }
+        DataType::FixedSizeList(inner, length) => {
+            let quoted_inner = quote_buffer_slice_element_type(inner.data_type());
+            quote!([#quoted_inner; #length])
+        }
         _ => unimplemented!("{datatype:#?}"),
     }
 }
@@ -1160,35 +1300,40 @@ fn quote_arrow_field_deserializer_buffer_slice(
 ///
 /// Note that nullabillity is kind of weird since it's technically a property of the field
 /// rather than the datatype.
-/// Components can only be used by archetypes so they should never be nullable, but for datatypes
+/// Components can only be used by archetypes so they should never be nullable, but for encodings
 /// we might need both.
 ///
 /// This should always be checked before using [`quote_arrow_deserializer_buffer_slice`].
 pub fn should_optimize_buffer_slice_deserialize(
+    objects: &Objects,
     obj: &Object,
     type_registry: &TypeRegistry,
 ) -> bool {
-    let is_arrow_transparent = obj.datatype.is_none();
+    let is_arrow_transparent = obj.is_arrow_transparent();
     if is_arrow_transparent {
         let typ = type_registry.get(&obj.fqname);
         let obj_field = &obj.fields[0];
-        !obj_field.is_nullable && should_optimize_buffer_slice_deserialize_datatype(&typ)
+        !obj_field.is_nullable && should_optimize_buffer_slice_deserialize_datatype(objects, &typ)
     } else {
         false
     }
 }
 
 /// Whether or not this datatype allows for the buffer slice optimizations.
-fn should_optimize_buffer_slice_deserialize_datatype(typ: &DataType) -> bool {
+fn should_optimize_buffer_slice_deserialize_datatype(objects: &Objects, typ: &DataType) -> bool {
     match typ {
         DataType::Atomic(atomic) => {
             !matches!(atomic, AtomicDataType::Null | AtomicDataType::Boolean)
         }
         DataType::Object { datatype, .. } => {
-            should_optimize_buffer_slice_deserialize_datatype(datatype)
+            typ.enum_obj(objects).is_none()
+                && should_optimize_buffer_slice_deserialize_datatype(objects, datatype)
         }
         DataType::FixedSizeList(field, _) => {
-            should_optimize_buffer_slice_deserialize_datatype(field.data_type())
+            // A wrapper-object element would break the generated `bytemuck` casts, which
+            // produce bare nested arrays rather than wrapper structs.
+            !matches!(field.data_type(), DataType::Object { .. })
+                && should_optimize_buffer_slice_deserialize_datatype(objects, field.data_type())
         }
         _ => false,
     }

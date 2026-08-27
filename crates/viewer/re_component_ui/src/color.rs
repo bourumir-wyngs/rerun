@@ -1,11 +1,11 @@
-use re_sdk_types::datatypes::Rgba32;
+use re_sdk_types::encodings::Rgba32;
 use re_ui::UiExt as _;
 use re_viewer_context::MaybeMutRef;
 
 use crate::color_swatch::ColorSwatch;
 
 pub fn edit_rgba32(
-    _ctx: &re_viewer_context::StoreViewContext<'_>,
+    _ctx: &re_viewer_context::AppContext<'_>,
     ui: &mut egui::Ui,
     value: &mut MaybeMutRef<'_, impl std::ops::DerefMut<Target = Rgba32>>,
 ) -> egui::Response {
@@ -24,7 +24,7 @@ fn edit_rgba32_impl<'a>(
 }
 
 pub fn edit_rgba32_array(
-    _ctx: &re_viewer_context::StoreViewContext<'_>,
+    _ctx: &re_viewer_context::AppContext<'_>,
     ui: &mut egui::Ui,
     colors: &mut MaybeMutRef<'_, Vec<re_sdk_types::components::Color>>,
 ) -> egui::Response {

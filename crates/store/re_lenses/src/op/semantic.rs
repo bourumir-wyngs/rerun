@@ -111,7 +111,7 @@ impl Transform for TimeSpecToNanos {
     fn transform(&self, source: &StructArray) -> Result<Option<Self::Target>, Error> {
         let (Some(seconds_array), Some(nanos_array)) = (
             Self::get_field_from_variants::<Int64Type>(source, &["seconds", "sec"])?,
-            Self::get_field_from_variants::<Int32Type>(source, &["nanos", "nsec"])?,
+            Self::get_field_from_variants::<Int32Type>(source, &["nanos", "nanosec", "nsec"])?,
         ) else {
             return Ok(None);
         };
@@ -149,9 +149,11 @@ impl Transform for StringToVideoCodecUInt32 {
                                 "h264" => VideoCodec::H264,
                                 "h265" => VideoCodec::H265,
                                 "av1" => VideoCodec::AV1,
+                                "vp8" => VideoCodec::VP8,
+                                "vp9" => VideoCodec::VP9,
                                 _ => {
                                     return Err(Error::UnexpectedValue {
-                                        expected: &["h264", "h265", "av1"],
+                                        expected: &["h264", "h265", "av1", "vp8", "vp9"],
                                         actual: codec_str.to_owned(),
                                     });
                                 }
@@ -219,20 +221,35 @@ impl Transform for RgbaStructToUInt32 {
 }
 
 /// Converts binary data (i32 offsets) to a list of `u8` values.
+///
+/// If the binary data is already a list of `u8` values, it is passed through unchanged.
 pub fn binary_to_list_uint8()
 -> impl Fn(&arrow::array::ArrayRef) -> Result<Option<arrow::array::ArrayRef>, Error> + Send + Sync {
     move |source: &arrow::array::ArrayRef| {
-        let binary = source
+        if let Some(binary) = source.as_any().downcast_ref::<arrow::array::BinaryArray>() {
+            return Ok(BinaryToListUInt8::<i32, i32>::new()
+                .transform(binary)?
+                .map(|arr| Arc::new(arr) as arrow::array::ArrayRef));
+        }
+
+        if source
             .as_any()
-            .downcast_ref::<arrow::array::BinaryArray>()
-            .ok_or_else(|| Error::TypeMismatch {
-                expected: "BinaryArray".to_owned(),
-                actual: source.data_type().clone(),
-                context: "binary_to_list_uint8 input".to_owned(),
-            })?;
-        Ok(BinaryToListUInt8::<i32, i32>::new()
-            .transform(binary)?
-            .map(|arr| Arc::new(arr) as arrow::array::ArrayRef))
+            .downcast_ref::<arrow::array::ListArray>()
+            .is_some_and(|list| {
+                list.values()
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt8Array>()
+                    .is_some()
+            })
+        {
+            return Ok(Some(source.clone()));
+        }
+
+        Err(Error::TypeMismatch {
+            expected: "BinaryArray or ListArray<UInt8>".to_owned(),
+            actual: source.data_type().clone(),
+            context: "binary_to_list_uint8 input".to_owned(),
+        })
     }
 }
 
@@ -297,8 +314,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        Array as _, Float32Array, Float64Array, GenericByteBuilder, Int32Array, Int64Array,
-        StringArray, StructArray, UInt32Array,
+        Array as _, ArrayRef, BinaryArray, Float32Array, Float64Array, GenericByteBuilder,
+        Int32Array, Int64Array, ListBuilder, StringArray, StructArray, UInt8Builder, UInt32Array,
     };
     use arrow::datatypes::{DataType, Field, GenericBinaryType};
     use re_lenses_core::combinators::{Error, Transform as _};
@@ -390,6 +407,27 @@ mod tests {
         impl_binary_test::<i64, i32>()?;
         impl_binary_test::<i32, i64>()?;
         impl_binary_test::<i64, i64>()?;
+
+        Ok(())
+    }
+
+    /// Checks that the pipe helper accepts both binary data and an existing list of `u8` values.
+    #[test]
+    fn binary_to_list_uint8_accepts_both_representations() -> Result<(), Error> {
+        let binary: ArrayRef = Arc::new(BinaryArray::from_iter_values([&b"bytes"[..]]));
+        let converted = binary_to_list_uint8()(&binary)?.unwrap();
+        assert_eq!(
+            converted.data_type(),
+            &DataType::new_list(DataType::UInt8, false)
+        );
+
+        let mut builder = ListBuilder::new(UInt8Builder::new())
+            .with_field(Arc::new(Field::new_list_field(DataType::UInt8, false)));
+        builder.values().append_slice(b"bytes");
+        builder.append(true);
+        let list: ArrayRef = Arc::new(builder.finish());
+        let passed_through = binary_to_list_uint8()(&list)?.unwrap();
+        assert!(Arc::ptr_eq(&list, &passed_through));
 
         Ok(())
     }
@@ -524,6 +562,10 @@ mod tests {
             Some("h264"),
             Some("H265"),
             Some("aV1"),
+            Some("vp8"),
+            Some("vp9"),
+            Some("Vp8"),
+            Some("vP9"),
         ]);
         assert_eq!(input_array.null_count(), 1);
         let output_array = StringToVideoCodecUInt32::default()
@@ -536,6 +578,10 @@ mod tests {
             Some(VideoCodec::H264 as u32),
             Some(VideoCodec::H265 as u32),
             Some(VideoCodec::AV1 as u32),
+            Some(VideoCodec::VP8 as u32),
+            Some(VideoCodec::VP9 as u32),
+            Some(VideoCodec::VP8 as u32),
+            Some(VideoCodec::VP9 as u32),
         ]);
         assert_eq!(output_array, expected_array);
 
@@ -545,7 +591,7 @@ mod tests {
     /// Tests that we return the correct error when an unsupported codec is in the data.
     #[test]
     fn test_string_to_codec_uint32_unsupported() {
-        let unsupported_codecs = ["vp9"];
+        let unsupported_codecs = ["vp08", "vp09"];
         for &bad_codec in &unsupported_codecs {
             let input_array = StringArray::from(vec![Some("h264"), Some(bad_codec)]);
             let result = StringToVideoCodecUInt32::default().transform(&input_array);

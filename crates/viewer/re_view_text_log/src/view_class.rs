@@ -1,12 +1,13 @@
 use std::collections::BTreeSet;
 
 use re_data_ui::item_ui::{self, timeline_button};
+use re_log::ResultExt as _;
 use re_log_types::{EntityPath, TimelineName};
 use re_sdk_types::blueprint::archetypes::{TextLogColumns, TextLogFormat, TextLogRows};
 use re_sdk_types::blueprint::components::{Enabled, TextLogColumn, TimelineColumn};
-use re_sdk_types::blueprint::datatypes as bp_datatypes;
+use re_sdk_types::blueprint::encodings as bp_encodings;
 use re_sdk_types::components::TextLogLevel;
-use re_sdk_types::{View as _, ViewClassIdentifier, datatypes};
+use re_sdk_types::{View as _, ViewClassIdentifier, encodings};
 use re_ui::list_item::LabelContent;
 use re_ui::{DesignTokens, Help, UiExt as _};
 use re_viewer_context::{
@@ -19,13 +20,22 @@ use re_viewport_blueprint::ViewProperty;
 use super::visualizer_system::{Entry, TextLogSystem};
 
 // TODO(andreas): This should be a blueprint component.
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default, re_byte_size::SizeBytes)]
 pub struct TextViewState {
     /// Keeps track of the latest time selection made by the user.
     ///
     /// We need this because we want the user to be able to manually scroll the
     /// text entry window however they please when the time cursor isn't moving.
     latest_time: i64,
+
+    /// Time of the latest entry at or before the cursor on the previous render.
+    ///
+    /// We auto-scroll whenever this changes so the view tracks the latest-at
+    /// row as new (possibly out-of-order) data streams in. This handles both
+    /// the initial catch-up to a programmatic `SetTime` (e.g. a `#when` URL
+    /// anchor pointing past the data loaded so far) and any later arrival
+    /// that lands closer to the cursor.
+    last_anchor_time: Option<i64>,
 
     seen_levels: BTreeSet<String>,
 
@@ -39,6 +49,10 @@ impl ViewState for TextViewState {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+
+    fn heap_size_bytes(&self) -> u64 {
+        re_byte_size::SizeBytes::heap_size_bytes(self)
     }
 }
 
@@ -78,7 +92,7 @@ Filter message types and toggle column visibility in a selection panel.",
             TextLogColumns::descriptor_timeline_columns().component,
             |ctx| {
                 let active_timeline = ctx.viewer_ctx().time_ctrl.timeline_name();
-                vec![TimelineColumn(bp_datatypes::TimelineColumn {
+                vec![TimelineColumn(bp_encodings::TimelineColumn {
                     visible: true.into(),
                     timeline: active_timeline.as_str().into(),
                 })]
@@ -89,12 +103,12 @@ Filter message types and toggle column visibility in a selection panel.",
             TextLogColumns::descriptor_text_log_columns().component,
             |_ctx| {
                 [
-                    bp_datatypes::TextLogColumnKind::EntityPath,
-                    bp_datatypes::TextLogColumnKind::LogLevel,
-                    bp_datatypes::TextLogColumnKind::Body,
+                    bp_encodings::TextLogColumnKind::EntityPath,
+                    bp_encodings::TextLogColumnKind::LogLevel,
+                    bp_encodings::TextLogColumnKind::Body,
                 ]
                 .map(|kind| {
-                    TextLogColumn(bp_datatypes::TextLogColumn {
+                    TextLogColumn(bp_encodings::TextLogColumn {
                         kind,
                         visible: true.into(),
                     })
@@ -115,7 +129,7 @@ Filter message types and toggle column visibility in a selection panel.",
                 state
                     .seen_levels
                     .iter()
-                    .map(|lvl| TextLogLevel(datatypes::Utf8::from(lvl.as_str())))
+                    .map(|lvl| TextLogLevel(encodings::Utf8::from(lvl.as_str())))
                     .collect::<Vec<_>>()
             },
         );
@@ -182,30 +196,18 @@ Filter message types and toggle column visibility in a selection panel.",
         state: &mut dyn ViewState,
         query: &ViewQuery<'_>,
         system_output: re_viewer_context::SystemExecutionOutput,
-    ) -> Result<(), ViewSystemExecutionError> {
+    ) -> Result<re_viewer_context::ViewClassUiOutput, ViewSystemExecutionError> {
         re_tracing::profile_function!();
 
         let tokens = ui.tokens();
         let state = state.downcast_mut::<TextViewState>()?;
-        let text = system_output.visualizer_data::<Vec<Entry>>(TextLogSystem::identifier())?;
-
-        let columns_property = ViewProperty::from_archetype::<TextLogColumns>(
-            ctx.blueprint_db(),
-            ctx.blueprint_query,
-            query.view_id,
-        );
-        let rows_property = ViewProperty::from_archetype::<TextLogRows>(
-            ctx.blueprint_db(),
-            ctx.blueprint_query,
-            query.view_id,
-        );
-        let format_property = ViewProperty::from_archetype::<TextLogFormat>(
-            ctx.blueprint_db(),
-            ctx.blueprint_query,
-            query.view_id,
-        );
+        let text =
+            system_output.visualizer_data_or_default::<Vec<Entry>>(TextLogSystem::identifier())?;
 
         let view_ctx = self.view_context(ctx, query.view_id, state, query.space_origin);
+        let columns_property = ViewProperty::from_archetype::<TextLogColumns>(&view_ctx);
+        let rows_property = ViewProperty::from_archetype::<TextLogRows>(&view_ctx);
+        let format_property = ViewProperty::from_archetype::<TextLogFormat>(&view_ctx);
 
         let monospace_body = format_property.component_or_fallback::<Enabled>(
             &view_ctx,
@@ -226,7 +228,7 @@ Filter message types and toggle column visibility in a selection panel.",
             TextLogRows::descriptor_filter_by_log_level().component,
         )?;
 
-        for te in text {
+        for te in text.iter() {
             if let Some(lvl) = &te.level {
                 state.seen_levels.insert(lvl.to_string());
             }
@@ -249,14 +251,20 @@ Filter message types and toggle column visibility in a selection panel.",
             ..egui::Frame::default()
         }
         .show(ui, |ui| {
-            // Did the time cursor move since last time?
-            // - If it did, autoscroll to the text log to reveal the current time.
-            // - Otherwise, let the user scroll around freely!
+            // Auto-scroll when the time cursor moves, or whenever the
+            // latest-at row shifts because new (possibly out-of-order) data
+            // landed closer to the cursor.
+            let anchor_time = entries
+                .partition_point(|te| te.time.as_i64() <= time)
+                .checked_sub(1)
+                .map(|i| entries[i].time.as_i64());
+            let anchor_moved = anchor_time != state.last_anchor_time;
             let time_cursor_moved = state.latest_time != time;
-            let scroll_to_row = time_cursor_moved.then(|| {
+            let scroll_to_row = (time_cursor_moved || anchor_moved).then(|| {
                 re_tracing::profile_scope!("search scroll time");
                 entries.partition_point(|te| te.time.as_i64() < time)
             });
+            state.last_anchor_time = anchor_time;
 
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
@@ -276,7 +284,7 @@ Filter message types and toggle column visibility in a selection panel.",
         });
         state.latest_time = time;
 
-        Ok(())
+        Ok(Default::default())
     }
 }
 
@@ -285,7 +293,6 @@ Filter message types and toggle column visibility in a selection panel.",
 /// `scroll_to_row` indicates how far down we want to scroll in terms of logical rows,
 /// as opposed to `scroll_to_offset` (computed below) which is how far down we want to
 /// scroll in terms of actual points.
-#[expect(clippy::too_many_arguments)]
 fn table_ui(
     ctx: &ViewerContext<'_>,
     ui: &mut egui::Ui,
@@ -344,11 +351,11 @@ fn table_ui(
         }
 
         let col = match col.kind {
-            bp_datatypes::TextLogColumnKind::EntityPath => {
+            bp_encodings::TextLogColumnKind::EntityPath => {
                 size_column(Column::auto().clip(true), 32)
             }
-            bp_datatypes::TextLogColumnKind::LogLevel => size_column(Column::auto(), 30),
-            bp_datatypes::TextLogColumnKind::Body => size_column(Column::remainder(), 100),
+            bp_encodings::TextLogColumnKind::LogLevel => size_column(Column::auto(), 30),
+            bp_encodings::TextLogColumnKind::Body => size_column(Column::remainder(), 100),
         };
 
         table_builder = table_builder.column(col);
@@ -365,7 +372,11 @@ fn table_ui(
                 }
 
                 header.col(|ui| {
-                    timeline_button(&ctx.app_ctx, ui, &TimelineName::new(&col.timeline));
+                    if let Some(timeline) =
+                        TimelineName::try_new(col.timeline.as_str()).ok_or_log_error_once()
+                    {
+                        timeline_button(&ctx.app_ctx, ui, &timeline);
+                    }
                 });
             }
             for col in columns {
@@ -393,7 +404,11 @@ fn table_ui(
                         continue;
                     }
 
-                    let timeline = TimelineName::new(&col.timeline);
+                    let Some(timeline) =
+                        TimelineName::try_new(col.timeline.as_str()).ok_or_log_error_once()
+                    else {
+                        continue;
+                    };
 
                     row.col(|ui| {
                         let row_time = entry
@@ -427,7 +442,7 @@ fn table_ui(
                     }
 
                     row.col(|ui| match col.kind {
-                        bp_datatypes::TextLogColumnKind::EntityPath => {
+                        bp_encodings::TextLogColumnKind::EntityPath => {
                             item_ui::entity_path_button(
                                 &ctx.active_recording_store_view_context(),
                                 ui,
@@ -435,14 +450,14 @@ fn table_ui(
                                 &entry.entity_path,
                             );
                         }
-                        bp_datatypes::TextLogColumnKind::LogLevel => {
+                        bp_encodings::TextLogColumnKind::LogLevel => {
                             if let Some(lvl) = &entry.level {
                                 ui.label(level_to_rich_text(ui, lvl));
                             } else {
                                 ui.label("-");
                             }
                         }
-                        bp_datatypes::TextLogColumnKind::Body => {
+                        bp_encodings::TextLogColumnKind::Body => {
                             let mut text = egui::RichText::new(entry.body.as_str());
 
                             if monospace_body {
@@ -470,7 +485,7 @@ fn table_ui(
     }
 }
 
-fn column_name_ui(ui: &mut egui::Ui, column: &bp_datatypes::TextLogColumnKind) -> egui::Response {
+fn column_name_ui(ui: &mut egui::Ui, column: &bp_encodings::TextLogColumnKind) -> egui::Response {
     ui.strong(column.name())
 }
 
@@ -478,16 +493,12 @@ fn column_name_ui(ui: &mut egui::Ui, column: &bp_datatypes::TextLogColumnKind) -
 ///
 /// This could potentially be avoided if we could add component ui's from this crate.
 fn view_property_ui_rows(ctx: &ViewContext<'_>, ui: &mut egui::Ui) {
-    let property = ViewProperty::from_archetype::<TextLogRows>(
-        ctx.blueprint_db(),
-        ctx.blueprint_query(),
-        ctx.view_id,
-    );
+    let property = ViewProperty::from_archetype::<TextLogRows>(ctx);
 
     let reflection = ctx.viewer_ctx.reflection();
     let Some(reflection) = reflection.archetypes.get(&property.archetype_name) else {
         ui.error_label(format!(
-            "Missing reflection data for archetype {:?}.",
+            "Missing reflection data for archetype {}.",
             property.archetype_name
         ));
         return;
@@ -523,20 +534,17 @@ fn view_property_ui_rows(ctx: &ViewContext<'_>, ui: &mut egui::Ui) {
                             return;
                         };
 
-                        let mut new_levels = state
-                            .seen_levels
-                            .iter()
-                            .map(|s| {
+                        let mut new_levels = std::iter::chain(
+                            state.seen_levels.iter().map(|s| {
                                 let level_active = levels.iter().any(|l| l.as_str() == s);
                                 (s.clone(), level_active)
-                            })
-                            .chain(
-                                levels
-                                    .iter()
-                                    .filter(|lvl| !state.seen_levels.contains(lvl.as_str()))
-                                    .map(|lvl| (lvl.as_str().to_owned(), true)),
-                            )
-                            .collect::<Vec<_>>();
+                            }),
+                            levels
+                                .iter()
+                                .filter(|lvl| !state.seen_levels.contains(lvl.as_str()))
+                                .map(|lvl| (lvl.as_str().to_owned(), true)),
+                        )
+                        .collect::<Vec<_>>();
 
                         let mut any_change = false;
                         for (lvl, active) in &mut new_levels {

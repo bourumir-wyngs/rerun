@@ -1,26 +1,36 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError};
+use arrow::array::{Array as _, ArrayData, ListArray, make_array};
+use arrow::pyarrow::{PyArrowType, ToPyArrow as _};
+use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use re_sdk::external::re_data_loader::{UrdfTree, urdf_joint_transform};
-use re_sdk::external::urdf_rs::{Joint, JointType, Link};
+use re_sdk::external::re_importer::{UrdfTree, urdf_joint_transform};
+use re_sdk::external::urdf_rs::{Joint, JointType, Link, Mimic};
 use re_sdk::{EntityPath, TimePoint};
 
+use crate::chunk_stream::PyLazyChunkStreamInternal;
+use crate::chunk_stream::stream::LazyChunkStream;
+use crate::chunk_stream::urdf_tree_stream::UrdfTreeStreamFactory;
 use crate::python_bridge::{PyRecordingStream, get_data_recording};
 
 /// A `.urdf` file loaded into memory (excluding any mesh files).
 #[pyclass(name = "_UrdfTreeInternal", module = "rerun_bindings.rerun_bindings")]
-pub struct PyUrdfTree(UrdfTree);
+pub struct PyUrdfTree(Arc<UrdfTree>);
 
 #[pymethods]
 impl PyUrdfTree {
     /// Load the URDF found at `path`.
     #[staticmethod]
-    #[pyo3(text_signature = "(path, entity_path_prefix=None, frame_prefix=None)")]
+    #[pyo3(signature = (path, entity_path_prefix=None, *, frame_prefix=None, static_transform_entity_path=None))]
+    #[pyo3(
+        text_signature = "(path, entity_path_prefix=None, *, frame_prefix=None, static_transform_entity_path=None)"
+    )]
     pub fn from_file_path(
         path: PathBuf,
         entity_path_prefix: Option<String>,
         frame_prefix: Option<String>,
+        static_transform_entity_path: Option<String>,
     ) -> PyResult<Self> {
         let mut tree =
             UrdfTree::from_file_path(path, entity_path_prefix.map(EntityPath::from_single_string))
@@ -30,7 +40,10 @@ impl PyUrdfTree {
         if let Some(prefix) = frame_prefix {
             tree = tree.with_frame_prefix(prefix);
         }
-        Ok(Self(tree))
+        if let Some(entity_path) = static_transform_entity_path {
+            tree = tree.with_static_transform_entity(entity_path);
+        }
+        Ok(Self(Arc::new(tree)))
     }
 
     /// Name of the robot defined in this URDF.
@@ -123,13 +136,68 @@ impl PyUrdfTree {
         Ok(())
     }
 
+    /// Return a new lazy stream over all chunks emitted from this URDF tree.
+    #[pyo3(signature = (*, include_joint_transforms = true))]
+    pub(crate) fn stream(&self, include_joint_transforms: bool) -> PyLazyChunkStreamInternal {
+        PyLazyChunkStreamInternal::new(LazyChunkStream::from_factory(UrdfTreeStreamFactory::new(
+            Arc::clone(&self.0),
+            include_joint_transforms,
+        )))
+    }
+
+    /// Compute transform batches from per-row joint name and value arrays.
+    #[pyo3(signature = (names, values, *, clamp = false))]
+    pub fn compute_joint_transform_batches(
+        &self,
+        py: Python<'_>,
+        names: PyArrowType<ArrayData>,
+        values: PyArrowType<ArrayData>,
+        clamp: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let names = make_array(names.0);
+        let values = make_array(values.0);
+
+        let names = names.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "joint names must be a list array, got {:?}",
+                names.data_type()
+            ))
+        })?;
+        let values = values.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "joint values must be a list array, got {:?}",
+                values.data_type()
+            ))
+        })?;
+
+        let result = self
+            .0
+            .compute_joint_transform_batches(names, values, clamp)
+            .map_err(|err| {
+                if matches!(
+                    err.downcast_ref::<urdf_joint_transform::Error>(),
+                    Some(urdf_joint_transform::Error::UnsupportedJointType(_))
+                ) {
+                    PyNotImplementedError::new_err(err.to_string())
+                } else {
+                    PyValueError::new_err(err.to_string())
+                }
+            })?;
+
+        result.to_data().to_pyarrow(py).map(|obj| obj.unbind())
+    }
+
     fn __repr__(&self) -> String {
         format!("UrdfTree(name={:?})", self.0.name())
     }
 }
 
 /// Wrapper around a URDF joint.
-#[pyclass(name = "_UrdfJointInternal", module = "rerun_bindings.rerun_bindings")]
+#[pyclass(
+    name = "_UrdfJointInternal",
+    from_py_object,
+    module = "rerun_bindings.rerun_bindings"
+)]
 #[derive(Clone)]
 pub struct PyUrdfJoint {
     pub joint: Joint,
@@ -212,6 +280,12 @@ impl PyUrdfJoint {
         self.joint.limit.velocity
     }
 
+    /// Mimic-tag specification, or `None` if this joint is not a mimic joint.
+    #[getter]
+    pub fn mimic(&self) -> Option<PyUrdfMimic> {
+        self.joint.mimic.clone().map(PyUrdfMimic)
+    }
+
     /// Compute the transform components for this joint at the given value.
     ///
     /// The result is wrapped in a dictionary for easy conversion to the final types in Python.
@@ -257,8 +331,8 @@ impl PyUrdfJoint {
 
                 Ok(dict.into())
             }
-            Err(e @ urdf_joint_transform::Error::UnsupportedJointType(_)) => {
-                Err(PyNotImplementedError::new_err(e.to_string()))
+            Err(err @ urdf_joint_transform::Error::UnsupportedJointType(_)) => {
+                Err(PyNotImplementedError::new_err(err.to_string()))
             }
         }
     }
@@ -310,8 +384,8 @@ impl PyUrdfJoint {
                             Self::apply_prefix(self.frame_prefix.as_ref(), &result.child_frame);
                     }
                 }
-                Err(e @ urdf_joint_transform::Error::UnsupportedJointType(_)) => {
-                    return Err(PyNotImplementedError::new_err(e.to_string()));
+                Err(err @ urdf_joint_transform::Error::UnsupportedJointType(_)) => {
+                    return Err(PyNotImplementedError::new_err(err.to_string()));
                 }
             }
         }
@@ -330,7 +404,7 @@ impl PyUrdfJoint {
         format!(
             "UrdfJoint(name={:?}, type={}, parent={:?}, child={:?})",
             self.joint.name,
-            &self.joint_type(),
+            self.joint_type(),
             self.joint.parent.link,
             self.joint.child.link
         )
@@ -346,8 +420,55 @@ impl PyUrdfJoint {
     }
 }
 
+/// URDF `<mimic>` tag: this joint's value is derived from a driver joint.
+#[pyclass(
+    name = "_UrdfMimicInternal",
+    from_py_object,
+    module = "rerun_bindings.rerun_bindings"
+)]
+#[derive(Clone)]
+pub struct PyUrdfMimic(pub Mimic);
+
+#[pymethods]
+impl PyUrdfMimic {
+    /// Name of the driver joint.
+    #[getter]
+    pub fn joint(&self) -> &str {
+        &self.0.joint
+    }
+
+    /// Multiplier applied to the driver joint's value.
+    ///
+    /// Defaults to `1.0` per the URDF spec when the `<mimic>` tag omits `multiplier`.
+    #[getter]
+    pub fn multiplier(&self) -> f64 {
+        self.0.multiplier.unwrap_or(1.0)
+    }
+
+    /// Offset added after multiplying the driver joint's value.
+    ///
+    /// Defaults to `0.0` per the URDF spec when the `<mimic>` tag omits `offset`.
+    #[getter]
+    pub fn offset(&self) -> f64 {
+        self.0.offset.unwrap_or(0.0)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "UrdfMimic(joint={:?}, multiplier={}, offset={})",
+            self.0.joint,
+            self.multiplier(),
+            self.offset()
+        )
+    }
+}
+
 /// URDF link
-#[pyclass(name = "_UrdfLinkInternal", module = "rerun_bindings.rerun_bindings")]
+#[pyclass(
+    name = "_UrdfLinkInternal",
+    from_py_object,
+    module = "rerun_bindings.rerun_bindings"
+)]
 #[derive(Clone)]
 pub struct PyUrdfLink(pub Link);
 
@@ -368,6 +489,7 @@ impl PyUrdfLink {
 pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyUrdfTree>()?;
     m.add_class::<PyUrdfJoint>()?;
+    m.add_class::<PyUrdfMimic>()?;
     m.add_class::<PyUrdfLink>()?;
 
     Ok(())

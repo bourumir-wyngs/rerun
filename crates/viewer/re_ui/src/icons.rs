@@ -61,7 +61,10 @@ impl Icon {
 
     #[inline]
     pub fn as_image(&self) -> Image<'static> {
-        let scale = if self.uri.ends_with(".svg") {
+        let is_svg = std::path::Path::new(self.uri)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"));
+        let scale = if is_svg {
             1.0
         } else {
             0.5 // Because we save all png icons as 2x
@@ -116,14 +119,16 @@ macro_rules! icon_from_path {
     };
 }
 
-pub const RERUN_MENU: Icon = icon_from_path!("../data/icons/rerun_menu.svg");
+/// The monochrome `rerun` wordmark
+pub const RERUN_WORDMARK: Icon = icon_from_path!("../data/icons/rerun_wordmark.svg");
 
-pub const RERUN_IO_TEXT: Icon = icon_from_path!("../data/icons/rerun_io.svg");
+/// The square and colorful `RE`
+pub const RERUN_LOGO: Icon = icon_from_path!("../data/icons/rerun_logo.png");
 
 pub const HELP: Icon = icon_from_path!("../data/icons/help.svg");
 
 pub const PLAY: Icon = icon_from_path!("../data/icons/play.svg");
-pub const FOLLOW: Icon = icon_from_path!("../data/icons/follow.svg");
+pub const PLAYHEAD_NAV: Icon = icon_from_path!("../data/icons/playhead_nav.svg");
 pub const PAUSE: Icon = icon_from_path!("../data/icons/pause.svg");
 pub const CHEVRON: Icon = icon_from_path!("../data/icons/chevron.svg");
 pub const ARROW_LEFT: Icon = icon_from_path!("../data/icons/arrow_left.svg");
@@ -142,7 +147,6 @@ pub const LEFT_PANEL_TOGGLE: Icon = icon_from_path!("../data/icons/left_panel_to
 pub const MINIMIZE: Icon = icon_from_path!("../data/icons/minimize.svg");
 pub const MAXIMIZE: Icon = icon_from_path!("../data/icons/maximize.svg");
 pub const EXPAND: Icon = icon_from_path!("../data/icons/expand.svg");
-pub const COLUMN_VISIBILITY: Icon = icon_from_path!("../data/icons/column_visibility.svg");
 
 pub const VISIBLE: Icon = icon_from_path!("../data/icons/visible.svg");
 pub const INVISIBLE: Icon = icon_from_path!("../data/icons/invisible.svg");
@@ -159,6 +163,13 @@ pub const MORE: Icon = icon_from_path!("../data/icons/more.svg");
 
 pub const CLOSE: Icon = icon_from_path!("../data/icons/close.svg");
 pub const CLOSE_SMALL: Icon = icon_from_path!("../data/icons/close_small.svg");
+
+// Caption controls, matching the glyphs documented by Microsoft:
+// https://learn.microsoft.com/en-us/windows/apps/design/basics/titlebar-design#caption-controls-minimize-maximize-restore-close
+pub const CHROME_MINIMIZE: Icon = icon_from_path!("../data/icons/chrome_minimize.svg");
+pub const CHROME_MAXIMIZE: Icon = icon_from_path!("../data/icons/chrome_maximize.svg");
+pub const CHROME_RESTORE: Icon = icon_from_path!("../data/icons/chrome_restore.svg");
+pub const CHROME_CLOSE: Icon = icon_from_path!("../data/icons/chrome_close.svg");
 
 /// Used for HTTP URLs that lead out of the app.
 ///
@@ -182,12 +193,13 @@ pub const VIEW_GENERIC: Icon = icon_from_path!("../data/icons/view_generic.svg")
 pub const VIEW_HISTOGRAM: Icon = icon_from_path!("../data/icons/view_histogram.svg");
 pub const VIEW_LOG: Icon = icon_from_path!("../data/icons/view_log.svg");
 pub const VIEW_MAP: Icon = icon_from_path!("../data/icons/view_map.svg");
+pub const VIEW_STATE_TIMELINE: Icon = icon_from_path!("../data/icons/view_state_timeline.svg");
 pub const VIEW_TENSOR: Icon = icon_from_path!("../data/icons/view_tensor.svg");
 pub const VIEW_TEXT: Icon = icon_from_path!("../data/icons/view_text.svg");
 pub const VIEW_TIMESERIES: Icon = icon_from_path!("../data/icons/view_timeseries.svg");
 pub const VIEW_UNKNOWN: Icon = icon_from_path!("../data/icons/view_unknown.svg");
 
-pub const GROUP: Icon = icon_from_path!("../data/icons/group.svg");
+//pub const GROUP: Icon = icon_from_path!("../data/icons/group.svg");
 pub const ENTITY: Icon = icon_from_path!("../data/icons/entity.svg");
 pub const ENTITY_EMPTY: Icon = icon_from_path!("../data/icons/entity_empty.svg");
 pub const ENTITY_RESERVED: Icon = icon_from_path!("../data/icons/entity_reserved.svg");
@@ -208,6 +220,19 @@ pub const RECORDING: Icon = icon_from_path!("../data/icons/recording.svg");
 pub const OPEN_RECORDING: Icon = icon_from_path!("../data/icons/open_recording.svg");
 pub const BLUEPRINT: Icon = icon_from_path!("../data/icons/blueprint.svg");
 
+// These link icons have a blue arrow that wouldn't work with the usual tint we do for light/dark,
+// so we have separate icons for the themes:
+pub const LINK_RECORDING_LIGHT: Icon = icon_from_path!("../data/icons/link_recording_light.svg");
+pub const LINK_RECORDING_DARK: Icon = icon_from_path!("../data/icons/link_recording_dark.svg");
+pub const LINK_DATASET_LIGHT: Icon = icon_from_path!("../data/icons/link_dataset_light.svg");
+pub const LINK_DATASET_DARK: Icon = icon_from_path!("../data/icons/link_dataset_dark.svg");
+pub const LINK_TABLE_LIGHT: Icon = icon_from_path!("../data/icons/link_table_light.svg");
+pub const LINK_TABLE_DARK: Icon = icon_from_path!("../data/icons/link_table_dark.svg");
+pub const LINK_FOLDER_LIGHT: Icon = icon_from_path!("../data/icons/link_folder_light.svg");
+pub const LINK_FOLDER_DARK: Icon = icon_from_path!("../data/icons/link_folder_dark.svg");
+pub const LINK_PROXY_LIGHT: Icon = icon_from_path!("../data/icons/link_proxy_light.svg");
+pub const LINK_PROXY_DARK: Icon = icon_from_path!("../data/icons/link_proxy_dark.svg");
+
 pub const GITHUB: Icon = icon_from_path!("../data/icons/github.svg");
 
 // Notifications:
@@ -218,7 +243,6 @@ pub const SUCCESS: Icon = icon_from_path!("../data/icons/success.svg");
 pub const VIDEO_ERROR: Icon = icon_from_path!("../data/icons/video_error.svg");
 
 // Drag and drop:
-pub const DND_ADD_NEW: Icon = icon_from_path!("../data/icons/dnd_add_new.svg");
 pub const DND_ADD_TO_EXISTING: Icon = icon_from_path!("../data/icons/dnd_add_to_existing.svg");
 pub const DND_MOVE: Icon = icon_from_path!("../data/icons/dnd_move.svg");
 pub const DND_HANDLE: Icon = icon_from_path!("../data/icons/dnd_handle.svg");
@@ -245,3 +269,10 @@ pub const DOWNLOAD: Icon = icon_from_path!("../data/icons/download.svg");
 // Other non-icon-sized images:
 pub const DROPDOWN_ARROW: Icon = icon_from_path!("../data/icons/dropdown_arrow.svg");
 pub const CHECKED: Icon = icon_from_path!("../data/icons/checked.svg");
+
+// Datafusion tables:
+pub const TABLE_ROW_VIEW: Icon = icon_from_path!("../data/icons/table_row_view.svg");
+pub const TABLE_GRID_VIEW: Icon = icon_from_path!("../data/icons/table_grid_view.svg");
+pub const TABLE_COLUMNS: Icon = icon_from_path!("../data/icons/columns.svg");
+pub const FLAG_UNTOGGLED: Icon = icon_from_path!("../data/icons/flag_untoggled.svg");
+pub const FLAG_TOGGLED: Icon = icon_from_path!("../data/icons/flag_toggled.svg");

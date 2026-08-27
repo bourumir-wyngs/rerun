@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use arrow::array::{AsArray as _, Int32Builder, ListArray, ListBuilder};
 use arrow::datatypes::{DataType, Field};
+use itertools::Itertools as _;
 use re_chunk::{ArrowArray as _, Chunk, ChunkId, TimeColumn, TimelineName};
-use re_sdk::lenses::{Lens, Lenses, OutputMode, Selector, op};
+use re_sdk::lenses::{CastTo, Lens, Lenses, OutputMode, Selector};
 use re_sdk_types::ComponentDescriptor;
 use re_sdk_types::archetypes::Scalars;
 
@@ -119,7 +120,7 @@ fn nullability_chunk() -> Chunk {
     Chunk::from_auto_row_ids(
         ChunkId::new(),
         "nullability".into(),
-        std::iter::once((TimelineName::new("tick"), time_column)).collect(),
+        std::iter::once((TimelineName::from("tick"), time_column)).collect(),
         components.collect(),
     )
     .unwrap()
@@ -130,25 +131,24 @@ fn test_destructure_cast() {
     let original_chunk = nullability_chunk();
     println!("{original_chunk}");
 
-    let destructure = Lens::for_input_column(
-        re_log_types::EntityPathFilter::parse_forgiving("nullability"),
-        "structs",
-    )
-    .output_columns_at("nullability/a", |out| {
-        out.component(
+    let destructure = Lens::derive("structs")
+        .output_entity("nullability/a")
+        .to_component_with_cast(
             Scalars::descriptor_scalars(),
-            Selector::parse(".a")?.pipe(op::cast(DataType::Float64)),
+            Selector::parse(".a").unwrap(),
+            CastTo::Auto,
         )
-    })
-    .unwrap()
-    .build();
+        .build()
+        .unwrap();
 
-    let mut lenses = Lenses::new(OutputMode::DropUnmatched);
-    lenses.add_lens(destructure);
+    let lenses = Lenses::new(OutputMode::DropUnmatched).add_lens_with_filter(
+        re_log_types::EntityPathFilter::parse_forgiving("nullability"),
+        destructure,
+    );
 
     let res: Vec<re_chunk::Chunk> = lenses
-        .apply(&original_chunk)
-        .collect::<Result<_, _>>()
+        .apply(&original_chunk, &re_lenses::default_runtime())
+        .try_collect()
         .unwrap();
 
     assert_eq!(res.len(), 1);
@@ -162,22 +162,23 @@ fn test_destructure() {
     let original_chunk = nullability_chunk();
     println!("{original_chunk}");
 
-    let destructure = Lens::for_input_column(
-        re_log_types::EntityPathFilter::parse_forgiving("nullability"),
-        "structs",
-    )
-    .output_columns_at("nullability/b", |out| {
-        out.component(Scalars::descriptor_scalars(), Selector::parse(".b")?)
-    })
-    .unwrap()
-    .build();
+    let destructure = Lens::derive("structs")
+        .output_entity("nullability/b")
+        .to_component(
+            Scalars::descriptor_scalars(),
+            Selector::parse(".b").unwrap(),
+        )
+        .build()
+        .unwrap();
 
-    let mut lenses = Lenses::new(OutputMode::DropUnmatched);
-    lenses.add_lens(destructure);
+    let lenses = Lenses::new(OutputMode::DropUnmatched).add_lens_with_filter(
+        re_log_types::EntityPathFilter::parse_forgiving("nullability"),
+        destructure,
+    );
 
     let res: Vec<re_chunk::Chunk> = lenses
-        .apply(&original_chunk)
-        .collect::<Result<_, _>>()
+        .apply(&original_chunk, &re_lenses::default_runtime())
+        .try_collect()
         .unwrap();
     assert_eq!(res.len(), 1);
 
@@ -220,7 +221,7 @@ fn test_time_column_extraction() {
     let original_chunk = Chunk::from_auto_row_ids(
         ChunkId::new(),
         "timestamped".into(),
-        std::iter::once((TimelineName::new("tick"), time_column)).collect(),
+        std::iter::once((TimelineName::from("tick"), time_column)).collect(),
         components.collect(),
     )
     .unwrap();
@@ -228,26 +229,27 @@ fn test_time_column_extraction() {
     println!("{original_chunk}");
 
     // Create a lens that extracts the timestamp as a time column and keeps the original timestamp as a component
-    let time_lens = Lens::for_input_column(
-        re_log_types::EntityPathFilter::parse_forgiving("timestamped"),
-        "my_timestamp",
-    )
-    .output_columns(|out| {
-        out.time("my_timeline", TimeType::Sequence, Selector::parse(".")?)?
-            .component(
-                ComponentDescriptor::partial("extracted_time"),
-                Selector::parse(".")?,
-            )
-    })
-    .unwrap()
-    .build();
+    let time_lens = Lens::derive("my_timestamp")
+        .to_timeline(
+            "my_timeline",
+            TimeType::Sequence,
+            Selector::parse(".").unwrap(),
+        )
+        .to_component(
+            ComponentDescriptor::partial("extracted_time"),
+            Selector::parse(".").unwrap(),
+        )
+        .build()
+        .unwrap();
 
-    let mut lenses = Lenses::new(OutputMode::DropUnmatched);
-    lenses.add_lens(time_lens);
+    let lenses = Lenses::new(OutputMode::DropUnmatched).add_lens_with_filter(
+        re_log_types::EntityPathFilter::parse_forgiving("timestamped"),
+        time_lens,
+    );
 
     let res: Vec<Chunk> = lenses
-        .apply(&original_chunk)
-        .collect::<Result<_, _>>()
+        .apply(&original_chunk, &re_lenses::default_runtime())
+        .try_collect()
         .unwrap();
     assert_eq!(res.len(), 1);
 
@@ -255,17 +257,17 @@ fn test_time_column_extraction() {
     println!("{chunk}");
 
     // Verify the chunk has both the original timeline and the new custom timeline
-    assert!(chunk.timelines().contains_key(&TimelineName::new("tick")));
+    assert!(chunk.timelines().contains_key(&TimelineName::from("tick")));
     assert!(
         chunk
             .timelines()
-            .contains_key(&TimelineName::new("my_timeline"))
+            .contains_key(&TimelineName::from("my_timeline"))
     );
 
     // Verify the custom timeline has the correct values
     let my_timeline = chunk
         .timelines()
-        .get(&TimelineName::new("my_timeline"))
+        .get(&TimelineName::from("my_timeline"))
         .unwrap();
     assert_eq!(my_timeline.times_raw().len(), 5);
     assert_eq!(my_timeline.times_raw()[0], 100);
@@ -331,7 +333,20 @@ fn test_scatter_columns() {
     // Each element is a struct with {timestamp: i64, value: String}
     let struct_list = create_test_struct_list();
 
-    let components = std::iter::once((ComponentDescriptor::partial("nested_data"), struct_list));
+    // An unrelated `tag` column that should be forwarded and scattered along
+    // with the existing time columns.
+    let mut tag_builder = ListBuilder::new(arrow::array::StringBuilder::new());
+    for tag in ["a", "b", "c"] {
+        tag_builder.values().append_value(tag);
+        tag_builder.append(true);
+    }
+    let tag_column = tag_builder.finish();
+
+    let components = [
+        (ComponentDescriptor::partial("nested_data"), struct_list),
+        (ComponentDescriptor::partial("tag"), tag_column),
+    ]
+    .into_iter();
 
     let time_column = TimeColumn::new_sequence("tick", [1, 2, 3]);
 
@@ -347,27 +362,25 @@ fn test_scatter_columns() {
     println!("{original_chunk}");
 
     // Create a scatter lens that explodes the nested lists
-    let scatter_lens = Lens::for_input_column(re_log_types::EntityPathFilter::all(), "nested_data")
-        .output_scatter_columns_at("scatter_test/exploded", |out| {
-            out.component(
-                ComponentDescriptor::partial("exploded_strings"),
-                Selector::parse(".value")?,
-            )?
-            .time(
-                "my_timestamp",
-                TimeType::Sequence,
-                Selector::parse(".timestamp")?,
-            )
-        })
-        .unwrap()
-        .build();
+    let scatter_lens = Lens::scatter("nested_data")
+        .output_entity("scatter_test/exploded")
+        .to_component(
+            ComponentDescriptor::partial("exploded_strings"),
+            Selector::parse(".value").unwrap(),
+        )
+        .to_timeline(
+            "my_timestamp",
+            TimeType::Sequence,
+            Selector::parse(".timestamp").unwrap(),
+        )
+        .build()
+        .unwrap();
 
-    let mut lenses = Lenses::new(OutputMode::DropUnmatched);
-    lenses.add_lens(scatter_lens);
+    let lenses = Lenses::new(OutputMode::DropUnmatched).add_lens(scatter_lens);
 
     let res: Vec<Chunk> = lenses
-        .apply(&original_chunk)
-        .collect::<Result<_, _>>()
+        .apply(&original_chunk, &re_lenses::default_runtime())
+        .try_collect()
         .unwrap();
     assert_eq!(res.len(), 1);
 
@@ -386,7 +399,7 @@ fn test_scatter_columns() {
     // Verify tick timeline is replicated correctly
     // Original tick: [1, 2, 3]
     // Scattered tick: [1, 1, 1, 2, 3] (row 0 scatters into 3 rows)
-    let tick_timeline = chunk.timelines().get(&TimelineName::new("tick")).unwrap();
+    let tick_timeline = chunk.timelines().get(&TimelineName::from("tick")).unwrap();
     assert_eq!(tick_timeline.times_raw().len(), 5);
     assert_eq!(tick_timeline.times_raw()[0], 1);
     assert_eq!(tick_timeline.times_raw()[1], 1);
@@ -399,7 +412,7 @@ fn test_scatter_columns() {
     // After scattering: [1, 2, 3, 4, 5]
     let event_timeline = chunk
         .timelines()
-        .get(&TimelineName::new("my_timestamp"))
+        .get(&TimelineName::from("my_timestamp"))
         .unwrap();
     assert_eq!(event_timeline.times_raw().len(), 5);
     assert_eq!(event_timeline.times_raw()[0], 1);
@@ -433,27 +446,25 @@ fn test_scatter_columns_static() {
     println!("{original_chunk}");
 
     // Create a scatter lens that explodes the nested lists
-    let scatter_lens = Lens::for_input_column(re_log_types::EntityPathFilter::all(), "nested_data")
-        .output_scatter_columns_at("scatter_test/exploded", |out| {
-            out.component(
-                ComponentDescriptor::partial("exploded_strings"),
-                Selector::parse(".value")?,
-            )?
-            .time(
-                "my_timestamp",
-                TimeType::Sequence,
-                Selector::parse(".timestamp")?,
-            )
-        })
-        .unwrap()
-        .build();
+    let scatter_lens = Lens::scatter("nested_data")
+        .output_entity("scatter_test/exploded")
+        .to_component(
+            ComponentDescriptor::partial("exploded_strings"),
+            Selector::parse(".value").unwrap(),
+        )
+        .to_timeline(
+            "my_timestamp",
+            TimeType::Sequence,
+            Selector::parse(".timestamp").unwrap(),
+        )
+        .build()
+        .unwrap();
 
-    let mut lenses = Lenses::new(OutputMode::DropUnmatched);
-    lenses.add_lens(scatter_lens);
+    let lenses = Lenses::new(OutputMode::DropUnmatched).add_lens(scatter_lens);
 
     let res: Vec<Chunk> = lenses
-        .apply(&original_chunk)
-        .collect::<Result<_, _>>()
+        .apply(&original_chunk, &re_lenses::default_runtime())
+        .try_collect()
         .unwrap();
     assert_eq!(res.len(), 1);
 
@@ -478,7 +489,7 @@ fn test_scatter_columns_static() {
     // After scattering: [1, 2, 3, 4, 5]
     let event_timeline = chunk
         .timelines()
-        .get(&TimelineName::new("my_timestamp"))
+        .get(&TimelineName::from("my_timestamp"))
         .unwrap();
     assert_eq!(event_timeline.times_raw().len(), 5);
     assert_eq!(event_timeline.times_raw()[0], 1);
@@ -495,4 +506,66 @@ fn test_scatter_columns_static() {
     assert_eq!(strings_component.list_array.len(), 5);
 
     insta::assert_snapshot!("scatter_columns_static", format!("{chunk:-240}"));
+}
+
+#[test]
+fn test_output_overwrites_same_named_component() {
+    // The input chunk contains a `value` column. The lens declares its own output
+    // component named `value`. With `DropUnmatched`, only the lens output is
+    // produced, so the original `value` column is simply not forwarded.
+    let mut value_builder = ListBuilder::new(arrow::array::StringBuilder::new());
+    for v in ["x", "y"] {
+        value_builder.values().append_value(v);
+        value_builder.append(true);
+    }
+    let value_column = value_builder.finish();
+
+    let mut input_builder = ListBuilder::new(arrow::array::StringBuilder::new());
+    for v in ["alpha", "beta"] {
+        input_builder.values().append_value(v);
+        input_builder.append(true);
+    }
+    let input_column = input_builder.finish();
+
+    let components = [
+        (ComponentDescriptor::partial("input"), input_column),
+        (ComponentDescriptor::partial("value"), value_column),
+    ]
+    .into_iter();
+
+    let original_chunk = Chunk::from_auto_row_ids(
+        ChunkId::new(),
+        "collision".into(),
+        std::iter::once((
+            TimelineName::from("tick"),
+            TimeColumn::new_sequence("tick", 0..2),
+        ))
+        .collect(),
+        components.collect(),
+    )
+    .unwrap();
+
+    let lens = Lens::derive("input")
+        .to_component(
+            ComponentDescriptor::partial("value"),
+            Selector::parse(".").unwrap(),
+        )
+        .build()
+        .unwrap();
+
+    let lenses = Lenses::new(OutputMode::DropUnmatched).add_lens(lens);
+
+    let results: Vec<_> = lenses
+        .apply(&original_chunk, &re_lenses::default_runtime())
+        .collect();
+    assert_eq!(results.len(), 1);
+
+    let chunk = results.into_iter().next().unwrap().unwrap();
+    let value = chunk
+        .components()
+        .get(ComponentDescriptor::partial("value").component)
+        .expect("`value` should be present");
+    let strings = value.list_array.values().as_string::<i32>();
+    assert_eq!(strings.value(0), "alpha");
+    assert_eq!(strings.value(1), "beta");
 }

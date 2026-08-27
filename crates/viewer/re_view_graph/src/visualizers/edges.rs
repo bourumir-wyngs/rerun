@@ -2,7 +2,7 @@ use re_chunk::LatestAtQuery;
 use re_log_types::{EntityPath, Instance};
 use re_sdk_types::archetypes::{self, GraphEdges};
 use re_sdk_types::reflection::Enum as _;
-use re_sdk_types::{self, Archetype as _, components, datatypes};
+use re_sdk_types::{self, Archetype as _, components, encodings};
 use re_view::{DataResultQuery as _, VisualizerInstructionQueryResults};
 use re_viewer_context::{
     self, IdentifiedViewSystem, ViewContext, ViewContextCollection, ViewQuery,
@@ -15,6 +15,7 @@ use crate::graph::NodeId;
 #[derive(Default)]
 pub struct EdgesVisualizer;
 
+#[derive(Clone)]
 pub struct EdgeInstance {
     // We will need this in the future, when we want to select individual edges.
     pub instance: Instance,
@@ -24,6 +25,7 @@ pub struct EdgeInstance {
     pub target_index: NodeId,
 }
 
+#[derive(Clone)]
 pub struct EdgeData {
     pub graph_type: components::GraphType,
     pub edges: Vec<EdgeInstance>,
@@ -31,7 +33,10 @@ pub struct EdgeData {
 
 impl IdentifiedViewSystem for EdgesVisualizer {
     fn identifier() -> ViewSystemIdentifier {
-        "GraphEdges".into()
+        re_viewer_context::external::re_string_interner::intern_static!(
+            re_viewer_context::ViewSystemIdentifier,
+            "GraphEdges"
+        )
     }
 }
 
@@ -60,9 +65,9 @@ impl VisualizerSystem for EdgesVisualizer {
 
         // TODO(cmc): could we (improve and then) use reflection for this?
         re_sdk_types::static_assert_struct_has_fields!(
-            datatypes::Utf8Pair,
-            first: datatypes::Utf8,
-            second: datatypes::Utf8,
+            encodings::Utf8Pair,
+            first: encodings::Utf8,
+            second: encodings::Utf8,
         );
         const SOURCE: &str = "first";
         const TARGET: &str = "second";

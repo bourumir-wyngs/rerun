@@ -11,22 +11,22 @@ use crate::{SerializationResult, SerializedComponentBatch};
 /// [`AsComponents::as_serialized_batches`], which describes how the bundle can be interpreted
 /// as a set of [`SerializedComponentBatch`]es: serialized component data.
 ///
-/// Have a look at our [Custom Data Loader] example to learn more about handwritten bundles.
+/// Have a look at our [Custom Data Importer] example to learn more about handwritten bundles.
 ///
-/// [IDL definitions]: https://github.com/rerun-io/rerun/tree/latest/crates/store/re_sdk_types/definitions/rerun
-/// [Custom Data Loader]: https://github.com/rerun-io/rerun/blob/latest/examples/rust/custom_data_loader
+/// [IDL definitions]: https://github.com/rerun-io/rerun/tree/latest/crates/build/re_type_definitions/rerun
+/// [Custom Data Importer]: https://github.com/rerun-io/rerun/blob/latest/examples/rust/custom_importer
 /// [`Component`]: [crate::Component]
 pub trait AsComponents {
     /// Exposes the object's contents as a set of [`SerializedComponentBatch`]es.
     ///
     /// This is the main mechanism for easily extending builtin archetypes or even writing
     /// fully custom ones.
-    /// Have a look at our [Custom Data Loader] example to learn more about extending archetypes.
+    /// Have a look at our [Custom Data Importer] example to learn more about extending archetypes.
     ///
     /// Implementers of [`AsComponents`] get one last chance to override the tags in the
     /// [`ComponentDescriptor`], see [`SerializedComponentBatch::with_descriptor_override`].
     ///
-    /// [Custom Data Loader]: https://github.com/rerun-io/rerun/blob/latest/docs/snippets/all/tutorials/custom_data.rs
+    /// [Custom Data Importer]: https://github.com/rerun-io/rerun/blob/latest/docs/snippets/all/tutorials/custom_data.rs
     /// [`ComponentDescriptor`]: [crate::ComponentDescriptor]
     //
     // NOTE: Don't bother returning a CoW here: we need to dynamically discard optional components
@@ -208,7 +208,16 @@ mod tests {
 
     use crate::{Component as _, ComponentDescriptor};
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        bytemuck::Pod,
+        bytemuck::Zeroable,
+        re_byte_size::SizeBytes,
+    )]
     #[repr(transparent)]
     pub struct MyColor(pub u32);
 
@@ -224,39 +233,30 @@ mod tests {
 
     crate::macros::impl_into_cow!(MyColor);
 
-    impl re_byte_size::SizeBytes for MyColor {
-        #[inline]
-        fn heap_size_bytes(&self) -> u64 {
-            let Self(_) = self;
-            0
-        }
-    }
-
-    impl crate::Loggable for MyColor {
+    impl crate::ArrowDatatype for MyColor {
         fn arrow_datatype() -> arrow::datatypes::DataType {
             arrow::datatypes::DataType::UInt32
         }
+    }
 
-        fn to_arrow_opt<'a>(
-            data: impl IntoIterator<Item = Option<impl Into<std::borrow::Cow<'a, Self>>>>,
+    impl crate::ToArrow for MyColor {
+        fn to_arrow<'a>(
+            data: impl IntoIterator<Item = impl Into<std::borrow::Cow<'a, Self>>>,
         ) -> crate::SerializationResult<arrow::array::ArrayRef>
         where
             Self: 'a,
         {
-            use crate::datatypes::UInt32;
-            UInt32::to_arrow_opt(
-                data.into_iter()
-                    .map(|opt| opt.map(Into::into).map(|c| UInt32(c.0))),
-            )
+            use crate::encodings::UInt32;
+            UInt32::to_arrow(data.into_iter().map(Into::into).map(|c| UInt32(c.0)))
         }
+    }
 
-        fn from_arrow_opt(
-            data: &dyn arrow::array::Array,
-        ) -> crate::DeserializationResult<Vec<Option<Self>>> {
-            use crate::datatypes::UInt32;
-            Ok(UInt32::from_arrow_opt(data)?
+    impl crate::FromArrow for MyColor {
+        fn from_arrow(data: &dyn arrow::array::Array) -> crate::DeserializationResult<Vec<Self>> {
+            use crate::encodings::UInt32;
+            Ok(UInt32::from_arrow(data)?
                 .into_iter()
-                .map(|opt| opt.map(|v| Self(v.0)))
+                .map(|v| Self(v.0))
                 .collect())
         }
     }

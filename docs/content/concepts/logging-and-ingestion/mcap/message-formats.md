@@ -29,10 +29,12 @@ We are continually adding support for more standard message types.
 | Misc. scalar sensor data | `sensor_msgs/Imu`, `sensor_msgs/JointState`, `sensor_msgs/Temperature`, `sensor_msgs/FluidPressure`, `sensor_msgs/RelativeHumidity`, `sensor_msgs/Illuminance`, `sensor_msgs/Range`, `sensor_msgs/BatteryState`, `sensor_msgs/Joy` | - *(usually covered via custom schemas, see [Schema reflection](#schema-reflection) below on this page)* | [Scalars](../../../reference/types/archetypes/scalars.md) |
 | Text | `std_msgs/String` | - | [TextDocument](../../../reference/types/archetypes/text_document.md) |
 | Log messages | `rcl_interfaces/Log` | `Log` | [TextLog](../../../reference/types/archetypes/text_log.md) |
+| 2D grid map | `nav_msgs/OccupancyGrid` | - | [GridMap](../../../reference/types/archetypes/grid_map.md) |
+| 3D voxel grid map | `nav2_msgs/VoxelGrid` | `VoxelGrid` | [VoxelGridMap](../../../reference/types/archetypes/voxel_grid_map.md) |
 
 ### Timelines
 
-The MCAP data loader adds [timelines](../../../concepts/logging-and-ingestion/timelines.md) based on the message timestamps.
+The MCAP importer adds [timelines](../../../concepts/logging-and-ingestion/timelines.md) based on the message timestamps.
 
 In addition to the `message_log_time` and `message_publish_time` timestamps that are part of every MCAP message, we also add timelines with the application-specific timestamps from ROS and Foxglove schemas.
 
@@ -66,16 +68,17 @@ Pose messages are converted to [`InstancePoses3D`](../../../reference/types/arch
 Just like `Transform3D`, you can visualize these poses in the viewer by selecting the entity and adding a `TransformAxes3D` visualizer in the selection panel.
 Note that the visualization requires the parent coordinate frame of the pose to be known, i.e. part of the transform hierarchy of your data.
 
-[`CoordinateFrame`](../../../reference/types/archetypes/coordinate_frame.md)s are also used for other message types that are supported by the `ros2msg` layer, if they have an [`std_msgs/Header`](https://docs.ros2.org/foxy/api/std_msgs/msg/Header.html) with a `frame_id`.
+[`CoordinateFrame`](../../../reference/types/archetypes/coordinate_frame.md)s are also used for other message types that are supported by the `ros2msg` decoder, if they have an [`std_msgs/Header`](https://docs.ros2.org/foxy/api/std_msgs/msg/Header.html) with a `frame_id`.
 For data that can be visualized in 3D views (e.g. point clouds), this means that the viewer takes the respective coordinate frame's transform into account and renders the data relative to it.
 
 ## Schema reflection
 
 MCAP files allow for arbitrary custom message payloads, so you might have other message types in your files than the set of ROS 2 or Foxglove messages that Rerun automatically converts to archetypes.
 
-Rerun's MCAP data loader automatically decodes unknown Protobuf or ROS 2 messages using schema reflection.
+Rerun's MCAP importer automatically decodes unknown Protobuf or ROS 2 messages using schema reflection.
 This means that you won't get Rerun archetypes out of the box, but the message fields become queryable components (e.g. for training data curation via the Rerun SDK, see [here](decoders-explained.md#accessing-decoder-data)).
 Depending on the contents of your data, you can still manually add visualizers for certain fields to your blueprint, e.g. a time-series view for scalars or a dataframe view.
+You can also use [Lenses](../../query-and-transform/lenses.md) to attach Rerun semantics to the reflected data.
 
 ### Example: time-series plot for custom message scalars
 
@@ -113,8 +116,18 @@ You can see this also in the selection panel:
 
 ## ROS1 message types
 
-ROS1 messages are currently not supported for semantic interpretation through any layer.
-The `raw` and `schema` layers are able to preserve the original bytes and structure of the messages.
+ROS 1 data is not supported for semantic interpretation through any decoder.
+The `raw` and `schema` decoders are able to preserve the original bytes and structure of ROS 1 messages in MCAP files, but Rerun will not convert them to visualization archetypes.
+
+We don't plan to add support for ROS 1 in Rerun, as it has reached [end-of-life](https://www.ros.org/blog/noetic-eol/) in May 2025.
+But if you have legacy ROS 1 data and want to migrate it to modern formats, we recommend to try external tools like [`rosbags`](https://ternaris.gitlab.io/rosbags/).
+For example, this command converts a ROS 1 `.bag` to a ROS 2 CDR-encoded `.mcap` that Rerun can import like any other supported ROS 2 recording:
+```bash
+rosbags-convert --src my_data_ros1.bag --dst my_data_ros2 --dst-storage mcap
+
+rerun my_data_ros2/my_data_ros2.mcap
+```
+Please refer to the `rosbags` documentation for further information.
 
 ## Adding support for new types
 

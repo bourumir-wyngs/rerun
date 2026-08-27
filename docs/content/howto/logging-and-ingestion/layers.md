@@ -1,16 +1,39 @@
 ---
 title: Using layers to append data to segments
 order: 150
+description: Append data to existing segments via named layers
 ---
 
+In the [catalog object model](../../concepts/query-and-transform/catalog-object-model.md#datasets), a dataset is a collection of segments, and each segment is a collection of named layers.
+Together, layers form one logical segment.
 
+See [Recordings on a catalog server](../../concepts/logging-and-ingestion/recordings.md#recordings-on-a-catalog-server) for how segments and layers relate to recordings.
 
-In the [catalog object model](../../concepts/query-and-transform/catalog-object-model.md), datasets are a collection of segments, which are a collection of layers identified by a name.
-Layers are immutable, but data can be added to segments by registering other layers with the same recording id but a different layer name.
-This how-to page provides examples for two ways data can be added to existing datasets through layers.
+## Why use layers?
 
-Note: layers should not be confused with [MCAP decoders](../../concepts/logging-and-ingestion/mcap/decoders-explained.md), which serve a different purpose in the context of MCAP file ingestion.
+The initial recording is rarely the final form of a segment.
+For example, you may want to augment it with additional data like annotations or model predictions that weren't part of the live recording, or do incremental edits like resizing images.
 
+Layers provide a way to organize and maintain this progression in a structured and composable way.
+You can register the original recording as one base layer of a segment and augment it in a modular way through additional layers.
+
+Consider a simple scenario:
+
+- You record live camera images, robot joint states, and motion-tracking data.
+- Later, you compute a tracking-error metric for each segment so that you can query for high-quality segments.
+- You also have URDF files describing the robot and scene, along with camera calibration data.
+  Using these assets together with the recorded joint states, you can reconstruct the robot's full 3D trajectory.
+
+The outputs from each of these stages can be registered as separate layers — for example, `"base"`, `"tracking_error"`, and `"urdf"`.
+
+A layer is immutable once created, but a segment can be enriched over time by registering additional layers with the same recording ID and a different layer name.
+
+Importantly, layers are natively understood by Rerun's visualization and query systems.
+Viewing or querying a segment automatically includes all its layers, making it work as a single logical unit.
+
+---
+
+This how-to page provides examples of two ways to add data to existing datasets using layers.
 
 ## Adding data to existing segments using layers
 
@@ -102,7 +125,6 @@ The property now appears in the segment table:
 
 snippet: howto/layers[verify]
 
-
 Output:
 
 ```
@@ -141,10 +163,7 @@ Registering a `.rrd` file with a `recording_id` and `layer_name` that already ex
 
 ### How can I replace an existing layer?
 
-<!-- TODO(RR-3451) update this when the python API is updated -->
-
-There is currently no way to replace an existing layer using the Python SDK.
-The current workaround consists of recreating the dataset.
+You can specify how duplicate segment layers should be handled by passing an [`OnDuplicateSegmentLayer`](https://ref.rerun.io/docs/python/stable/catalog/#rerun.catalog.OnDuplicateSegmentLayer) value (ERROR, SKIP, REPLACE) to [`DatasetEntry.register()`](https://ref.rerun.io/docs/python/stable/catalog/#rerun.catalog.DatasetEntry.register) or [`DatasetEntry.register_prefix()`](https://ref.rerun.io/docs/python/stable/catalog/#rerun.catalog.DatasetEntry.register_prefix). To replace an existing layer, set `on_duplicate = OnDuplicateSegmentLayer.REPLACE`.
 
 ### Can I query a single layer with the dataframe query?
 
@@ -162,43 +181,29 @@ Some segments may have additional layers that others do not.
 
 When you register a recording without specifying a `layer_name`, it is assigned to the `"base"` layer.
 
-
 ### Is it possible to obtain a dataframe with a list of all layers in a dataset?
 
 Yes.
-The [`DatasetEntry.manifest()`](https://ref.rerun.io/docs/python/stable/common/catalog/#rerun.catalog.DatasetEntry.manifest) method returns a DataFusion DataFrame containing the full dataset manifest, which includes layer information for each segment:
+The [`DatasetEntry.segment_table()`](https://ref.rerun.io/docs/python/stable/common/catalog/#rerun.catalog.DatasetEntry.segment_table) method returns a DataFusion DataFrame with one row per segment and a `rerun_layer_names` column listing the layers of each segment:
 
-snippet: howto/layers[manifest]
+snippet: howto/layers[list_layers]
 
 Output:
 
 ```
-┌───────────────────────────────────────┬──────────────────┬────────────────────────────────────┐
-│ rerun_segment_id                      ┆ rerun_layer_name ┆ property:quality:tracking_good     │
-│ ---                                   ┆ ---              ┆ ---                                │
-│ type: Utf8                            ┆ type: Utf8       ┆ type: nullable List[nullable bool] │
-│                                       ┆                  ┆ component: tracking_good           │
-│                                       ┆                  ┆ entity_path: /__properties/quality │
-│                                       ┆                  ┆ kind: data                         │
-╞═══════════════════════════════════════╪══════════════════╪════════════════════════════════════╡
-│ ILIAD_50aee79f_2023_07_12_20h_55m_08s ┆ base             ┆ null                               │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ ILIAD_50aee79f_2023_07_12_20h_55m_08s ┆ quality          ┆ [false]                            │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ ILIAD_50aee79f_2023_07_12_20h_55m_08s ┆ tracking_error   ┆ null                               │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ ILIAD_5e938e3b_2023_07_20_10h_40m_10s ┆ base             ┆ null                               │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ ILIAD_5e938e3b_2023_07_20_10h_40m_10s ┆ quality          ┆ [false]                            │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ ILIAD_5e938e3b_2023_07_20_10h_40m_10s ┆ tracking_error   ┆ null                               │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ ILIAD_5e938e3b_2023_07_28_11h_25m_26s ┆ base             ┆ null                               │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ ILIAD_5e938e3b_2023_07_28_11h_25m_26s ┆ quality          ┆ [true]                             │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ ILIAD_5e938e3b_2023_07_28_11h_25m_26s ┆ tracking_error   ┆ null                               │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ ILIAD_j807b3f8_2023_06_15_13h_42m_56s ┆ base             ┆ null                               │
-└───────────────────────────────────────┴──────────────────┴────────────────────────────────────┘
+┌───────────────────────────────────────┬─────────────────────────────────┐
+│ rerun_segment_id                      ┆ rerun_layer_names               │
+│ ---                                   ┆ ---                             │
+│ type: Utf8                            ┆ type: List[Utf8]                │
+╞═══════════════════════════════════════╪═════════════════════════════════╡
+│ ILIAD_50aee79f_2023_07_12_20h_55m_08s ┆ [base, tracking_error, quality] │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ ILIAD_5e938e3b_2023_07_20_10h_40m_10s ┆ [base, tracking_error, quality] │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ ILIAD_5e938e3b_2023_07_28_11h_25m_26s ┆ [base, tracking_error, quality] │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ ILIAD_j807b3f8_2023_06_15_13h_42m_56s ┆ [base, tracking_error, quality] │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ ILIAD_sbd7d2c6_2023_12_24_16h_20m_37s ┆ [base, tracking_error, quality] │
+└───────────────────────────────────────┴─────────────────────────────────┘
 ```

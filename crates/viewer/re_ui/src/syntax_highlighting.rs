@@ -1,4 +1,4 @@
-use egui::text::LayoutJob;
+use egui::text::{ByteIndex, LayoutJob};
 use egui::{Color32, Style, TextFormat, TextStyle};
 use re_entity_db::InstancePath;
 use re_log_types::external::re_types_core::{
@@ -78,9 +78,9 @@ impl SyntaxHighlightedBuilder {
     }
 
     fn append_kind(&mut self, style: SyntaxHighlightedStyle, portion: &str) -> &mut Self {
-        let start = self.text.len();
+        let start = ByteIndex(self.text.len());
         self.text.push_str(portion);
-        let end = self.text.len();
+        let end = ByteIndex(self.text.len());
         self.parts.push(SyntaxHighlightedPart {
             byte_range: start..end,
             style,
@@ -222,29 +222,10 @@ impl SyntaxHighlightedBuilder {
     }
 
     /// Append text with a custom format closure.
-    #[inline]
-    pub fn append_with_format_closure<F>(&mut self, text: &str, f: F) -> &mut Self
-    where
-        F: 'static + Fn(&Style) -> TextFormat,
-    {
-        self.append_kind(SyntaxHighlightedStyle::CustomClosure(Box::new(f)), text);
-        self
-    }
-
     /// With a custom format.
     #[inline]
     pub fn with_format(mut self, text: &str, format: TextFormat) -> Self {
         self.append_with_format(text, format);
-        self
-    }
-
-    /// With a custom format closure.
-    #[inline]
-    pub fn with_format_closure<F>(mut self, text: &str, f: F) -> Self
-    where
-        F: 'static + Fn(&Style) -> TextFormat,
-    {
-        self.append_with_format_closure(text, f);
         self
     }
 }
@@ -296,7 +277,6 @@ enum SyntaxHighlightedStyle {
     BodyDefault,
     BodyItalics,
     Custom(Box<TextFormat>),
-    CustomClosure(Box<dyn Fn(&Style) -> TextFormat>),
 }
 
 impl std::fmt::Debug for SyntaxHighlightedStyle {
@@ -313,14 +293,13 @@ impl std::fmt::Debug for SyntaxHighlightedStyle {
             Self::BodyDefault => write!(f, "BodyDefault"),
             Self::BodyItalics => write!(f, "BodyItalics"),
             Self::Custom(_) => write!(f, "Custom(…)"),
-            Self::CustomClosure(_) => write!(f, "CustomClosure(…)"),
         }
     }
 }
 
 #[derive(Debug)]
 struct SyntaxHighlightedPart {
-    byte_range: std::ops::Range<usize>,
+    byte_range: egui::text::ByteRange,
     style: SyntaxHighlightedStyle,
 }
 
@@ -375,7 +354,6 @@ impl SyntaxHighlightedStyle {
                 format
             }
             Self::Custom(format) => *format.clone(),
-            Self::CustomClosure(f) => f(style),
         }
     }
 }

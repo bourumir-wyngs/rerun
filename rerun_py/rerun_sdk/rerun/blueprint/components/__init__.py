@@ -10,11 +10,13 @@ from .auto_layout import AutoLayout, AutoLayoutBatch
 from .auto_scroll import AutoScroll, AutoScrollBatch
 from .auto_views import AutoViews, AutoViewsBatch
 from .background_kind import BackgroundKind, BackgroundKindArrayLike, BackgroundKindBatch, BackgroundKindLike
+from .column_name import ColumnName, ColumnNameBatch
 from .column_order import ColumnOrder, ColumnOrderArrayLike, ColumnOrderBatch, ColumnOrderLike
 from .column_share import ColumnShare, ColumnShareBatch
 from .component_column_selector import ComponentColumnSelector, ComponentColumnSelectorBatch
 from .container_kind import ContainerKind, ContainerKindArrayLike, ContainerKindBatch, ContainerKindLike
 from .corner2d import Corner2D, Corner2DArrayLike, Corner2DBatch, Corner2DLike
+from .editable import Editable, EditableBatch
 from .enabled import Enabled, EnabledBatch
 from .eye3d_kind import Eye3DKind, Eye3DKindArrayLike, Eye3DKindBatch, Eye3DKindLike
 from .filter_by_range import FilterByRange, FilterByRangeBatch
@@ -38,6 +40,8 @@ from .query_expression import QueryExpression, QueryExpressionBatch
 from .root_container import RootContainer, RootContainerBatch
 from .row_share import RowShare, RowShareBatch
 from .selected_columns import SelectedColumns, SelectedColumnsBatch
+from .table_cell_kind import TableCellKind, TableCellKindArrayLike, TableCellKindBatch, TableCellKindLike
+from .table_layout_kind import TableLayoutKind, TableLayoutKindArrayLike, TableLayoutKindBatch, TableLayoutKindLike
 from .tensor_dimension_index_slider import TensorDimensionIndexSlider, TensorDimensionIndexSliderBatch
 from .text_log_column import TextLogColumn, TextLogColumnBatch
 from .time_int import TimeInt, TimeIntBatch
@@ -75,6 +79,8 @@ __all__ = [
     "BackgroundKindArrayLike",
     "BackgroundKindBatch",
     "BackgroundKindLike",
+    "ColumnName",
+    "ColumnNameBatch",
     "ColumnOrder",
     "ColumnOrderArrayLike",
     "ColumnOrderBatch",
@@ -91,6 +97,8 @@ __all__ = [
     "Corner2DArrayLike",
     "Corner2DBatch",
     "Corner2DLike",
+    "Editable",
+    "EditableBatch",
     "Enabled",
     "EnabledBatch",
     "Eye3DKind",
@@ -149,6 +157,14 @@ __all__ = [
     "RowShareBatch",
     "SelectedColumns",
     "SelectedColumnsBatch",
+    "TableCellKind",
+    "TableCellKindArrayLike",
+    "TableCellKindBatch",
+    "TableCellKindLike",
+    "TableLayoutKind",
+    "TableLayoutKindArrayLike",
+    "TableLayoutKindBatch",
+    "TableLayoutKindLike",
     "TensorDimensionIndexSlider",
     "TensorDimensionIndexSliderBatch",
     "TextLogColumn",

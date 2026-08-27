@@ -10,7 +10,7 @@ use re_sdk_types::blueprint::components::{
     ActiveTab, ColumnShare, ContainerKind, GridColumns, IncludedContent, RowShare,
 };
 use re_sdk_types::components::{Name, Visible};
-use re_sdk_types::{Archetype as _, Loggable as _};
+use re_sdk_types::{Archetype as _, ArrowDatatype as _};
 use re_viewer_context::{
     BlueprintContext as _, ContainerId, Contents, ContentsName, ViewId, ViewerContext,
 };
@@ -71,6 +71,7 @@ impl ContainerBlueprint {
         // ----
 
         let results = blueprint_db.storage_engine().cache().latest_at(
+            re_chunk_store::ChunkTrackingMode::Report,
             query,
             &id.as_entity_path(),
             blueprint_archetypes::ContainerBlueprint::all_component_identifiers(),
@@ -422,7 +423,7 @@ impl ContainerBlueprint {
                             children.clone(),
                         );
 
-                        for (share, id) in self.col_shares.iter().zip(children.iter()) {
+                        for (share, id) in std::iter::zip(&self.col_shares, &children) {
                             linear.shares.set_share(*id, *share);
                         }
 
@@ -434,7 +435,7 @@ impl ContainerBlueprint {
                             children.clone(),
                         );
 
-                        for (share, id) in self.row_shares.iter().zip(children.iter()) {
+                        for (share, id) in std::iter::zip(&self.row_shares, &children) {
                             linear.shares.set_share(*id, *share);
                         }
 

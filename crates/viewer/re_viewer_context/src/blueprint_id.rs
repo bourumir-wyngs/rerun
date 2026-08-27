@@ -18,12 +18,10 @@ pub struct BlueprintId<T: BlueprintIdRegistry> {
 }
 
 impl<T: BlueprintIdRegistry> re_byte_size::SizeBytes for BlueprintId<T> {
+    const IS_POD: bool = true;
+
     fn heap_size_bytes(&self) -> u64 {
         0
-    }
-
-    fn is_pod() -> bool {
-        true
     }
 }
 
@@ -93,21 +91,16 @@ impl<T: BlueprintIdRegistry> BlueprintId<T> {
 
     #[inline]
     pub fn as_entity_path(&self) -> EntityPath {
-        T::registry_path()
-            .iter()
-            .cloned()
-            .chain(std::iter::once(EntityPathPart::new(self.id.to_string())))
-            .collect()
+        std::iter::chain(
+            T::registry_path().iter().cloned(),
+            std::iter::once(EntityPathPart::new(self.id.to_string())),
+        )
+        .collect()
     }
 
     #[inline]
     pub fn registry() -> &'static EntityPath {
         T::registry_path()
-    }
-
-    #[inline]
-    pub fn registry_part() -> &'static EntityPathPart {
-        &T::registry_path().as_slice()[0]
     }
 
     #[inline]
@@ -131,9 +124,9 @@ impl<T: BlueprintIdRegistry> From<uuid::Uuid> for BlueprintId<T> {
     }
 }
 
-impl<T: BlueprintIdRegistry> From<re_sdk_types::datatypes::Uuid> for BlueprintId<T> {
+impl<T: BlueprintIdRegistry> From<re_sdk_types::encodings::Uuid> for BlueprintId<T> {
     #[inline]
-    fn from(id: re_sdk_types::datatypes::Uuid) -> Self {
+    fn from(id: re_sdk_types::encodings::Uuid) -> Self {
         Self {
             id: id.into(),
             _registry: std::marker::PhantomData,
@@ -141,7 +134,7 @@ impl<T: BlueprintIdRegistry> From<re_sdk_types::datatypes::Uuid> for BlueprintId
     }
 }
 
-impl<T: BlueprintIdRegistry> From<BlueprintId<T>> for re_sdk_types::datatypes::Uuid {
+impl<T: BlueprintIdRegistry> From<BlueprintId<T>> for re_sdk_types::encodings::Uuid {
     #[inline]
     fn from(id: BlueprintId<T>) -> Self {
         id.id.into()
@@ -193,6 +186,13 @@ macro_rules! define_blueprint_id_type {
 // Definitions for the different [`BlueprintId`] types.
 define_blueprint_id_type!(ViewId, ViewIdRegistry, "view");
 define_blueprint_id_type!(ContainerId, ContainerIdRegistry, "container");
+
+impl ViewId {
+    /// Returns the renderer identity corresponding to this blueprint view.
+    pub fn render_view_id(self) -> re_renderer::ViewBuilderId {
+        re_renderer::ViewBuilderId::new(re_log_types::hash::Hash64::hash(self.id).hash64())
+    }
+}
 
 // ----------------------------------------------------------------------------
 // Builtin `ViewId`s.

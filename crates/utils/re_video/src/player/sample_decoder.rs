@@ -4,7 +4,7 @@ use crate::{Chunk, Frame, Receiver, Sender, Time, VideoDataDescription};
 
 use super::{TimedDecodingError, VideoPlayerError};
 
-#[derive(Default)]
+#[derive(Default, re_byte_size::SizeBytes)]
 pub(super) struct DecoderOutput {
     /// Frames sorted by PTS.
     ///
@@ -22,6 +22,7 @@ pub(super) struct DecoderOutput {
     frames_by_pts: BTreeMap<Time, Frame>,
 
     /// Set on error; reset on success.
+    #[size_bytes(ignore)]
     error: Option<TimedDecodingError>,
 }
 
@@ -30,45 +31,44 @@ impl DecoderOutput {
         self.error = None;
         self.frames_by_pts.clear();
     }
-}
 
-impl re_byte_size::SizeBytes for DecoderOutput {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            frames_by_pts,
-            error: _,
-        } = self;
-        frames_by_pts.heap_size_bytes()
+    /// Samples can share a presentation timestamp, in which case the last one is shown.
+    fn insert_frame(&mut self, frame: Frame, video_descr: &VideoDataDescription) {
+        let pts = frame.info.presentation_timestamp;
+
+        // Which sample a frame came from is only known via its source, since the index of a
+        // sample shifts whenever samples are inserted or removed before it.
+        let sample_idx = |frame: &Frame| {
+            let source = frame.info.source?;
+            video_descr.sample_index_of_source(pts, source)
+        };
+
+        if let Some(previous) = self.frames_by_pts.get(&pts)
+            && let (Some(previous_idx), Some(new_idx)) = (sample_idx(previous), sample_idx(&frame))
+            && new_idx < previous_idx
+        {
+            return;
+        }
+
+        self.frames_by_pts.insert(pts, frame);
     }
 }
 
 /// Internal implementation detail of the [`super::VideoPlayer`].
 ///
 /// Expected to be reset upon backwards seeking.
+#[derive(re_byte_size::SizeBytes)]
 pub struct VideoSampleDecoder {
     debug_name: String,
+    // TODO(RR-3800): maybe we should count this
+    #[size_bytes(ignore)]
     decoder: Box<dyn crate::AsyncDecoder>,
 
     frame_receiver: Receiver<crate::FrameResult>,
     decoder_output: DecoderOutput,
 
     /// The [`Chunk::sample_idx`] of the latest submitted sample.
-    latest_sample_idx: Option<usize>,
-}
-
-impl re_byte_size::SizeBytes for VideoSampleDecoder {
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            debug_name,
-            decoder: _, // TODO(RR-3800): maybe we should count this
-            frame_receiver,
-            decoder_output,
-            latest_sample_idx: _,
-        } = self;
-        debug_name.heap_size_bytes()
-            + frame_receiver.current_bytes()
-            + decoder_output.heap_size_bytes()
-    }
+    latest_sample_idx: Option<crate::SampleIndex>,
 }
 
 impl VideoSampleDecoder {
@@ -94,7 +94,7 @@ impl VideoSampleDecoder {
     }
 
     /// Processes all frames received from the asynchronously running decoder.
-    fn process_decoder_output(&mut self) {
+    fn process_decoder_output(&mut self, video_descr: &VideoDataDescription) {
         loop {
             match self.frame_receiver.try_recv() {
                 Ok(frame) => {
@@ -104,9 +104,7 @@ impl VideoSampleDecoder {
                                 "Decoded frame at PTS {:?}",
                                 frame.info.presentation_timestamp
                             );
-                            self.decoder_output
-                                .frames_by_pts
-                                .insert(frame.info.presentation_timestamp, frame);
+                            self.decoder_output.insert_frame(frame, video_descr);
                             self.decoder_output.error = None; // We successfully decoded a frame, reset the error state.
                         }
                         Err(err) => {
@@ -199,8 +197,12 @@ impl VideoSampleDecoder {
     ///
     /// Afterwards, you can retrieve the frame that is at or after the PTS using [`Self::oldest_available_frame`]
     /// (without a mutable reference to the decoder).
-    pub fn process_incoming_frames_and_drop_earlier_than(&mut self, pts: Time) {
-        self.process_decoder_output();
+    pub fn process_incoming_frames_and_drop_earlier_than(
+        &mut self,
+        pts: Time,
+        video_descr: &VideoDataDescription,
+    ) {
+        self.process_decoder_output(video_descr);
 
         // Latest-at semantics means that if `pts` doesn't land on the exact PTS of a decode frame we have,
         // we provide the next *older* frame.
@@ -227,7 +229,7 @@ impl VideoSampleDecoder {
         self.decoder.reset(video_descr)?;
 
         // Flush out any pending frames.
-        self.process_decoder_output();
+        self.process_decoder_output(video_descr);
         self.decoder_output.clear();
         self.latest_sample_idx = None;
 

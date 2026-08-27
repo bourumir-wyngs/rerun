@@ -3,9 +3,9 @@ use std::io::{Read, Seek};
 
 use mcap::Summary;
 use mcap::sans_io::{SummaryReadEvent, SummaryReader};
-use re_chunk::TimePoint;
+use re_chunk::{TimePoint, TimelineName};
+use re_int::SaturatingCast as _;
 use re_log_types::{TimeCell, TimeType};
-use saturating_cast::SaturatingCast as _;
 
 use crate::Error;
 use crate::parsers::ChannelId;
@@ -14,7 +14,13 @@ use crate::parsers::ChannelId;
 pub fn read_summary<R: Read + Seek>(mut reader: R) -> anyhow::Result<Option<Summary>> {
     let mut summary_reader = SummaryReader::new();
     while let Some(event) = summary_reader.next_event() {
-        match event? {
+        let event = event.map_err(|err| match err {
+            mcap::McapError::BadMagic => {
+                anyhow::anyhow!("MCAP file does not end with the expected magic bytes")
+            }
+            err => anyhow::Error::from(err),
+        })?;
+        match event {
             SummaryReadEvent::SeekRequest(pos) => {
                 summary_reader.notify_seeked(reader.seek(pos)?);
             }
@@ -75,9 +81,8 @@ pub fn log_and_publish_timepoint_from_msg(
     msg: &mcap::Message<'_>,
     time_type: TimeType,
 ) -> TimePoint {
-    let log_time_cell = crate::util::TimestampCell::from_nanos_default(msg.log_time, time_type);
-    let publish_time_cell =
-        crate::util::TimestampCell::from_nanos_default(msg.publish_time, time_type);
+    let log_time_cell = TimestampCell::from_nanos_default(msg.log_time, time_type);
+    let publish_time_cell = TimestampCell::from_nanos_default(msg.publish_time, time_type);
     re_chunk::TimePoint::from([
         ("message_log_time", log_time_cell.into_time_cell()),
         ("message_publish_time", publish_time_cell.into_time_cell()),
@@ -85,9 +90,9 @@ pub fn log_and_publish_timepoint_from_msg(
 }
 
 /// A timestamp or duration on a specific timeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimestampCell {
-    pub timeline: String,
+    pub timeline: TimelineName,
     pub time: TimeCell,
 }
 
@@ -96,7 +101,7 @@ impl TimestampCell {
     ///
     /// Always interprets the value as a timestamp, regardless of magnitude.
     /// Use [`Self::from_nanos_with_type`] for configurable [`TimeType`].
-    pub fn from_nanos(timestamp_ns: u64, timeline: impl Into<String>) -> Self {
+    pub fn from_nanos(timestamp_ns: u64, timeline: impl Into<TimelineName>) -> Self {
         let ns = timestamp_ns.saturating_cast::<i64>();
         Self {
             timeline: timeline.into(),
@@ -107,7 +112,7 @@ impl TimestampCell {
     /// Create a time cell with a configurable [`TimeType`] and custom timeline name.
     pub fn from_nanos_with_type(
         nanos: u64,
-        timeline: impl Into<String>,
+        timeline: impl Into<TimelineName>,
         time_type: TimeType,
     ) -> Self {
         let ns = nanos.saturating_cast::<i64>();
@@ -133,7 +138,7 @@ impl TimestampCell {
     }
 
     /// The timeline name for this time cell.
-    pub fn timeline_name(&self) -> &str {
+    pub fn timeline_name(&self) -> &TimelineName {
         &self.timeline
     }
 
@@ -146,6 +151,7 @@ impl TimestampCell {
 #[cfg(test)]
 mod tests {
     #![expect(clippy::cast_possible_wrap)] // ok in tests
+    use std::assert_matches;
 
     use re_log_types::TimeType;
 
@@ -156,7 +162,7 @@ mod tests {
         let ts: u64 = 1_672_531_200_000_000_000; // 2023-01-01
         let cell = TimestampCell::from_nanos_default(ts, TimeType::TimestampNs);
         assert_eq!(cell.timeline_name(), "timestamp");
-        assert!(matches!(cell.time.typ, TimeType::TimestampNs));
+        assert_matches!(cell.time.typ, TimeType::TimestampNs);
         assert_eq!(
             cell.time,
             TimeCell::from_timestamp_nanos_since_epoch(ts as i64)
@@ -164,7 +170,7 @@ mod tests {
 
         let cell = TimestampCell::from_nanos_default(ts, TimeType::DurationNs);
         assert_eq!(cell.timeline_name(), "timestamp");
-        assert!(matches!(cell.time.typ, TimeType::DurationNs));
+        assert_matches!(cell.time.typ, TimeType::DurationNs);
         assert_eq!(cell.time, TimeCell::from_duration_nanos(ts as i64));
     }
 
@@ -173,7 +179,7 @@ mod tests {
         let ts: u64 = 1_672_531_200_000_000_000;
         let cell = TimestampCell::from_nanos_ros2(ts, TimeType::TimestampNs);
         assert_eq!(cell.timeline_name(), "ros2_timestamp");
-        assert!(matches!(cell.time.typ, TimeType::TimestampNs));
+        assert_matches!(cell.time.typ, TimeType::TimestampNs);
     }
 
     #[test]

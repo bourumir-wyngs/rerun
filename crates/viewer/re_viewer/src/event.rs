@@ -13,6 +13,7 @@ use std::rc::Rc;
 use re_entity_db::EntityDb;
 use re_log_channel::LogSource;
 use re_log_types::{ApplicationId, RecordingId, TimeReal, Timeline, TimelineName};
+use re_sdk_types::SegmentId;
 use re_viewer_context::{ContainerId, Item, ItemCollection, ItemContext, ViewId};
 use re_viewport_blueprint::ViewportBlueprint;
 
@@ -26,7 +27,7 @@ pub struct ViewerEvent {
     #[serde(with = "serde::recording_id")]
     pub recording_id: RecordingId,
 
-    pub segment_id: Option<String>,
+    pub segment_id: Option<SegmentId>,
 
     #[serde(flatten)]
     pub kind: ViewerEventKind,
@@ -37,7 +38,11 @@ impl ViewerEvent {
     fn from_db_and_kind(db: &EntityDb, kind: ViewerEventKind) -> Self {
         let segment_id = db.data_source.as_ref().and_then(|ds| {
             if let LogSource::RedapGrpcStream {
-                uri: re_uri::DatasetSegmentUri { segment_id, .. },
+                uri:
+                    re_uri::DatasetUri {
+                        segment_id: Some(segment_id),
+                        ..
+                    },
                 ..
             } = ds
             {
@@ -183,7 +188,7 @@ impl SelectionChangeItem {
             | Item::AppId(_)
             | Item::ComponentPath(_)
             | Item::DataSource(_)
-            | Item::RedapEntry(_)
+            | Item::RedapEntry { .. }
             | Item::RedapServer(_)
             | Item::TableId(_) => None,
             Item::View(view_id) => Some(Self::View {

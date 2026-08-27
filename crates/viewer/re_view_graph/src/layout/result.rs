@@ -6,7 +6,7 @@ use re_chunk::EntityPath;
 use super::EdgeGeometry;
 use crate::graph::{EdgeId, NodeId};
 
-#[derive(Debug)]
+#[derive(Debug, re_byte_size::SizeBytes)]
 pub struct Layout {
     pub(super) nodes: ahash::HashMap<NodeId, Rect>,
     pub(super) edges: ahash::HashMap<EdgeId, Vec<EdgeGeometry>>,
@@ -37,11 +37,6 @@ impl Layout {
     /// Gets the final position and size of a node in the layout.
     pub fn get_node(&self, node: &NodeId) -> Option<Rect> {
         self.nodes.get(node).copied()
-    }
-
-    /// Gets the shape of an edge in the final layout.
-    pub fn get_edge(&self, edge: &EdgeId) -> Option<&[EdgeGeometry]> {
-        self.edges.get(edge).map(|es| es.as_slice())
     }
 
     /// Returns an iterator over all edges in the layout.

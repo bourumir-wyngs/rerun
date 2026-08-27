@@ -16,8 +16,8 @@ use re_sdk_types::blueprint::components::{
 };
 use re_sdk_types::{Archetype as _, ViewClassIdentifier};
 use re_viewer_context::{
-    BlueprintContext as _, ContainerId, Contents, Item, ViewId, ViewerContext, VisitorControlFlow,
-    blueprint_id_to_tile_id,
+    BlueprintContext as _, ContainerId, Contents, Item, MAX_VIEWS_SPAWNED, ViewId, ViewerContext,
+    VisitorControlFlow, blueprint_id_to_tile_id,
 };
 use smallvec::SmallVec;
 
@@ -84,6 +84,7 @@ impl ViewportBlueprint {
         let blueprint_engine = blueprint_db.storage_engine();
 
         let results = blueprint_engine.cache().latest_at(
+            re_chunk_store::ChunkTrackingMode::Report,
             query,
             &VIEWPORT_PATH.into(),
             blueprint_archetypes::ViewportBlueprint::all_component_identifiers(),
@@ -263,7 +264,7 @@ impl ViewportBlueprint {
             | Item::StoreId(_)
             | Item::ComponentPath(_)
             | Item::InstancePath(_)
-            | Item::RedapEntry(_)
+            | Item::RedapEntry { .. }
             | Item::RedapServer(_) => true,
 
             Item::View(view_id) => self.view(view_id).is_some(),
@@ -272,7 +273,7 @@ impl ViewportBlueprint {
                 self.view(&data_result.view_id).is_some_and(|view| {
                     let entity_path = &data_result.instance_path.entity_path;
 
-                    // TODO(#5742): including any path that is—or descend from—the space origin is
+                    // TODO(#5742): including any path that is — or descend from — the space origin is
                     // necessary because such items may actually be displayed in the blueprint tree.
                     entity_path == &view.space_origin
                         || entity_path.is_descendant_of(&view.space_origin)
@@ -315,7 +316,6 @@ impl ViewportBlueprint {
             let include_entity = |ent: &EntityPath| !excluded_entities.matches(ent);
 
             let spawn_heuristics = entry.class.spawn_heuristics(ctx, &include_entity);
-            let max_views_spawned = spawn_heuristics.max_views_spawned();
             let mut recommended_views = spawn_heuristics.into_vec();
 
             re_tracing::profile_scope!("filter_recommendations_for", class_id);
@@ -327,9 +327,9 @@ impl ViewportBlueprint {
                 .filter(|view| view.class_identifier() == class_id)
                 .count();
 
-            // Limit recommendations based on max_views_spawned.
+            // Limit recommendations based on `MAX_VIEWS_SPAWNED`.
             // If we already have max or more views, don't spawn any more.
-            let max_new_views = max_views_spawned.saturating_sub(existing_view_count);
+            let max_new_views = MAX_VIEWS_SPAWNED.saturating_sub(existing_view_count);
             if max_new_views < recommended_views.len() {
                 recommended_views.truncate(max_new_views);
             }
@@ -356,11 +356,9 @@ impl ViewportBlueprint {
             // If now the user edits the view at `/**` to be `/points/**`, that does *not*
             // mean we should suddenly add `/camera/**` to the viewport.
             if !recommended_views.is_empty() {
-                let new_viewer_recommendation_hashes: Vec<ViewerRecommendationHash> = self
-                    .past_viewer_recommendations
-                    .iter()
-                    .cloned()
-                    .chain(
+                let new_viewer_recommendation_hashes: Vec<ViewerRecommendationHash> =
+                    std::iter::chain(
+                        self.past_viewer_recommendations.iter().cloned(),
                         recommended_views
                             .iter()
                             .map(|recommendation| recommendation.recommendation_hash(class_id)),
@@ -455,14 +453,12 @@ impl ViewportBlueprint {
 
     /// Returns an iterator over all the contents (views and containers) in the viewport.
     pub fn contents_iter(&self) -> impl Iterator<Item = Contents> + '_ {
-        self.views
-            .keys()
-            .map(|view_id| Contents::View(*view_id))
-            .chain(
-                self.containers
-                    .keys()
-                    .map(|container_id| Contents::Container(*container_id)),
-            )
+        std::iter::chain(
+            self.views.keys().map(|view_id| Contents::View(*view_id)),
+            self.containers
+                .keys()
+                .map(|container_id| Contents::Container(*container_id)),
+        )
     }
 
     /// Walk the entire [`Contents`] tree, starting from the root container.
@@ -516,12 +512,6 @@ impl ViewportBlueprint {
         }
 
         ControlFlow::Continue(())
-    }
-
-    /// Given a predicate, finds the (first) matching contents by recursively walking from the root
-    /// container.
-    pub fn find_contents_by(&self, predicate: &impl Fn(&Contents) -> bool) -> Option<Contents> {
-        self.find_contents_in_container_by(predicate, &self.root_container)
     }
 
     /// Given a predicate, finds the (first) matching contents by recursively walking from the given
@@ -898,6 +888,7 @@ impl ViewportBlueprint {
         }
 
         // Now save any contents that are a container back to the blueprint
+        #[expect(clippy::iter_over_hash_type)] // Each container saves to its own unique path.
         for (tile_id, contents) in &contents_from_tile_id {
             if let Contents::Container(container_id) = contents
                 && let Some(egui_tiles::Tile::Container(container)) = self.tree.tiles.get(*tile_id)
@@ -979,6 +970,7 @@ pub fn tree_simplification_options() -> egui_tiles::SimplificationOptions {
         prune_single_child_tabs: false,
         prune_single_child_containers: false,
         join_nested_linear_containers: true,
+        flatten_tabs_in_tabs: false,
     }
 }
 

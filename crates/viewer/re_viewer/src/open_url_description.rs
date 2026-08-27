@@ -1,4 +1,3 @@
-use re_ui::CommandPaletteUrl;
 use re_viewer_context::open_url::ViewerOpenUrl;
 
 /// A description of what happens when opening a [`ViewerOpenUrl`].
@@ -35,7 +34,7 @@ impl ViewerOpenUrlDescription {
                 let rrd_file_name = path.split('/').next_back().map(|s| s.to_owned());
 
                 Self {
-                    category: "From http link",
+                    category: "HTTP url",
                     target_short: rrd_file_name,
                 }
             }
@@ -46,10 +45,19 @@ impl ViewerOpenUrlDescription {
                 target_short: path.file_name().map(|s| s.display().to_string()),
             },
 
-            ViewerOpenUrl::RedapDatasetSegment(uri) => Self {
-                category: "Segment",
-                target_short: Some(uri.segment_id.clone()),
-            },
+            ViewerOpenUrl::RedapDataset(uri) => {
+                if let Some(segment_id) = &uri.segment_id {
+                    Self {
+                        category: "Segment",
+                        target_short: Some(segment_id.as_str().to_owned()),
+                    }
+                } else {
+                    Self {
+                        category: "Dataset",
+                        target_short: Some(uri.dataset_id.to_string()),
+                    }
+                }
+            }
 
             ViewerOpenUrl::RedapProxy(_) => Self {
                 category: "GRPC proxy",
@@ -62,8 +70,13 @@ impl ViewerOpenUrlDescription {
             },
 
             ViewerOpenUrl::RedapEntry(uri) => Self {
-                category: "Redap Entry",
+                category: "Redap entry",
                 target_short: Some(uri.entry_id.to_string()),
+            },
+
+            ViewerOpenUrl::RedapFolder(uri) => Self {
+                category: "Folder",
+                target_short: Some(uri.path.clone()),
             },
 
             ViewerOpenUrl::WebEventListener => Self {
@@ -93,20 +106,4 @@ impl ViewerOpenUrlDescription {
             },
         }
     }
-}
-
-pub fn command_palette_parse_url(url: &str) -> Option<CommandPaletteUrl> {
-    let open_url = ViewerOpenUrl::parse_with_options(
-        url,
-        &re_data_source::FromUriOptions {
-            accept_extensionless_http: true,
-            ..Default::default()
-        },
-    )
-    .ok()?;
-
-    Some(CommandPaletteUrl {
-        url: url.to_owned(),
-        command_text: format!("Open {}", ViewerOpenUrlDescription::from_url(&open_url)),
-    })
 }

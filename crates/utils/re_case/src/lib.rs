@@ -21,6 +21,7 @@ pub fn to_snake_case(s: &str) -> String {
     if let Some(last) = parts.last_mut() {
         *last = last
             .replace("UVec", "uvec")
+            .replace("IVec", "ivec")
             .replace("DVec", "dvec")
             .replace("UInt", "uint");
         *last = rerun_snake.convert(last.as_str());
@@ -40,30 +41,38 @@ fn test_to_snake_case() {
     );
 
     assert_eq!(
-        to_snake_case("rerun.datatypes.Utf8"),
-        "rerun.datatypes.utf8"
+        to_snake_case("rerun.encodings.Utf8"),
+        "rerun.encodings.utf8"
     );
     assert_eq!(
-        to_snake_case("rerun.datatypes.utf8"),
-        "rerun.datatypes.utf8"
-    );
-
-    assert_eq!(
-        to_snake_case("rerun.datatypes.UVec2D"),
-        "rerun.datatypes.uvec2d"
-    );
-    assert_eq!(
-        to_snake_case("rerun.datatypes.uvec2d"),
-        "rerun.datatypes.uvec2d"
+        to_snake_case("rerun.encodings.utf8"),
+        "rerun.encodings.utf8"
     );
 
     assert_eq!(
-        to_snake_case("rerun.datatypes.UInt32"),
-        "rerun.datatypes.uint32"
+        to_snake_case("rerun.encodings.UVec2D"),
+        "rerun.encodings.uvec2d"
     );
     assert_eq!(
-        to_snake_case("rerun.datatypes.uint32"),
-        "rerun.datatypes.uint32"
+        to_snake_case("rerun.encodings.uvec2d"),
+        "rerun.encodings.uvec2d"
+    );
+    assert_eq!(
+        to_snake_case("rerun.encodings.IVec3D"),
+        "rerun.encodings.ivec3d"
+    );
+    assert_eq!(
+        to_snake_case("rerun.encodings.ivec3d"),
+        "rerun.encodings.ivec3d"
+    );
+
+    assert_eq!(
+        to_snake_case("rerun.encodings.UInt32"),
+        "rerun.encodings.uint32"
+    );
+    assert_eq!(
+        to_snake_case("rerun.encodings.uint32"),
+        "rerun.encodings.uint32"
     );
 
     assert_eq!(
@@ -111,6 +120,7 @@ pub fn to_pascal_case(s: &str) -> String {
     if let Some(last) = parts.last_mut() {
         *last = last
             .replace("uvec", "UVec")
+            .replace("ivec", "IVec")
             .replace("dvec", "DVec")
             .replace("uint", "UInt")
             .replace("2d", "2D") // NOLINT
@@ -133,21 +143,29 @@ fn test_to_pascal_case() {
     );
 
     assert_eq!(
-        to_pascal_case("rerun.datatypes.uvec2d"),
-        "rerun.datatypes.UVec2D"
+        to_pascal_case("rerun.encodings.uvec2d"),
+        "rerun.encodings.UVec2D"
     );
     assert_eq!(
-        to_pascal_case("rerun.datatypes.UVec2D"),
-        "rerun.datatypes.UVec2D"
+        to_pascal_case("rerun.encodings.UVec2D"),
+        "rerun.encodings.UVec2D"
+    );
+    assert_eq!(
+        to_pascal_case("rerun.encodings.ivec3d"),
+        "rerun.encodings.IVec3D"
+    );
+    assert_eq!(
+        to_pascal_case("rerun.encodings.IVec3D"),
+        "rerun.encodings.IVec3D"
     );
 
     assert_eq!(
-        to_pascal_case("rerun.datatypes.uint32"),
-        "rerun.datatypes.UInt32"
+        to_pascal_case("rerun.encodings.uint32"),
+        "rerun.encodings.UInt32"
     );
     assert_eq!(
-        to_pascal_case("rerun.datatypes.UInt32"),
-        "rerun.datatypes.UInt32"
+        to_pascal_case("rerun.encodings.UInt32"),
+        "rerun.encodings.UInt32"
     );
 
     assert_eq!(
@@ -192,8 +210,10 @@ pub fn to_human_case(s: &str) -> String {
         *last = rerun_human.convert(last.as_str());
         *last = last
             .replace("Uvec", "UVec")
+            .replace("Ivec", "IVec")
             .replace("Uint", "UInt")
             .replace("U vec", "UVec")
+            .replace("I vec", "IVec")
             .replace("U int", "UInt")
             .replace("Int 32", "Int32")
             .replace("mat 3x 3", "mat3x3")
@@ -217,21 +237,29 @@ fn test_to_human_case() {
     );
 
     assert_eq!(
-        to_human_case("rerun.datatypes.uvec2d"),
-        "rerun.datatypes.UVec 2D"
+        to_human_case("rerun.encodings.uvec2d"),
+        "rerun.encodings.UVec 2D"
     );
     assert_eq!(
-        to_human_case("rerun.datatypes.UVec2D"),
-        "rerun.datatypes.UVec 2D"
+        to_human_case("rerun.encodings.UVec2D"),
+        "rerun.encodings.UVec 2D"
+    );
+    assert_eq!(
+        to_human_case("rerun.encodings.ivec3d"),
+        "rerun.encodings.IVec 3D"
+    );
+    assert_eq!(
+        to_human_case("rerun.encodings.IVec3D"),
+        "rerun.encodings.IVec 3D"
     );
 
     assert_eq!(
-        to_human_case("rerun.datatypes.uint32"),
-        "rerun.datatypes.UInt32"
+        to_human_case("rerun.encodings.uint32"),
+        "rerun.encodings.UInt32"
     );
     assert_eq!(
-        to_human_case("rerun.datatypes.UInt32"),
-        "rerun.datatypes.UInt32"
+        to_human_case("rerun.encodings.UInt32"),
+        "rerun.encodings.UInt32"
     );
 
     assert_eq!(

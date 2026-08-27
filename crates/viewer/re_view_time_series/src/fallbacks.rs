@@ -1,10 +1,11 @@
+use re_sdk_types::archetypes::Scalars;
 use re_sdk_types::blueprint::archetypes::{PlotLegend, ScalarAxis, TimeAxis};
-use re_sdk_types::datatypes::TimeRange;
+use re_sdk_types::encodings::TimeRange;
 use re_sdk_types::{
     archetypes::{SeriesLines, SeriesPoints},
-    datatypes::TimeRangeBoundary,
+    encodings::TimeRangeBoundary,
 };
-use re_viewer_context::ViewStateExt as _;
+use re_viewer_context::{ViewStateExt as _, VisualizerComponentSource};
 
 use crate::view_class::{TimeSeriesViewState, add_margin_to_range, make_range_sane};
 
@@ -84,10 +85,40 @@ pub fn register_fallbacks(system_registry: &mut re_viewer_context::ViewSystemReg
                     .and_then(|id| state.num_time_series_last_frame_per_instruction.get(&id))
                     .map_or(1, |set| set.len());
 
+                // There can be several visualizer instructions on the same entity
+                // and for the same component so we additionally look at the
+                // `(source_component, selector)` pair.
+                let source_selector = ctx.instruction_id.and_then(|id| {
+                    let data_result = ctx
+                        .view_ctx
+                        .query_result
+                        .tree
+                        .lookup_result_by_visualizer_instruction(id)?;
+                    let instruction = data_result
+                        .visualizer_instructions
+                        .iter()
+                        .find(|instr| instr.id == id)?;
+                    match instruction
+                        .component_mappings
+                        .get(&Scalars::descriptor_scalars().component)?
+                    {
+                        VisualizerComponentSource::SourceComponent {
+                            source_component,
+                            selector,
+                        } => Some((*source_component, selector.as_str())),
+                        VisualizerComponentSource::Override
+                        | VisualizerComponentSource::Default => None,
+                    }
+                });
+
                 (0..num_series)
                     .map(|i| {
-                        let hash = re_log_types::hash::Hash64::hash((ctx.instruction_id, i))
-                            .hash64()
+                        let hash = re_log_types::hash::Hash64::hash((
+                            ctx.target_entity_path,
+                            source_selector,
+                            i,
+                        ))
+                        .hash64()
                             % u16::MAX as u64;
                         re_viewer_context::auto_color_egui(hash as u16).into()
                     })
@@ -118,8 +149,6 @@ pub fn register_fallbacks(system_registry: &mut re_viewer_context::ViewSystemReg
     system_registry.register_fallback_provider(
         TimeAxis::descriptor_view_range().component,
         |ctx| -> re_sdk_types::blueprint::components::TimeRange {
-            use re_chunk_store::TimeType;
-
             let timeline = ctx.viewer_ctx().time_ctrl.timeline();
 
             let recording_range = timeline
@@ -137,32 +166,10 @@ pub fn register_fallbacks(system_registry: &mut re_viewer_context::ViewSystemReg
 
             if let Some(timeline) = timeline
                 && let Some(data_range) = data_range
+                && let Some(range) =
+                    re_view::cursor_centered_default_range(timeline.typ(), data_range.abs_length())
             {
-                let span = data_range.abs_length();
-
-                // When viewing large recordings (spanning hours), it is VERY important
-                // that we only show part of the data by default, for two reasons:
-                //
-                // # Performance
-                // If we show all the data, we need to collect and aggregate all the data. This can be VERY slow.
-                //
-                // # Legibility
-                // A sufficiently zoomed out plot is indistinguishable from noise
-
-                const NS_PER_SEC: i64 = 1_000_000_000;
-
-                match timeline.typ() {
-                    TimeType::Sequence => {
-                        if 2_000 < span {
-                            return TimeRange::from_cursor_plus_minus(1_000).into();
-                        }
-                    }
-                    TimeType::TimestampNs | TimeType::DurationNs => {
-                        if (60 * NS_PER_SEC as u64) < span {
-                            return TimeRange::from_cursor_plus_minus(30 * NS_PER_SEC).into();
-                        }
-                    }
-                }
+                return range.into();
             }
 
             // View the entire data_range:

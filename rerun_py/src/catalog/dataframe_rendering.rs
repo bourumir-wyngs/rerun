@@ -5,7 +5,12 @@ use comfy_table::Table;
 use pyo3::{Bound, PyAny, PyResult, pyclass, pymethods};
 use re_arrow_util::{RecordBatchFormatOpts, format_record_batch_opts};
 
-#[pyclass(eq, name = "RerunHtmlTable", module = "rerun_bindings.rerun_bindings")]
+#[pyclass(
+    eq,
+    from_py_object,
+    name = "RerunHtmlTable",
+    module = "rerun_bindings.rerun_bindings"
+)]
 #[derive(Clone, PartialEq, Eq)]
 pub struct PyRerunHtmlTable {
     max_width: Option<usize>,
@@ -85,11 +90,11 @@ impl PyRerunHtmlTable {
             let rows = table
                 .row_iter()
                 .map(|row| {
-                    let cells = row
-                        .cell_iter()
-                        .map(|cell| format!("<td>{}</td>", cell.content().replace('\n', "<br>")))
-                        .collect::<Vec<_>>()
-                        .join("");
+                    let cells = row.cell_iter().fold(String::new(), |mut cells, cell| {
+                        use std::fmt::Write as _;
+                        write!(cells, "<td>{}</td>", cell.content().replace('\n', "<br>")).ok();
+                        cells
+                    });
 
                     format!("<tr>{cells}</tr>\n")
                 })

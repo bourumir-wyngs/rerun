@@ -1,5 +1,4 @@
 use crate::RawRrdManifest;
-use crate::rrd::decoder::state_machine::DecoderState;
 use crate::rrd::{DecodeError, Decoder, DecoderEntrypoint};
 
 // ---
@@ -15,28 +14,10 @@ impl<T: DecoderEntrypoint> Decoder<T> {
     /// * This lets the end-user in control of the buffering, which prevents unfortunately stacked
     ///   buffers (and thus exploding memory usage and copies).
     ///
-    /// See also [`Self::decode_lazy_with_opts`].
     pub fn decode_lazy<R: std::io::BufRead>(reader: R) -> DecoderIterator<T, R> {
-        let wait_for_eos = false;
-        Self::decode_lazy_with_opts(reader, wait_for_eos)
-    }
-
-    /// Same as [`Self::decode_lazy`], with extra options.
-    ///
-    /// * `wait_for_eos`: if true, the decoder will always wait for an end-of-stream marker before
-    ///   calling it a day, even if the underlying reader has already reached its EOF state (…for now).
-    ///   This only really makes sense when running in tail mode (see `RetryableFileReader`), otherwise
-    ///   we'd rather terminate early when a potentially short-circuited (and therefore lacking a proper
-    ///   end-of-stream marker) RRD stream indicates EOF.
-    pub fn decode_lazy_with_opts<R: std::io::BufRead>(
-        reader: R,
-        wait_for_eos: bool,
-    ) -> DecoderIterator<T, R> {
-        let decoder = Self::new();
         DecoderIterator {
-            decoder,
+            decoder: Self::new(),
             reader,
-            wait_for_eos,
             first_msg: None,
         }
     }
@@ -52,30 +33,12 @@ impl<T: DecoderEntrypoint> Decoder<T> {
     /// * This lets the end-user in control of the buffering, which prevents unfortunately stacked
     ///   buffers (and thus exploding memory usage and copies).
     ///
-    /// See also [`Self::decode_eager_with_opts`].
     pub fn decode_eager<R: std::io::BufRead>(
         reader: R,
     ) -> Result<DecoderIterator<T, R>, DecodeError> {
-        let wait_for_eos = false;
-        Self::decode_eager_with_opts(reader, wait_for_eos)
-    }
-
-    /// Same as [`Self::decode_eager`], with extra options.
-    ///
-    /// * `wait_for_eos`: if true, the decoder will always wait for an end-of-stream marker before
-    ///   calling it a day, even if the underlying reader has already reached its EOF state (…for now).
-    ///   This only really makes sense when running in tail mode (see `RetryableFileReader`), otherwise
-    ///   we'd rather terminate early when a potentially short-circuited (and therefore lacking a proper
-    ///   end-of-stream marker) RRD stream indicates EOF.
-    pub fn decode_eager_with_opts<R: std::io::BufRead>(
-        reader: R,
-        wait_for_eos: bool,
-    ) -> Result<DecoderIterator<T, R>, DecodeError> {
-        let decoder = Self::new();
         let mut it = DecoderIterator {
-            decoder,
+            decoder: Self::new(),
             reader,
-            wait_for_eos,
             first_msg: None,
         };
 
@@ -91,14 +54,6 @@ impl<T: DecoderEntrypoint> Decoder<T> {
 pub struct DecoderIterator<T, R: std::io::BufRead> {
     decoder: Decoder<T>,
     reader: R,
-
-    /// If true, the decoder will always wait for an end-of-stream marker before calling it a day,
-    /// even if the underlying reader has already reached its EOF state (…for now).
-    ///
-    /// This only really makes sense when running in tail mode (see `RetryableFileReader`),
-    /// otherwise we'd rather terminate early when a potentially short-circuited (and therefore
-    /// lacking a proper end-of-stream marker) RRD stream indicates EOF.
-    wait_for_eos: bool,
 
     /// See [`Decoder::decode_eager`] for more information.
     first_msg: Option<T>,
@@ -147,18 +102,8 @@ impl<T: DecoderEntrypoint, R: std::io::BufRead> std::iter::Iterator for DecoderI
                         // more messages, so go on for now.
                         Ok(Some(msg)) => return Some(Ok(msg)),
 
-                        // …and we don't want to explicitly wait around for more to come, so just leave.
-                        Ok(None) if !self.wait_for_eos => return None,
-
-                        // …and the underlying decoder already considers that it's done (i.e. it's
-                        // waiting for a whole new stream to begin): time to stop.
-                        Ok(None) if self.decoder.state == DecoderState::WaitingForStreamHeader => {
-                            return None;
-                        }
-
-                        // …but the underlying decoder doesn't believe it's done yet (i.e. it's still
-                        // waiting for an EOS marker to show up): we continue.
-                        Ok(None) => {}
+                        // …and there is nothing left to decode.
+                        Ok(None) => return None,
 
                         Err(err) => return Some(Err(err)),
                     }
@@ -183,6 +128,7 @@ impl<T: DecoderEntrypoint, R: std::io::BufRead> std::iter::Iterator for DecoderI
 #[cfg(all(test, feature = "encoder"))]
 mod tests {
     #![expect(unsafe_code, clippy::unwrap_used, clippy::undocumented_unsafe_blocks)] // tests
+    use std::assert_matches;
 
     use re_build_info::CrateVersion;
     use re_chunk::RowId;
@@ -295,10 +241,7 @@ mod tests {
         ) -> Result<u64, crate::EncodeError> {
             re_tracing::profile_function!();
             let mut encoder = Encoder::new_eager(version, options, write)?;
-            let mut size_bytes = 0;
-            for message in messages {
-                size_bytes += encoder.append(message?.borrow())?;
-            }
+            let size_bytes = encoder.extend(messages)?;
 
             {
                 encoder.flush_blocking()?;
@@ -387,7 +330,7 @@ mod tests {
         for message in messages.clone() {
             unsafe {
                 encoder
-                    .append_transport(&message)
+                    .append_transport_without_footer(&message)
                     .expect("encoding should succeed");
             }
         }
@@ -410,12 +353,12 @@ mod tests {
         // ensure the test data is as we expect
         let orig_message_count = messages.len();
         assert_eq!(orig_message_count, 3);
-        assert!(matches!(messages[0], proto::log_msg::Msg::SetStoreInfo(..)));
-        assert!(matches!(messages[1], proto::log_msg::Msg::ArrowMsg(..)));
-        assert!(matches!(
+        assert_matches!(messages[0], proto::log_msg::Msg::SetStoreInfo(..));
+        assert_matches!(messages[1], proto::log_msg::Msg::ArrowMsg(..));
+        assert_matches!(
             messages[2],
             proto::log_msg::Msg::BlueprintActivationCommand(..)
-        ));
+        );
 
         // make out-of-order messages
         let mut out_of_order_messages = vec![messages[1].clone(), messages[2].clone()];
@@ -428,7 +371,7 @@ mod tests {
         for message in out_of_order_messages.clone() {
             unsafe {
                 encoder
-                    .append_transport(&message)
+                    .append_transport_without_footer(&message)
                     .expect("encoding should succeed");
             }
         }
@@ -450,12 +393,9 @@ mod tests {
         // ensure the test data is as we expect
         let orig_message_count = messages.len();
         assert_eq!(orig_message_count, 3);
-        assert!(matches!(messages[0], LogMsg::SetStoreInfo { .. }));
-        assert!(matches!(messages[1], LogMsg::ArrowMsg { .. }));
-        assert!(matches!(
-            messages[2],
-            LogMsg::BlueprintActivationCommand { .. }
-        ));
+        assert_matches!(messages[0], LogMsg::SetStoreInfo { .. });
+        assert_matches!(messages[1], LogMsg::ArrowMsg { .. });
+        assert_matches!(messages[2], LogMsg::BlueprintActivationCommand { .. });
 
         let options = [
             EncodingOptions {

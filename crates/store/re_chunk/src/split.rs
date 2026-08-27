@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use re_byte_size::SizeBytes;
+use re_span::Span;
 
 use crate::Chunk;
 
@@ -50,7 +51,7 @@ impl Chunk {
         let needs_split_rows = chunk_max_rows > 0 && chunk_num_rows > chunk_max_rows;
         let needs_split_unsorted = chunk_max_rows_if_unsorted > 0
             && chunk_num_rows > chunk_max_rows_if_unsorted
-            && !chunk.is_time_sorted();
+            && !chunk.all_timelines_sorted();
 
         if !needs_split_bytes && !needs_split_rows && !needs_split_unsorted {
             return vec![chunk];
@@ -78,7 +79,7 @@ impl Chunk {
             let remaining_rows = chunk.num_rows() - start_idx;
             let chunk_size = remaining_rows.min(target_rows);
 
-            let split_chunk = chunk.row_sliced_deep(start_idx, chunk_size);
+            let split_chunk = chunk.row_sliced_deep(Span::from_start_len(start_idx, chunk_size));
 
             result.push(Arc::new(split_chunk));
 

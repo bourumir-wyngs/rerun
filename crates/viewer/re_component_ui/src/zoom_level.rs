@@ -9,7 +9,7 @@ const MAX_ZOOM_LEVEL: f64 = 19.0;
 
 /// Editor for a [`re_sdk_types::blueprint::components::ZoomLevel`].
 pub fn edit_zoom_level(
-    _ctx: &re_viewer_context::StoreViewContext<'_>,
+    _ctx: &re_viewer_context::AppContext<'_>,
     ui: &mut egui::Ui,
     value: &mut MaybeMutRef<'_, ZoomLevel>,
 ) -> egui::Response {
@@ -18,7 +18,7 @@ pub fn edit_zoom_level(
         MaybeMutRef::MutRef(value) => MaybeMutRef::MutRef(&mut value.0),
     };
 
-    super::datatype_uis::edit_f64_float_raw_with_speed_impl(
+    super::encoding_uis::edit_f64_float_raw_with_speed_impl(
         ui,
         &mut value,
         0.0..=MAX_ZOOM_LEVEL,

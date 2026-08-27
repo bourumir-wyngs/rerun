@@ -1,24 +1,23 @@
-use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
-
-static RERUN_SDK_NUM_CPUS: LazyLock<Option<String>> =
-    LazyLock::new(|| std::env::var("RERUN_SDK_NUM_CPUS").ok());
+use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow::pyarrow::PyArrowType;
 use pyo3::exceptions::{PyLookupError, PyRuntimeError, PyValueError};
 use pyo3::types::{PyAnyMethods as _, PyDict};
 use pyo3::{Py, PyAny, PyErr, PyResult, Python, pyclass, pymethods};
-use re_datafusion::{DEFAULT_CATALOG_NAME, get_all_catalog_names};
 use re_log_types::EntryName;
 use re_protos::cloud::v1alpha1::{EntryFilter, EntryKind};
 
-use crate::catalog::datafusion_catalog::PyDataFusionCatalogProvider;
+use crate::catalog::datafusion_catalog::PyDataFusionCatalogProviderList;
 use crate::catalog::{
-    ConnectionHandle, PyDatasetEntryInternal, PyEntryId, PyRerunHtmlTable, PyTableEntryInternal,
+    PyConnectionHandle, PyDatasetEntryInternal, PyEntryId, PyRerunHtmlTable, PyTableEntryInternal,
     to_py_err,
 };
-use crate::utils::{get_tokio_runtime, wait_for_future};
+use crate::trace_context::read_trace_context_from_python;
+use crate::utils::wait_for_future;
+
+/// (version, cloud_provider, cloud_region, features), as returned by `version_info`.
+type VersionInfoTuple = (String, Option<String>, Option<String>, Vec<String>);
 
 /// Client for a remote Rerun catalog server.
 #[pyclass(
@@ -27,16 +26,14 @@ use crate::utils::{get_tokio_runtime, wait_for_future};
 )]
 
 pub struct PyCatalogClientInternal {
-    origin: re_uri::Origin,
-
-    connection: ConnectionHandle,
+    connection: PyConnectionHandle,
 
     // If this isn't set, it means datafusion wasn't found
     datafusion_ctx: Option<Py<PyAny>>,
 }
 
 impl PyCatalogClientInternal {
-    pub fn connection(&self) -> &ConnectionHandle {
+    pub(crate) fn connection(&self) -> &PyConnectionHandle {
         &self.connection
     }
 }
@@ -47,8 +44,8 @@ fn setup_datafusion_context(py: Python<'_>) -> PyResult<Py<PyAny>> {
     let config_options = PyDict::new(py);
     config_options.set_item("datafusion.execution.coalesce_batches", "false")?;
 
-    if let Some(cores) = RERUN_SDK_NUM_CPUS.as_deref() {
-        config_options.set_item("datafusion.execution.target_partitions", cores)?;
+    if let Some(cores) = re_datafusion::rerun_sdk_num_cpus() {
+        config_options.set_item("datafusion.execution.target_partitions", cores.to_string())?;
     }
 
     let session_config = df_module.call_method1("SessionConfig", (config_options,))?;
@@ -77,6 +74,8 @@ impl PyCatalogClientInternal {
     #[new]
     #[pyo3(text_signature = "(self, url, token=None)")]
     fn new(py: Python<'_>, url: String, token: Option<String>) -> PyResult<Self> {
+        let _span = read_trace_context_from_python(py, "CatalogClient.__new__").entered();
+
         // NOTE: The entire TLS stack expects this global variable to be set. It doesn't matter
         // what we set it to. But we have to set it, or we will crash at runtime, as soon as
         // anything tries to do anything TLS-related.
@@ -99,17 +98,16 @@ impl PyCatalogClientInternal {
         };
         connection_registry.set_credentials(&origin, credentials);
 
-        let connection = ConnectionHandle::new(connection_registry, origin.clone());
+        let connection = PyConnectionHandle::new(connection_registry, origin);
 
         let datafusion_ctx = setup_datafusion_context(py).ok();
 
         let ret = Self {
-            origin,
             connection,
             datafusion_ctx,
         };
 
-        ret.update_catalog_providers(py, true)?;
+        ret.register_catalog_provider_list(py)?;
 
         Ok(ret)
     }
@@ -117,17 +115,40 @@ impl PyCatalogClientInternal {
     /// Get the URL of the catalog (a `rerun+http` URL).
     #[getter]
     pub fn url(&self) -> String {
-        self.origin.to_string()
+        self.connection.origin().to_string()
     }
 
-    /// Returns version and deployment information as (version, cloud_provider, cloud_region).
-    fn version_info(
-        self_: Py<Self>,
-        py: Python<'_>,
-    ) -> PyResult<(String, Option<String>, Option<String>)> {
+    /// Returns version and deployment information as (version, cloud_provider, cloud_region, features).
+    fn version_info(self_: Py<Self>, py: Python<'_>) -> PyResult<VersionInfoTuple> {
+        let _span = read_trace_context_from_python(py, "CatalogClient.version_info").entered();
         let connection = self_.borrow(py).connection.clone();
         let info = connection.version_info(py)?;
-        Ok((info.version, info.cloud_provider, info.cloud_region))
+        Ok((
+            info.version,
+            info.cloud_provider,
+            info.cloud_region,
+            info.features,
+        ))
+    }
+
+    fn rtt_seconds(self_: Py<Self>, py: Python<'_>, num_pings: usize) -> PyResult<f64> {
+        let _span = read_trace_context_from_python(py, "CatalogClient.rtt_seconds").entered();
+        let connection = self_.borrow(py).connection.clone();
+        Ok(connection.rtt(py, num_pings)?.as_secs_f64())
+    }
+
+    fn bandwidth_bytes_per_sec(
+        self_: Py<Self>,
+        py: Python<'_>,
+        num_bytes: u64,
+        rtt_seconds: f64,
+    ) -> PyResult<Option<f64>> {
+        let _span =
+            read_trace_context_from_python(py, "CatalogClient.bandwidth_bytes_per_sec").entered();
+        let connection = self_.borrow(py).connection.clone();
+        let rtt = std::time::Duration::try_from_secs_f64(rtt_seconds)
+            .map_err(|err| PyValueError::new_err(format!("invalid rtt_seconds: {err}")))?;
+        connection.bandwidth_bytes_per_sec(py, num_bytes, rtt)
     }
 
     /// Get a list of all dataset entries in the catalog.
@@ -136,20 +157,37 @@ impl PyCatalogClientInternal {
         py: Python<'_>,
         include_hidden: bool,
     ) -> PyResult<Vec<Py<PyDatasetEntryInternal>>> {
+        let _span = read_trace_context_from_python(py, "CatalogClient.datasets").entered();
         let connection = self_.borrow(py).connection.clone();
 
-        let mut entry_details =
-            connection.find_entries(py, EntryFilter::new().with_entry_kind(EntryKind::Dataset))?;
-
-        if include_hidden {
-            entry_details.extend(connection.find_entries(
-                py,
-                EntryFilter::new().with_entry_kind(EntryKind::BlueprintDataset),
-            )?);
-        }
+        let entry_details = connection.find_entries(
+            py,
+            EntryFilter {
+                id: None,
+                name: None,
+                // Passing the deprecated `entry_kind` as None for
+                // compatibility with older Rerun Hub versions.
+                //
+                // With this setting legacy Rerun Hub versions will return
+                // return all known entry kinds, which we'll need to filter below.
+                // See RR-5186.
+                entry_kind: None,
+                entry_kinds: vec![
+                    EntryKind::Dataset as i32,
+                    EntryKind::BlueprintDataset as i32,
+                    EntryKind::AssetDataset as i32,
+                ],
+            },
+        )?;
 
         entry_details
             .into_iter()
+            .filter(|details| {
+                matches!(
+                    details.kind,
+                    EntryKind::Dataset | EntryKind::BlueprintDataset | EntryKind::AssetDataset
+                ) && (include_hidden || !details.name.is_hidden())
+            })
             .map(|details| {
                 let dataset_entry = connection.read_dataset(py, details.id)?;
                 Py::new(
@@ -166,10 +204,18 @@ impl PyCatalogClientInternal {
         py: Python<'_>,
         include_hidden: bool,
     ) -> PyResult<Vec<Py<PyTableEntryInternal>>> {
+        let _span = read_trace_context_from_python(py, "CatalogClient.tables").entered();
         let connection = self_.borrow(py).connection.clone();
 
-        let entry_details =
-            connection.find_entries(py, EntryFilter::new().with_entry_kind(EntryKind::Table))?;
+        // `with_entry_kind` is deprecated and kept for compatibility with Rerun Hub
+        // older than 0.15. Drop when all customers are on 0.15 or newer.
+        #[expect(deprecated)]
+        let entry_details = connection.find_entries(
+            py,
+            EntryFilter::new()
+                .with_entry_kind(EntryKind::Table)
+                .with_entry_kinds([EntryKind::Table]),
+        )?;
 
         entry_details
             .into_iter()
@@ -191,6 +237,7 @@ impl PyCatalogClientInternal {
         id: Py<PyEntryId>,
         py: Python<'_>,
     ) -> PyResult<Py<PyDatasetEntryInternal>> {
+        let _span = read_trace_context_from_python(py, "CatalogClient.get_dataset").entered();
         let connection = self_.borrow(py).connection.clone();
         let dataset_entry = connection.read_dataset(py, id.borrow(py).id)?;
 
@@ -208,6 +255,7 @@ impl PyCatalogClientInternal {
         py: Python<'_>,
         id: Py<PyEntryId>,
     ) -> PyResult<Py<PyTableEntryInternal>> {
+        let _span = read_trace_context_from_python(py, "CatalogClient.get_table").entered();
         let connection = self_.borrow(py).connection.clone();
         let table_entry = connection.read_table(py, id.borrow(py).id)?;
 
@@ -225,6 +273,7 @@ impl PyCatalogClientInternal {
         py: Python<'_>,
         name: &str,
     ) -> PyResult<Py<PyDatasetEntryInternal>> {
+        let _span = read_trace_context_from_python(py, "CatalogClient.create_dataset").entered();
         let connection = self_.borrow_mut(py).connection.clone();
         let dataset_entry = connection.create_dataset(py, name.to_owned())?;
 
@@ -240,6 +289,7 @@ impl PyCatalogClientInternal {
         name: String,
         url: String,
     ) -> PyResult<Py<PyTableEntryInternal>> {
+        let _span = read_trace_context_from_python(py, "CatalogClient.register_table").entered();
         let connection = self_.borrow_mut(py).connection.clone();
 
         let url = url
@@ -248,8 +298,6 @@ impl PyCatalogClientInternal {
 
         let name = EntryName::new(name).map_err(|err| PyValueError::new_err(err.to_string()))?;
         let table_entry = connection.register_table(py, name, url)?;
-
-        self_.borrow(py).update_catalog_providers(py, false)?;
 
         Py::new(
             py,
@@ -270,6 +318,7 @@ impl PyCatalogClientInternal {
         schema: PyArrowType<Schema>,
         url: Option<String>,
     ) -> PyResult<Py<PyTableEntryInternal>> {
+        let _span = read_trace_context_from_python(py, "CatalogClient.create_table").entered();
         let connection = self_.borrow_mut(py).connection.clone();
 
         // Verify we have a valid table name
@@ -301,8 +350,6 @@ impl PyCatalogClientInternal {
         let name = EntryName::new(name).map_err(|err| PyValueError::new_err(err.to_string()))?;
         let table_entry = connection.create_table_entry(py, &name, schema, url)?;
 
-        self_.borrow(py).update_catalog_providers(py, false)?;
-
         Py::new(
             py,
             PyTableEntryInternal::new(self_.clone_ref(py), table_entry),
@@ -313,6 +360,8 @@ impl PyCatalogClientInternal {
 
     /// Perform global maintenance tasks on the server.
     fn do_global_maintenance(self_: Py<Self>, py: Python<'_>) -> PyResult<()> {
+        let _span =
+            read_trace_context_from_python(py, "CatalogClient.do_global_maintenance").entered();
         let connection = self_.borrow_mut(py).connection.clone();
 
         connection.do_global_maintenance(py)
@@ -332,7 +381,7 @@ impl PyCatalogClientInternal {
     }
 
     fn __repr__(&self) -> String {
-        format!("CatalogClient({})", self.origin)
+        format!("CatalogClient({})", self.connection.origin())
     }
 
     // ---
@@ -342,6 +391,8 @@ impl PyCatalogClientInternal {
         py: Python<'_>,
         name: String,
     ) -> PyResult<Py<PyEntryId>> {
+        let _span =
+            read_trace_context_from_python(py, "CatalogClient._entry_id_from_entry_name").entered();
         let connection = self_.borrow(py).connection.clone();
 
         let entry_details = connection.find_entries(py, EntryFilter::new().with_name(&name))?;
@@ -357,41 +408,21 @@ impl PyCatalogClientInternal {
 }
 
 impl PyCatalogClientInternal {
-    fn update_catalog_providers(&self, py: Python<'_>, force_register: bool) -> Result<(), PyErr> {
-        let client = wait_for_future(py, self.connection.client())?;
-        let runtime = get_tokio_runtime().handle();
+    /// Install a single lazy [`PyDataFusionCatalogProviderList`] on the session context. The
+    /// list resolves catalogs on demand, so this call performs no gRPC; subsequent SQL
+    /// planning never fans out to wildcard `FindEntries` either.
+    #[tracing::instrument(skip_all)]
+    fn register_catalog_provider_list(&self, py: Python<'_>) -> Result<(), PyErr> {
+        let Some(ctx) = self.datafusion_ctx.as_ref() else {
+            return Ok(());
+        };
 
-        let provider_names = get_all_catalog_names(&client, runtime).map_err(to_py_err)?;
-        let mut providers = provider_names
-            .iter()
-            .map(|p| p.as_str())
-            .collect::<Vec<_>>();
-        if !providers.contains(&DEFAULT_CATALOG_NAME) {
-            providers.push(DEFAULT_CATALOG_NAME);
-        }
+        let connection =
+            wait_for_future(py, self.connection.inner().connection()).map_err(to_py_err)?;
+        let provider_list =
+            PyDataFusionCatalogProviderList::new(connection.client, connection.analytics);
 
-        if let Some(ctx) = self.datafusion_ctx.as_ref() {
-            let existing_catalogs: HashSet<String> =
-                ctx.call_method0(py, "catalog_names")?.extract(py)?;
-
-            for provider_name in providers {
-                if !force_register && existing_catalogs.contains(provider_name) {
-                    continue;
-                }
-
-                let catalog_provider = PyDataFusionCatalogProvider::new(
-                    Some(provider_name.to_owned()),
-                    client.clone(),
-                );
-
-                ctx.call_method1(
-                    py,
-                    "register_catalog_provider",
-                    (provider_name, catalog_provider),
-                )?;
-            }
-        }
-
+        ctx.call_method1(py, "register_catalog_provider_list", (provider_list,))?;
         Ok(())
     }
 }

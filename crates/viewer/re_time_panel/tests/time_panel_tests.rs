@@ -205,7 +205,7 @@ pub fn test_various_entity_kinds_in_time_panel() {
                 test_context.active_store_id(),
                 [
                     TimeControlCommand::SetActiveTimeline(timeline.into()),
-                    TimeControlCommand::SetTime(time.into()),
+                    TimeControlCommand::SetTimeClamped(time.into()),
                     TimeControlCommand::SetTimeView(TimeView {
                         min: 0.into(),
                         time_spanned: 10.0,
@@ -313,10 +313,7 @@ fn with_unloaded_chunks() {
         },
     );
 
-    test_context.send_time_commands(
-        test_context.active_store_id(),
-        [TimeControlCommand::SetTime(TimeReal::from(5))],
-    );
+    test_context.set_time(TimeReal::from(5));
 
     used_ids.push(chunks[0].id());
 
@@ -413,7 +410,7 @@ pub fn log_data_for_various_entity_kinds_tests(test_context: &mut TestContext) {
 pub fn log_data(
     test_context: &mut TestContext,
     entity_path: impl Into<EntityPath>,
-    timeline: &str,
+    timeline: &'static str,
     time: i64,
 ) {
     let entity_path = entity_path.into();

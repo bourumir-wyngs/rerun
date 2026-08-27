@@ -1,10 +1,12 @@
+use re_entity_db::FetchStage;
 use re_log_types::TimestampFormat;
+use re_memory::MemoryLimit;
 use re_video::{DecodeHardwareAcceleration, DecodeSettings};
 
 const MAPBOX_ACCESS_TOKEN_ENV_VAR: &str = "RERUN_MAPBOX_ACCESS_TOKEN";
 
 /// Global options for the viewer.
-#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, Clone)]
 #[serde(default)]
 pub struct AppOptions {
     /// Experimental feature flags.
@@ -20,6 +22,9 @@ pub struct AppOptions {
     ///
     /// If false, you can still view them in the notifications panel.
     pub show_notification_toasts: bool,
+
+    /// Use Rerun's custom window decorations instead of the native OS decorations.
+    pub custom_window_decorations: bool,
 
     /// Include the "Welcome screen" application in the recordings panel?
     #[serde(alias = "include_welcome_screen_button_in_recordings_panel")]
@@ -53,6 +58,15 @@ pub struct AppOptions {
     /// Can also be set using the `RERUN_MAPBOX_ACCESS_TOKEN` environment variable.
     pub mapbox_access_token: String,
 
+    /// When the total process RAM reaches this limit, we GC old data.
+    pub memory_limit: MemoryLimit,
+
+    /// Only prefetch chunks up to (and including) this stage.
+    ///
+    /// Useful for debugging and for users who want to limit how aggressively
+    /// we prefetch data ahead of what is strictly needed.
+    pub max_fetch_stage: FetchStage,
+
     /// Path to the directory suitable for storing cache data.
     ///
     /// By cache data, we mean data that is safe to be garbage collected by the OS. Defaults to
@@ -66,14 +80,25 @@ pub struct AppOptions {
 
 impl Default for AppOptions {
     fn default() -> Self {
+        Self::default_with_custom_window_decorations(re_ui::custom_window_decorations_default())
+    }
+}
+
+impl AppOptions {
+    fn default_with_custom_window_decorations(custom_window_decorations: bool) -> Self {
         Self {
-            experimental: Default::default(),
+            experimental: ExperimentalAppOptions {
+                use_viewer_catalog: cfg!(debug_assertions),
+                ..Default::default()
+            },
 
             warn_e2e_latency: 1.0,
 
             show_metrics: cfg!(debug_assertions),
 
             show_notification_toasts: true,
+
+            custom_window_decorations,
 
             include_rerun_examples_button_in_recordings_panel: true,
 
@@ -91,13 +116,47 @@ impl Default for AppOptions {
 
             mapbox_access_token: String::new(),
 
+            memory_limit: MemoryLimit::default_for_current_platform(),
+
+            max_fetch_stage: FetchStage::default(),
+
             #[cfg(not(target_arch = "wasm32"))]
             cache_directory: Self::default_cache_directory(),
         }
     }
-}
 
-impl AppOptions {
+    pub fn test() -> Self {
+        Self {
+            memory_limit: MemoryLimit::UNLIMITED,
+            show_metrics: false, // flaky in snapshot tests
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            custom_window_decorations: false,
+            experimental: ExperimentalAppOptions {
+                table_cards_and_blueprints: true,
+                ..Default::default()
+            },
+
+            video: VideoOptions {
+                // Force the FFmpeg path to be wrong so we have a reproducible behavior.
+                ffmpeg_path: "/fake/ffmpeg/path".to_owned(),
+                override_ffmpeg_path: true,
+                ..Default::default()
+            },
+
+            // Always show the full date so timestamps render as `YYYY-MM-DD HH:MM:SS`
+            // regardless of when the test runs. The default `HideDateToday` would
+            // silently break snapshots once the calendar day rolls over.
+            timestamp_format: TimestampFormat::default()
+                .with_date_visibility(re_log_types::DateVisibility::ShowDate),
+
+            // Hide toast notifications by default in tests since they have a show-timeout and can cause flakiness in snapshot tests.
+            show_notification_toasts: false,
+
+            // Ensure to not probe the Wayland compositor, because tests run without one.
+            ..Self::default_with_custom_window_decorations(false)
+        }
+    }
+
     pub fn mapbox_access_token(&self) -> Option<String> {
         if self.mapbox_access_token.is_empty() {
             std::env::var(MAPBOX_ACCESS_TOKEN_ENV_VAR).ok()
@@ -136,7 +195,7 @@ impl AppOptions {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize, Clone)]
 #[serde(default)]
 pub struct VideoOptions {
     /// Preferred method for video decoding on web.
@@ -159,9 +218,29 @@ pub struct VideoOptions {
     pub ffmpeg_path: String,
 }
 
-#[derive(Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize, Clone)]
 #[serde(default)]
 pub struct ExperimentalAppOptions {
-    /// Enable the experimental States view.
-    pub enable_states_view: bool,
+    /// Enable table cards and blueprints.
+    ///
+    /// This enables registered table blueprints,
+    /// plus the table/card layout toggle for server-supplied tables.
+    pub table_cards_and_blueprints: bool,
+
+    /// Enable gamepad navigation in 3D spatial views.
+    pub gamepad_navigation: bool,
+
+    /// Enable alpha-blending of semi-transparent point clouds.
+    ///
+    /// Off by default: transparent point clouds are sorted on the CPU every frame, which is
+    /// slow for large clouds. Opaque point clouds render much faster.
+    pub point_cloud_transparency: bool,
+
+    /// Load `.rrd` files through the Viewer's in-process catalog instead of importing them
+    /// as a live recording.
+    ///
+    /// When enabled, opened `.rrd` files are registered with the catalog and surfaced as redap
+    /// datasets under an internal server in the recording panel. When disabled, files are imported
+    /// directly into the viewer as plain recordings.
+    pub use_viewer_catalog: bool,
 }

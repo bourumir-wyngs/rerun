@@ -415,14 +415,13 @@ mod tests {
             });
         harness.snapshot("share_modal__server_url");
 
-        modal.lock().url = Some(ViewerOpenUrl::RedapDatasetSegment(
-            re_uri::DatasetSegmentUri {
-                origin: origin.clone(),
-                dataset_id,
-                segment_id: "segment_id".to_owned(),
-                fragment: re_uri::Fragment::default(),
-            },
-        ));
+        modal.lock().url = Some(ViewerOpenUrl::RedapDataset(re_uri::DatasetUri {
+            origin: origin.clone(),
+            dataset_id,
+            resource: re_uri::DatasetResource::Segments,
+            segment_id: Some("segment_id".into()),
+            fragment: re_uri::Fragment::default(),
+        }));
         harness.run_steps(2); // Force running two steps to ensure relayouting happens. TODO(andreas): Why is this needed?
         harness.snapshot("share_modal__dataset_segment_url");
 
@@ -432,27 +431,28 @@ mod tests {
             [
                 TimeControlCommand::SetActiveTimeline(*timeline.name()),
                 TimeControlCommand::SetTime(re_chunk::TimeInt::ZERO.into()),
-                TimeControlCommand::SetTimeSelection(AbsoluteTimeRangeF::new(0.0, 1000.0).to_int()),
+                TimeControlCommand::SetTimeSelectionClamped(
+                    AbsoluteTimeRangeF::new(0.0, 1000.0).to_int(),
+                ),
             ],
         );
 
         harness.run();
 
-        modal.lock().url = Some(ViewerOpenUrl::RedapDatasetSegment(
-            re_uri::DatasetSegmentUri {
-                origin: origin.clone(),
-                dataset_id,
-                segment_id: "segment_id".to_owned(),
-                fragment: re_uri::Fragment {
-                    selection: selection.to_data_path(),
-                    when: Some((*timeline.name(), TimeCell::new(timeline.typ(), 234))),
-                    time_selection: Some(re_uri::TimeSelection {
-                        timeline,
-                        range: re_log_types::AbsoluteTimeRange::new(0, 1000),
-                    }),
-                },
+        modal.lock().url = Some(ViewerOpenUrl::RedapDataset(re_uri::DatasetUri {
+            origin: origin.clone(),
+            dataset_id,
+            resource: re_uri::DatasetResource::Segments,
+            segment_id: Some("segment_id".into()),
+            fragment: re_uri::Fragment {
+                selection: selection.to_data_path(),
+                when: Some((*timeline.name(), TimeCell::new(timeline.typ(), 234))),
+                time_selection: Some(re_uri::TimeSelection {
+                    timeline,
+                    range: re_log_types::AbsoluteTimeRange::new(0, 1000),
+                }),
             },
-        ));
+        }));
         harness.run();
         harness.snapshot("share_modal__dataset_segment_url_with_time_range");
     }

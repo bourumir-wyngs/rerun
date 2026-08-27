@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 
 use re_chunk_store::ColumnDescriptor;
+use re_log::ResultExt as _;
 use re_log_types::{AbsoluteTimeRange, EntityPath, Timeline, TimelineName};
 use re_sdk_types::blueprint::archetypes::DataframeQuery;
-use re_sdk_types::blueprint::{components, datatypes};
+use re_sdk_types::blueprint::{components, encodings};
 use re_sorbet::{ColumnSelector, ComponentColumnSelector};
 use re_viewer_context::{ViewSystemExecutionError, ViewerContext};
 
@@ -25,9 +26,12 @@ impl Query {
                 DataframeQuery::descriptor_timeline().component,
             )?;
 
-        // if the timeline is unset, we "freeze" it to the current time panel timeline
-        if let Some(timeline_name) = timeline_name {
-            Ok(timeline_name.into())
+        // if the timeline is unset (or invalid), we "freeze" it to the current time panel timeline
+        if let Some(timeline_name) = timeline_name
+            .as_ref()
+            .and_then(|timeline_name| timeline_name.try_into().ok_or_log_error_once())
+        {
+            Ok(timeline_name)
         } else {
             let timeline_name = *ctx.time_ctrl.timeline_name();
             self.save_timeline_name(ctx, &timeline_name);
@@ -159,7 +163,7 @@ impl Query {
         ctx: &ViewerContext<'_>,
         columns: impl IntoIterator<Item = ColumnSelector>,
     ) {
-        let mut selected_columns = datatypes::SelectedColumns::default();
+        let mut selected_columns = encodings::SelectedColumns::default();
         for column in columns {
             match column {
                 ColumnSelector::RowId => {
@@ -173,7 +177,7 @@ impl Query {
                 }
 
                 ColumnSelector::Component(selector) => {
-                    let blueprint_component_selector = datatypes::ComponentColumnSelector::new(
+                    let blueprint_component_selector = encodings::ComponentColumnSelector::new(
                         &selector.entity_path,
                         selector.component,
                     );
@@ -225,7 +229,7 @@ impl Query {
         let query_timeline_name = self.timeline_name(ctx)?;
 
         // no selected columns means only the active timeline and all component columns
-        let Some(datatypes::SelectedColumns {
+        let Some(encodings::SelectedColumns {
             // row_id, // TODO(#9921)
             time_columns,
             component_columns,
@@ -245,7 +249,9 @@ impl Query {
 
         let selected_time_columns: HashSet<TimelineName> = time_columns
             .iter()
-            .map(|timeline_name| timeline_name.as_str().into())
+            .filter_map(|timeline_name| {
+                TimelineName::try_new(timeline_name.as_str()).ok_or_log_error_once()
+            })
             .collect();
         let selected_component_columns = component_columns
             .iter()
@@ -435,7 +441,7 @@ mod test {
 
     use super::{Query, reorder_columns_by_entity};
 
-    fn make_component_column(entity: &str, component: &str) -> ColumnDescriptor {
+    fn make_component_column(entity: &str, component: &'static str) -> ColumnDescriptor {
         ColumnDescriptor::Component(ComponentColumnDescriptor {
             entity_path: entity.into(),
             component: ComponentIdentifier::from(component),

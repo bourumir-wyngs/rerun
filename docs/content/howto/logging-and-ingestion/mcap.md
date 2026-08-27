@@ -1,13 +1,14 @@
 ---
 title: Working with MCAP
 order: 700
+description: Open and inspect MCAP files in Rerun
 ---
 
 The Rerun Viewer has built-in support for opening [MCAP](https://mcap.dev/) files, an open container format for storing timestamped messages.
 
 ## Supported message formats
 
-Here's a quick summary of Rerun's MCAP data loader:
+Here's a quick summary of Rerun's MCAP importer:
 
 * Automatic conversion to Rerun archetypes is supported for common ROS 2 & Foxglove messages.
 * Other ROS 2 & Foxglove messages are decoded into queryable components via [reflection](../../concepts/logging-and-ingestion/mcap/message-formats.md#schema-reflection).
@@ -52,20 +53,21 @@ To map MCAP messages to Rerun entities we make the following assumptions:
 * The contents of an MCAP message will be extracted to Rerun components and grouped under a corresponding Rerun archetype.
 * `message_log_time` and `message_publish_time` of an MCAP message will be carried over to Rerun as two distinct [timelines](../../concepts/logging-and-ingestion/timelines.md).
 
-### Layered architecture
+### Decoder architecture
 
-Rerun uses a _layered architecture_ to process MCAP files at different levels of abstraction. This design allows the same MCAP file to be ingested in multiple ways simultaneously, from raw bytes to semantically meaningful visualizations.
+Rerun uses _decoders_ to process MCAP files at different levels of abstraction. This design allows to choose up to which level the MCAP message payloads are converted to RRD, from keeping only raw bytes up to a full semantic conversion to Rerun archetypes.
 
-Each layer extracts different types of information from the MCAP source and each of the following layers will create distinct Rerun archetypes:
+Each decoder extracts different types of information from the MCAP source:
 
 - **`raw`**: Logs the unprocessed message bytes as Rerun blobs without any interpretation
 - **`schema`**: Extracts metadata about channels, topics, and schemas
-- **`stats`**: Extracts file-level metrics like message counts, time ranges, and channel statistics
-- **`metadata`** Extracts metadata records (if present) into the `__properties` of the RRD
+- **`stats`**: Extracts file-level metrics like message counts, time ranges, and channel statistics into `__mcap_properties` in the RRD
+- **`metadata`** Extracts metadata records (if present) into `__mcap_metadata` in the RRD
+- **`attachments`**: Extracts MCAP attachment records (if present) as static data under `__mcap_attachments`
 - **`protobuf`**: Automatically decodes protobuf-encoded messages using reflection
 - **`ros2msg`**: Provides semantic conversion of common ROS2 message types into Rerun's visualization components
 - **`ros2_reflection`**: Automatically decodes ROS2 messages using reflection
-- **`recording_info`**: Extracts recording metadata such as message counts, start time, and session information
+- **`recording_info`**: Extracts recording metadata such as message counts, start time, and session information into `__mcap_properties` in the RRD
 - **`urdf`**: Uses Rerun's built-in URDF loader when a ROS 2 `/robot_description` string topic is present
 
 By default, Rerun analyzes an MCAP file to determine which decoders are active to provide the most comprehensive view of your data, while avoiding duplication.

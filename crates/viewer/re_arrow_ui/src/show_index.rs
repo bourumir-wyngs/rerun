@@ -1,7 +1,7 @@
 //! [`ArrayUi`] can be used to show arbitrary Arrow data with a nice UI.
 //! The implementation is inspired from arrows built-in display formatter:
 //! <https://github.com/apache/arrow-rs/blob/c628435f9f14abc645fb546442132974d3d380ca/arrow-cast/src/display.rs>
-use std::ops::Range;
+use std::{iter, ops::Range};
 
 use arrow::array::cast::{
     AsArray as _, as_generic_list_array, as_map_array, as_struct_array, as_union_array,
@@ -24,7 +24,9 @@ use arrow::datatypes::{
 use arrow::error::ArrowError;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use egui::{RichText, Ui};
+use itertools::Itertools as _;
 use re_log_types::TimestampFormat;
+use re_span::Span;
 use re_ui::list_item::{CustomContent, LabelContent};
 use re_ui::syntax_highlighting::SyntaxHighlightedBuilder;
 use re_ui::{UiExt as _, UiLayout};
@@ -140,7 +142,11 @@ impl<'a> ArrayUi<'a> {
 
     /// Show a `list_item` based tree view of the data.
     pub fn show(&self, ui: &mut Ui) {
-        list_ui(ui, 0..self.array.len(), &*self.show_index);
+        list_ui(
+            ui,
+            Span::from_start_len(0, self.array.len()),
+            &*self.show_index,
+        );
     }
 
     /// Returns a [`SyntaxHighlightedBuilder`] that displays the entire array.
@@ -551,16 +557,13 @@ fn write_list(
             values.write(idx, f)?;
         }
 
-        let mut items = 1;
-
-        for idx in range {
+        for (items, idx) in iter::zip(1.., range) {
             if items >= max_items {
                 f.append_syntax(", …");
                 break;
             }
             f.append_syntax(", ");
             values.write(idx, f)?;
-            items += 1;
         }
     }
     f.append_syntax("]");
@@ -571,14 +574,14 @@ fn write_list(
 ///
 /// If there are enough items, it will show items in a tree of ranges.
 ///
-/// Since arrow arrays might not start at 0, you need pass a `Range<usize>`.
+/// Since arrow arrays might not start at 0, you need pass a [`Span`].
 /// E.g. a [`GenericListArray`] consists of a single large values array and an offsets array.
 /// So the nth list would be a slice of the main array based on the offsets array at n.
 /// See the [`GenericListArray`] docs for more info.
 ///
 /// The indexes shown in the UI will be _normalized_ so it's always `0..end-start`.
-pub(crate) fn list_ui(ui: &mut Ui, range: Range<usize>, values: &dyn ShowIndex) {
-    let ui_range = 0..(range.end - range.start);
+pub(crate) fn list_ui(ui: &mut Ui, range: Span<usize>, values: &dyn ShowIndex) {
+    let ui_range = Span::from_start_len(0, range.len);
 
     list_item_ranges(ui, ui_range, &mut |ui, ui_idx| {
         let node = ArrowNode::index(ui_idx, values);
@@ -612,7 +615,7 @@ impl<'a, O: OffsetSizeTrait> ShowIndexState<'a> for &'a GenericListArray<O> {
         let offsets = self.value_offsets();
         let end = offsets[idx + 1].as_usize();
         let start = offsets[idx].as_usize();
-        list_ui(ui, start..end, show_index.as_ref());
+        list_ui(ui, Span::from_start_end(start, end), show_index.as_ref());
     }
 
     fn is_item_nested(&self) -> bool {
@@ -666,7 +669,7 @@ impl<'a> ShowIndexState<'a> for &'a FixedSizeListArray {
     ) {
         let start = idx * *value_length;
         let end = start + *value_length;
-        list_ui(ui, start..end, values.as_ref());
+        list_ui(ui, Span::from_start_end(start, end), values.as_ref());
     }
 
     fn is_item_nested(&self) -> bool {
@@ -689,15 +692,12 @@ impl<'a> ShowIndexState<'a> for &'a StructArray {
         let fields = self.fields();
         let nested_options = options.nested();
 
-        let items = self
-            .columns()
-            .iter()
-            .zip(fields)
-            .map(|(a, f)| {
+        let items = iter::zip(self.columns(), fields)
+            .map(|(a, f)| -> Result<_, ArrowError> {
                 let format = make_ui(a.as_ref(), &nested_options)?;
                 Ok((&**f, format))
             })
-            .collect::<Result<_, ArrowError>>()?;
+            .try_collect()?;
         Ok(FieldDisplayState {
             items,
             max_items: options.max_struct_items,
@@ -720,8 +720,7 @@ impl<'a> ShowIndexState<'a> for &'a StructArray {
                 f.append_syntax(": ");
                 display.as_ref().write(idx, f)?;
             }
-            let mut items = 1;
-            for (field, display) in iter {
+            for (items, (field, display)) in iter::zip(1.., iter) {
                 if items >= *max_items {
                     f.append_syntax(", …");
                     break;
@@ -730,7 +729,6 @@ impl<'a> ShowIndexState<'a> for &'a StructArray {
                 f.append_identifier(field.name());
                 f.append_syntax(": ");
                 display.as_ref().write(idx, f)?;
-                items += 1;
             }
         }
         f.append_syntax("}");
@@ -794,9 +792,7 @@ impl<'a> ShowIndexState<'a> for &'a MapArray {
                 values.write(idx, f)?;
             }
 
-            let mut items = 1;
-
-            for idx in iter {
+            for (items, idx) in iter::zip(1.., iter) {
                 if items >= *max_items {
                     f.append_syntax(", …");
                     break;
@@ -805,7 +801,6 @@ impl<'a> ShowIndexState<'a> for &'a MapArray {
                 keys.write(idx, f)?;
                 f.append_syntax(": ");
                 values.write(idx, f)?;
-                items += 1;
             }
         }
         f.append_syntax("}");
@@ -856,8 +851,7 @@ impl<'a> ShowIndexState<'a> for &'a UnionArray {
         };
 
         let max_id = fields.iter().map(|(id, _)| id).max().unwrap_or_default() as usize;
-        let mut show_fields: Vec<Option<FieldDisplay<'_>>> =
-            (0..max_id + 1).map(|_| None).collect();
+        let mut show_fields: Vec<Option<FieldDisplay<'_>>> = (0..=max_id).map(|_| None).collect();
         for (i, field) in fields.iter() {
             let formatter = make_ui(self.child(i).as_ref(), options)?;
             show_fields[i as usize] = Some((field, formatter));

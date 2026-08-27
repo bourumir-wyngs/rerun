@@ -19,14 +19,24 @@ use re_viewer_context::{
     SystemExecutionOutput, ViewId, ViewQuery, ViewStates, ViewerContext, icon_for_container_kind,
 };
 use re_viewport_blueprint::{
-    ViewBlueprint, ViewportBlueprint, ViewportCommand, create_entity_add_info,
+    CanAddToView, ViewBlueprint, ViewportBlueprint, ViewportCommand, create_entity_add_info,
 };
 
 use crate::system_execution::{execute_systems_for_all_views, execute_systems_for_view};
 
-/// Toggle the currently selected view to be maximized or not.
+/// Shortcut for maximizing a view.
+///
+/// Use [`is_toggle_maximize_view_pressed`] to check for this shortcut!
 // NOTE: we use CTRL and not COMMAND, because ⌘+M minimizes the whole window on macOS.
 const TOGGLE_MAXIMIZE_VIEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::M);
+
+/// Checks if the keyboard shortcut for maximizing a view is pressed,
+/// avoiding clashes with other similar shortcuts.
+fn is_toggle_maximize_view_pressed(input: &mut egui::InputState) -> bool {
+    // Check if CTRL+SHIFT+M is pressed instead, which is used to open the dev panel.
+    // `consume_shortcut` intentionally ignores extra Shift and Alt modifiers.
+    !input.modifiers.shift && input.consume_shortcut(&TOGGLE_MAXIMIZE_VIEW)
+}
 
 /// Defines the UI and layout of the Viewport.
 pub struct ViewportUi {
@@ -123,13 +133,7 @@ impl ViewportUi {
             tree.ui(&mut egui_tiles_delegate, ui);
 
             let dragged_payload = egui::DragAndDrop::payload::<DragAndDropPayload>(ui.ctx());
-            let dragged_payload = dragged_payload.as_ref().and_then(|payload| {
-                if let DragAndDropPayload::Entities { entities } = payload.as_ref() {
-                    Some(entities)
-                } else {
-                    None
-                }
-            });
+            let released = ui.input(|i| i.pointer.any_released());
 
             let mut hover_rects = Vec::new();
             let mut selection_rects = Vec::new();
@@ -157,9 +161,30 @@ impl ViewportUi {
                     let should_display_drop_destination_frame = if pointer_in_rect
                         && let Some(view_id) = contents.as_view_id()
                         && let Some(view_blueprint) = self.blueprint.view(&view_id)
-                        && let Some(dragged_payload) = dragged_payload
+                        && let Some(payload) = dragged_payload.as_ref()
                     {
-                        Self::handle_drop_entities_to_view(ctx, view_blueprint, dragged_payload)
+                        let feedback = match payload.as_ref() {
+                            DragAndDropPayload::Entities { entities } => {
+                                Self::handle_drop_entities_to_view(
+                                    ctx,
+                                    view_blueprint,
+                                    entities,
+                                    released,
+                                )
+                            }
+                            DragAndDropPayload::Components { component_paths } => view_blueprint
+                                .class(ctx.view_class_registry())
+                                .handle_component_drop(ctx, view_id, component_paths, released),
+                            DragAndDropPayload::Contents { .. } | DragAndDropPayload::Invalid => {
+                                DragAndDropFeedback::Ignore
+                            }
+                        };
+
+                        if feedback != DragAndDropFeedback::Ignore {
+                            ctx.drag_and_drop_manager().set_feedback(feedback);
+                        }
+
+                        feedback == DragAndDropFeedback::Accept
                     } else {
                         false
                     };
@@ -235,6 +260,7 @@ impl ViewportUi {
                             prune_single_child_containers: false,
                             all_panes_must_have_tabs: true,
                             join_nested_linear_containers: false,
+                            flatten_tabs_in_tabs: false,
                         });
                     }
 
@@ -250,71 +276,99 @@ impl ViewportUi {
 
     /// Handle the entities being dragged over a view.
     ///
-    /// Returns whether a "drop zone candidate" frame should be displayed to the user.
+    /// A dragged entity is added with an including-subtree rule, so it is worth dropping as soon
+    /// as one entity of its subtree, possibly itself, is:
+    /// - visualizable,
+    /// - not part of the view yet,
+    /// - and accepted by the view class.
+    ///
+    /// All three must hold for the *same* entity: a subtree whose only additions would be
+    /// entities the view can't show has nothing to contribute.
     ///
     /// Design decisions:
-    /// - We accept the drop only if at least one of the entities is visualizable and not already
-    ///   included.
-    /// - When the drop happens, of all dropped entities, we only add those which are visualizable.
+    /// - We accept the drop as soon as one of the dragged entities is worth dropping.
+    /// - When the drop happens, of all dragged entities, we only add those.
+    /// - If nothing is left to accept, we show the most specific reason we have.
     ///
-    fn handle_drop_entities_to_view(
+    /// This is public so that view crates can test how their class handles entity drops.
+    pub fn handle_drop_entities_to_view(
         ctx: &ViewerContext<'_>,
         view_blueprint: &ViewBlueprint,
         entities: &[EntityPath],
-    ) -> bool {
+        released: bool,
+    ) -> DragAndDropFeedback {
         let recording_engine = ctx.recording_engine();
+        let entity_tree = recording_engine.store().entity_tree();
         let add_info = create_entity_add_info(
             ctx,
-            recording_engine.store().entity_tree(),
+            entity_tree,
             view_blueprint,
             ctx.lookup_query_result(view_blueprint.id),
         );
+        let view_class = view_blueprint.class(ctx.view_class_registry());
 
-        // check if any entity or its children are visualizable and not yet included in the view
-        let can_entity_be_added = |entity: &EntityPath| {
-            add_info
-                .get(entity)
-                .is_some_and(|info| info.can_add_self_or_descendant.is_compatible_and_missing())
-        };
+        let mut acceptable_entities = Vec::new();
 
-        let any_is_visualizable = entities.iter().any(can_entity_be_added);
+        // Why we had to turn an entity down, in decreasing order of specificity. Only shown if
+        // nothing is acceptable in the end.
+        let mut class_rejection = None;
+        let mut any_already_in_view = false;
 
-        ctx.drag_and_drop_manager()
-            .set_feedback(if any_is_visualizable {
-                DragAndDropFeedback::Accept
-            } else {
-                DragAndDropFeedback::Reject
+        for entity in entities {
+            let Some(subtree) = entity_tree.subtree(entity) else {
+                continue;
+            };
+
+            let mut is_acceptable = false;
+            subtree.visit_children_recursively(|entity_path| {
+                // Entities no visualizer of this class can show are silently ignored: that is
+                // evident enough from the streams panel.
+                let Some(CanAddToView::Compatible { already_added }) =
+                    add_info.get(entity_path).map(|info| &info.can_add)
+                else {
+                    return;
+                };
+
+                if let Some(reason) = view_class.reject_entity_drop_reason(ctx, entity_path) {
+                    class_rejection.get_or_insert(reason);
+                } else if *already_added {
+                    any_already_in_view = true;
+                } else {
+                    is_acceptable = true;
+                }
             });
 
-        if !any_is_visualizable {
-            return false;
+            if is_acceptable {
+                acceptable_entities.push(entity);
+            }
+        }
+
+        if acceptable_entities.is_empty() {
+            let reason =
+                class_rejection.or_else(|| any_already_in_view.then_some("Already in this view"));
+            return DragAndDropFeedback::Reject(reason);
         }
 
         // drop incoming!
-        if ctx.egui_ctx().input(|i| i.pointer.any_released()) {
+        if released {
             egui::DragAndDrop::clear_payload(ctx.egui_ctx());
 
             view_blueprint
                 .contents
                 .mutate_entity_path_filter(ctx, |filter| {
-                    for entity in entities {
-                        if can_entity_be_added(entity) {
-                            filter.add_rule(
-                                RuleEffect::Include,
-                                ResolvedEntityPathRule::including_subtree(entity),
-                            );
-                        }
+                    for entity in acceptable_entities {
+                        filter.add_rule(
+                            RuleEffect::Include,
+                            ResolvedEntityPathRule::including_subtree(entity),
+                        );
                     }
                 });
 
             ctx.command_sender()
                 .send_system(SystemCommand::set_selection(Item::View(view_blueprint.id)));
-
-            // drop is completed, no need for highlighting anymore
-            false
-        } else {
-            any_is_visualizable
         }
+
+        DragAndDropFeedback::Accept
     }
 
     pub fn on_frame_start(&self, ctx: &ViewerContext<'_>) {
@@ -404,7 +458,7 @@ impl<'a> egui_tiles::Behavior<ViewId> for TilesDelegate<'a, '_> {
         let missing_chunk_reporter = MissingChunkReporter::new(system_output.any_missing_chunks());
 
         let response = ui.scope(|ui| {
-            class
+            let view_ui_output = class
                 .ui(
                     self.ctx,
                     &missing_chunk_reporter,
@@ -419,6 +473,7 @@ impl<'a> egui_tiles::Behavior<ViewId> for TilesDelegate<'a, '_> {
                         view_blueprint.class_identifier(),
                         class.display_name(),
                     );
+                    Default::default()
                 });
 
             ui.memory_mut(|mem| {
@@ -432,28 +487,20 @@ impl<'a> egui_tiles::Behavior<ViewId> for TilesDelegate<'a, '_> {
                         },
                     );
             });
+
+            view_ui_output
         });
 
-        {
-            let show_loading_indicator = missing_chunk_reporter.any_missing()
-                && self.ctx.recording().can_fetch_chunks_from_redap();
+        self.view_states
+            .set_view_reports(self.ctx.store_id(), *view_id, response.inner.reports);
 
-            let loading_indicator_opacity = ui
-                .ctx()
-                .animate_bool(ui.id().with("loading_indicator"), show_loading_indicator);
-
-            if 0.0 < loading_indicator_opacity {
-                let view_rect = response.response.rect;
-                re_ui::loading_indicator::paint_loading_indicator_inside(
-                    ui,
-                    egui::Align2::RIGHT_TOP,
-                    view_rect,
-                    loading_indicator_opacity,
-                    None,
-                    "Fetching chunks from redap",
-                );
-            }
-        }
+        crate::paint_view_loading_indicator(
+            ui,
+            *view_id,
+            response.response.rect,
+            missing_chunk_reporter.any_missing(),
+            self.ctx.recording(),
+        );
 
         response.response.widget_info(|| {
             let mut info = egui::WidgetInfo::new(egui::WidgetType::Panel);
@@ -490,10 +537,14 @@ impl<'a> egui_tiles::Behavior<ViewId> for TilesDelegate<'a, '_> {
             .on_hover_cursor(egui::CursorIcon::Grab);
 
         let label = tab_widget.label.take();
+        let active = tab_state.active;
         response.widget_info(|| {
-            let mut info = egui::WidgetInfo::new(egui::WidgetType::Label);
-            info.label = label.clone();
-            info
+            egui::WidgetInfo::selected(
+                egui::WidgetType::SelectableLabel,
+                true,
+                active,
+                label.clone().unwrap_or_default(),
+            )
         });
 
         // Show a gap when dragged
@@ -596,7 +647,7 @@ impl<'a> egui_tiles::Behavior<ViewId> for TilesDelegate<'a, '_> {
                         .ui(ui);
                 })
                 .clicked()
-                || ui.input_mut(|input| input.consume_shortcut(&TOGGLE_MAXIMIZE_VIEW))
+                || ui.input_mut(is_toggle_maximize_view_pressed)
             {
                 *self.maximized = None;
                 MaximizeAnimationState::restore_view(ui.ctx(), view_id);
@@ -605,8 +656,7 @@ impl<'a> egui_tiles::Behavior<ViewId> for TilesDelegate<'a, '_> {
             // Show maximize-button:
             let is_view_the_only_selected =
                 self.ctx.selection().is_view_the_only_selected(&view_id);
-            let toggle = is_view_the_only_selected
-                && ui.input_mut(|input| input.consume_shortcut(&TOGGLE_MAXIMIZE_VIEW));
+            let toggle = is_view_the_only_selected && ui.input_mut(is_toggle_maximize_view_pressed);
             if ui
                 .small_icon_button(&re_ui::icons::MAXIMIZE, "Maximize view")
                 .on_hover_ui(|ui| {
@@ -673,7 +723,7 @@ impl<'a> egui_tiles::Behavior<ViewId> for TilesDelegate<'a, '_> {
             view_class.help(ui.os()).ui(ui);
         });
 
-        self.visualizer_errors_button(ui, view_id);
+        self.reports_button(ui, view_id);
     }
 
     // Styling:
@@ -735,25 +785,33 @@ impl<'a> egui_tiles::Behavior<ViewId> for TilesDelegate<'a, '_> {
 }
 
 impl TilesDelegate<'_, '_> {
-    fn visualizer_errors_button(&self, ui: &mut egui::Ui, view_id: ViewId) {
-        let Some(per_visualizer_type_reports) = self
-            .view_states
-            .per_visualizer_type_reports(self.ctx.store_id(), view_id)
-        else {
-            return;
-        };
-
+    fn reports_button(&self, ui: &mut egui::Ui, view_id: ViewId) {
         let data_result_tree = &self.ctx.lookup_query_result(view_id).tree;
 
         let mut grouped_reports: BTreeMap<Item, Vec<_>> = BTreeMap::new();
 
-        for report in per_visualizer_type_reports.values() {
+        for report in self.view_states.view_reports(self.ctx.store_id(), view_id) {
+            if report.severity != re_viewer_context::ViewerReportSeverity::Info {
+                grouped_reports
+                    .entry(Item::View(view_id))
+                    .or_default()
+                    .push(report);
+            }
+        }
+
+        let per_visualizer_type_reports = self
+            .view_states
+            .per_visualizer_type_reports(self.ctx.store_id(), view_id)
+            .into_iter()
+            .flatten();
+
+        for (_id, report) in per_visualizer_type_reports {
             match report {
                 re_viewer_context::VisualizerTypeReport::OverallError(error) => {
                     grouped_reports
                         .entry(Item::View(view_id))
                         .or_default()
-                        .push(error.clone());
+                        .push(&error.diagnostic);
                 }
                 re_viewer_context::VisualizerTypeReport::PerInstructionReport(reports_map) => {
                     for instruction_id in reports_map.keys() {
@@ -766,10 +824,15 @@ impl TilesDelegate<'_, '_> {
                                 visualizer: Some(*instruction_id),
                             });
                             for instruction_report in report.reports_for(instruction_id) {
-                                grouped_reports
-                                    .entry(item.clone())
-                                    .or_default()
-                                    .push(instruction_report.clone());
+                                // Only show a button for errors and warnings.
+                                if instruction_report.diagnostic.severity
+                                    != re_viewer_context::ViewerReportSeverity::Info
+                                {
+                                    grouped_reports
+                                        .entry(item.clone())
+                                        .or_default()
+                                        .push(&instruction_report.diagnostic);
+                                }
                             }
                         }
                     }
@@ -790,7 +853,7 @@ impl TilesDelegate<'_, '_> {
 
         ui.scope(|ui| {
             let report_image =
-                if max_severity == Some(re_viewer_context::VisualizerReportSeverity::Warning) {
+                if max_severity == Some(re_viewer_context::ViewerReportSeverity::Warning) {
                     icons::WARNING
                         .as_image()
                         .fit_to_exact_size(ui.tokens().small_icon_size)
@@ -808,7 +871,7 @@ impl TilesDelegate<'_, '_> {
                 .add(egui::Button::image(report_image))
                 .on_hover_text(format!(
                     "Show {}",
-                    re_format::format_plural_s(report_count, "visualizer report")
+                    re_format::format_plural_s(report_count, "report")
                 ));
 
             egui::Popup::menu(&response)
@@ -830,7 +893,7 @@ impl TilesDelegate<'_, '_> {
         &self,
         ui: &mut egui::Ui,
         item: Item,
-        reports: &[re_viewer_context::VisualizerInstructionReport],
+        reports: &[&re_viewer_context::ViewerDiagnostic],
     ) {
         let item_entity = match &item {
             Item::View(blueprint_id) => blueprint_id.as_entity_path().to_string(),
@@ -864,13 +927,13 @@ impl TilesDelegate<'_, '_> {
                     // Show all reports for this item
                     for report in reports {
                         let (icon, color) = match report.severity {
-                            re_viewer_context::VisualizerReportSeverity::Error
-                            | re_viewer_context::VisualizerReportSeverity::OverallVisualizerError => {
+                            re_viewer_context::ViewerReportSeverity::Error => {
                                 (&icons::ERROR, ui.tokens().alert_error.icon)
                             }
-                            re_viewer_context::VisualizerReportSeverity::Warning => {
+                            re_viewer_context::ViewerReportSeverity::Warning => {
                                 (&icons::WARNING, ui.tokens().alert_warning.icon)
                             }
+                            re_viewer_context::ViewerReportSeverity::Info => continue,
                         };
 
                         ui.horizontal_top(|ui| {

@@ -81,7 +81,6 @@ impl TryFrom<&ArrowField> for ColumnKind {
 }
 
 /// Migrate TUID:s with the pre-0.23 encoding.
-#[tracing::instrument(level = "trace", skip_all)]
 fn migrate_tuids(batch: &ArrowRecordBatch) -> ArrowRecordBatch {
     re_tracing::profile_function!();
 
@@ -125,7 +124,6 @@ fn migrate_tuids(batch: &ArrowRecordBatch) -> ArrowRecordBatch {
 }
 
 /// Migrate TUID:s with the pre-0.23 encoding.
-#[tracing::instrument(level = "trace", skip_all)]
 fn migrate_tuid_column(
     field: ArrowFieldRef,
     array: ArrowArrayRef,
@@ -154,7 +152,7 @@ fn migrate_tuid_column(
 
         let new_field = ArrowField::new(
             field.name(),
-            <Tuid as re_types_core::Loggable>::arrow_datatype(),
+            <Tuid as re_types_core::ArrowDatatype>::arrow_datatype(),
             false,
         )
         .with_metadata(field.metadata().clone());

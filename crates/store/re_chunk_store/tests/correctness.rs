@@ -1,6 +1,7 @@
 // https://github.com/rust-lang/rust-clippy/issues/10011
 #![cfg(test)]
 
+use std::assert_matches;
 use std::sync::Arc;
 
 use re_chunk::{Chunk, ChunkId, RowId, TimelineName};
@@ -34,7 +35,8 @@ fn query_latest_component<C: re_types_core::Component>(
         .unwrap()
         .filter_map(|chunk| {
             let unit = chunk.latest_at(query, component)?;
-            unit.index(&query.timeline()).map(|index| (index, unit))
+            unit.index(query.timeline().as_ref())
+                .map(|index| (index, unit))
         })
         .max_by_key(|(index, _unit)| *index)?;
 
@@ -203,7 +205,7 @@ fn row_id_ordering_semantics() -> anyhow::Result<()> {
         store.insert_chunk(&Arc::new(chunk))?;
 
         {
-            let query = LatestAtQuery::new(TimelineName::new("doesnt_matter"), TimeInt::MAX);
+            let query = LatestAtQuery::new(TimelineName::from("doesnt_matter"), TimeInt::MAX);
             let (_, _, got_point) = query_latest_component::<MyPoint>(
                 &store,
                 &entity_path,
@@ -292,10 +294,10 @@ fn write_errors() -> anyhow::Result<()> {
             )
             .build()?;
 
-        assert!(matches!(
+        assert_matches!(
             store.insert_chunk(&Arc::new(chunk)),
-            Err(ChunkStoreError::UnsortedChunk),
-        ));
+            Err(ChunkStoreError::UnsortedChunk)
+        );
 
         Ok(())
     }
@@ -330,8 +332,8 @@ fn latest_at_emptiness_edge_cases() -> anyhow::Result<()> {
         .build()?;
     store.insert_chunk(&Arc::new(chunk))?;
 
-    let timeline_wrong_name = TimelineName::new("lag_time");
-    let timeline_frame_nr = TimelineName::new("frame_nr");
+    let timeline_wrong_name = TimelineName::from("lag_time");
+    let timeline_frame_nr = TimelineName::from("frame_nr");
     let timeline_log_time = TimelineName::log_time();
 
     // empty frame_nr

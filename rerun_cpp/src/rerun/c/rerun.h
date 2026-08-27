@@ -157,14 +157,14 @@ typedef struct rr_spawn_options {
     rr_string executable_path;
 } rr_spawn_options;
 
-/// Recommended settings for the [`DataLoader`].
+/// Recommended settings for the [`Importer`].
 ///
-/// The loader is free to ignore some or all of these.
+/// The importer is free to ignore some or all of these.
 ///
 /// Refer to the field-level documentation for more information about each individual options.
 //
 // TODO(#3841): expose timepoint settings once we implement stateless APIs
-typedef struct rr_data_loader_settings {
+typedef struct rr_importer_settings {
     /// The recommended `RecordingId` to log the data to.
     ///
     /// Unspecified by default.
@@ -179,7 +179,10 @@ typedef struct rr_data_loader_settings {
     ///
     /// Defaults to `false` if not set.
     bool static_;
-} rr_data_loader_settings;
+} rr_importer_settings;
+
+/* Deprecated since 0.32.0: use rr_importer_settings instead. */
+typedef rr_importer_settings rr_data_loader_settings;
 
 typedef struct rr_store_info {
     /// The user-chosen name of the application doing the logging.
@@ -314,7 +317,10 @@ typedef struct rr_time_column {
     rr_sorting_status sorting_status;
 } rr_time_column;
 
-/// Log sink which streams messages to a gRPC server.
+/// Log sink which streams messages to an existing Rerun gRPC server.
+///
+/// This is a gRPC client: it connects to a server but does not host one.
+/// Use `rr_grpc_server_sink` to host a server that SDKs and Viewers can connect to.
 ///
 /// The behavior of this sink is the same as the one set by `rr_recording_stream_connect_grpc`.
 typedef struct rr_grpc_sink {
@@ -333,9 +339,42 @@ typedef struct rr_file_sink {
     rr_string path;
 } rr_file_sink;
 
+/// Log sink which hosts a Rerun gRPC server.
+///
+/// This is a gRPC server: SDKs and Viewers connect to it.
+/// Use `rr_grpc_sink` to connect as a client to an existing server.
+/// Replacing the recording's sinks or freeing the recording shuts down the server.
+typedef struct rr_grpc_server_sink {
+    /// IP address on which to listen, such as `0.0.0.0` to listen on all interfaces.
+    rr_string bind_ip;
+
+    /// TCP port on which to listen.
+    uint16_t port;
+
+    /// Maximum amount of log data to retain for late-connecting clients, such as `1GiB`.
+    ///
+    /// Once this limit is reached, the earliest temporal data is dropped.
+    /// Static data is never dropped.
+    rr_string server_memory_limit;
+
+    /// Whether each new client should receive the newest retained messages first.
+    bool newest_first;
+
+    /// Optional origin patterns allowed to make cross-origin requests to the server.
+    ///
+    /// The array and its strings only need to remain valid for the
+    /// `rr_recording_stream_set_sinks` call.
+    /// Set this to `NULL` when `num_cors_allow_origins` is zero.
+    const rr_string* cors_allow_origins;
+
+    /// Number of entries in `cors_allow_origins`.
+    uint32_t num_cors_allow_origins;
+} rr_grpc_server_sink;
+
 enum {
     RR_LOG_SINK_KIND_GRPC = 0,
     RR_LOG_SINK_KIND_FILE = 1,
+    RR_LOG_SINK_KIND_GRPC_SERVER = 2,
 };
 
 /// Used to tag the kind of `rr_log_sink`.
@@ -346,12 +385,14 @@ typedef uint8_t rr_log_sink_kind;
 /// See specific log sink types for more information:
 /// * `rr_grpc_sink`
 /// * `rr_file_sink`
+/// * `rr_grpc_server_sink`
 typedef struct rr_log_sink {
     rr_log_sink_kind kind;
 
     union {
         rr_grpc_sink grpc;
         rr_file_sink file;
+        rr_grpc_server_sink grpc_server;
     };
 } rr_log_sink;
 
@@ -438,6 +479,12 @@ typedef struct rr_error {
 /// If not, the SDK's binary and the C header are out of sync.
 extern const char* rr_version_string(void);
 
+/// Converts a 32-bit `float` to the bits of an IEEE 754 16-bit half-precision float.
+///
+/// Rounds to nearest, ties to even. Values too large to represent become infinity,
+/// and `NaN` stays `NaN`.
+extern uint16_t rr_f16_from_f32(float value);
+
 /// Spawns a new Rerun Viewer process from an executable available in PATH, ready to
 /// listen for incoming gRPC connections.
 ///
@@ -462,9 +509,13 @@ extern rr_component_type_handle rr_register_component_type(
 /// `rr_recording_stream_set_global` afterwards once to make it available globally via
 /// `RR_REC_STREAM_CURRENT_RECORDING` and `RR_REC_STREAM_CURRENT_BLUEPRINT` respectively.
 ///
+/// If `send_properties` is false, the built-in recording properties are not sent when the
+/// recording is created. Processes that share a recording id each send their own properties,
+/// and the most recent one is selected if combined.
+///
 /// @return A handle to the recording stream, or null if an error occurred.
 extern rr_recording_stream rr_recording_stream_new(
-    const rr_store_info* store_info, bool default_enabled, rr_error* error
+    const rr_store_info* store_info, bool default_enabled, bool send_properties, rr_error* error
 );
 
 /// Free the given recording stream. The handle will be invalid after this.
@@ -601,6 +652,22 @@ void rr_recording_stream_disable_timeline(
 /// No-op for destroyed/non-existing streams.
 extern void rr_recording_stream_reset_time(rr_recording_stream stream);
 
+/// Enable or disable automatic injection of the `log_tick` timeline into logged data.
+///
+/// `log_tick` is a per-recording counter that increments on every logging call.
+/// It is disabled by default (it can also be controlled via the `RERUN_LOG_TICK` environment variable).
+///
+/// No-op for destroyed/non-existing streams.
+extern void rr_recording_stream_set_log_tick_enabled(rr_recording_stream stream, bool enabled);
+
+/// Enable or disable automatic injection of the `log_time` timeline into logged data.
+///
+/// `log_time` is the wall-clock time at which data was logged.
+/// It is enabled by default (it can also be controlled via the `RERUN_LOG_TIME` environment variable).
+///
+/// No-op for destroyed/non-existing streams.
+extern void rr_recording_stream_set_log_time_enabled(rr_recording_stream stream, bool enabled);
+
 /// Log the given data to the given stream.
 ///
 /// If `inject_time` is set to `true`, the row's timestamp data will be
@@ -613,27 +680,27 @@ extern void rr_recording_stream_log(
     rr_recording_stream stream, rr_data_row data_row, bool inject_time, rr_error* error
 );
 
-/// Logs the file at the given `path` using all `DataLoader`s available.
+/// Logs the file at the given `path` using all `Importer`s available.
 ///
-/// A single `path` might be handled by more than one loader.
+/// A single `path` might be handled by more than one importer.
 ///
-/// This method blocks until either at least one `DataLoader` starts streaming data in
+/// This method blocks until either at least one `Importer` starts streaming data in
 /// or all of them fail.
 ///
-/// See <https://www.rerun.io/docs/reference/data-loaders/overview> for more information.
+/// See <https://www.rerun.io/docs/concepts/logging-and-ingestion/importers/overview> for more information.
 extern void rr_recording_stream_log_file_from_path(
     rr_recording_stream stream, rr_string path, rr_string entity_path_prefix, bool static_,
     rr_error* error
 );
 
-/// Logs the given `contents` using all `DataLoader`s available.
+/// Logs the given `contents` using all `Importer`s available.
 ///
-/// A single `path` might be handled by more than one loader.
+/// A single `path` might be handled by more than one importer.
 ///
-/// This method blocks until either at least one `DataLoader` starts streaming data in
+/// This method blocks until either at least one `Importer` starts streaming data in
 /// or all of them fail.
 ///
-/// See <https://www.rerun.io/docs/reference/data-loaders/overview> for more information.
+/// See <https://www.rerun.io/docs/concepts/logging-and-ingestion/importers/overview> for more information.
 extern void rr_recording_stream_log_file_from_contents(
     rr_recording_stream stream, rr_string path, rr_bytes contents, rr_string entity_path_prefix,
     bool static_, rr_error* error

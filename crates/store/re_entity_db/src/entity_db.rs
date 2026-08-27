@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use itertools::chain;
 use nohash_hasher::IntMap;
 use re_byte_size::{MemUsageNode, MemUsageTree, MemUsageTreeCapture, SizeBytes as _};
 use re_chunk::{
@@ -52,7 +53,7 @@ pub enum EntityDbClass<'a> {
     ExampleRecording,
 
     /// This is a recording loaded from a remote dataset segment.
-    DatasetSegment(&'a re_uri::DatasetSegmentUri),
+    DatasetSegment(&'a re_uri::DatasetUri),
 
     /// This is a blueprint.
     Blueprint,
@@ -125,6 +126,9 @@ pub struct EntityDb {
     /// Clones of an [`EntityDb`] gets a `None` source.
     pub data_source: Option<re_log_channel::LogSource>,
 
+    /// If this database is a clone, the ID of the source database.
+    cloned_from: Option<StoreId>,
+
     rrd_manifest_index: RrdManifestIndex,
 
     /// Comes in a special message, [`LogMsg::SetStoreInfo`].
@@ -163,12 +167,6 @@ pub struct EntityDb {
 
     /// Lazily calculated
     store_size_bytes: StoreSizeBytes,
-
-    /// How much RAM the whole application uses beyond the raw physical chunks in this recording.
-    ///
-    /// This is estimated by the viewer after a GC pass, when there is only one recording loaded.
-    /// Includes primary and secondary indices, (purged) caches, fonts, icons, and other overhead.
-    pub estimated_application_overhead_bytes: Option<u64>,
 
     stats: IngestionStatistics,
 }
@@ -218,6 +216,7 @@ impl EntityDb {
             store_id,
             enable_viewer_indexes,
             data_source: None,
+            cloned_from: None,
             rrd_manifest_index: Default::default(),
             set_store_info: None,
             last_modified_at: web_time::Instant::now(),
@@ -227,7 +226,6 @@ impl EntityDb {
             data_meta_per_timeline: Default::default(),
             storage_engine,
             store_size_bytes: StoreSizeBytes(Mutex::new(None)),
-            estimated_application_overhead_bytes: None,
             stats: IngestionStatistics::default(),
         }
     }
@@ -362,6 +360,14 @@ impl EntityDb {
         }
     }
 
+    /// True if this recording has chunks we're actively keeping in memory.
+    ///
+    /// Recordings with protected chunks should not be auto-closed during memory pressure,
+    /// since we'd immediately need to re-download them.
+    pub fn has_protected_chunks(&self) -> bool {
+        self.rrd_manifest_index.has_protected_chunks()
+    }
+
     /// Are we connected to redap, and can fetch missing chunks?
     pub fn can_fetch_chunks_from_redap(&self) -> bool {
         match self.redap_connection_state() {
@@ -373,6 +379,15 @@ impl EntityDb {
     }
 
     /// Are we currently in the process of downloading the RRD Manifest?
+    pub fn is_downloading_manifest(&self) -> bool {
+        matches!(
+            self.redap_connection_state(),
+            RedapConnectionState::DownloadingFirstManifestPart
+                | RedapConnectionState::PartialManifest
+        )
+    }
+
+    /// Are we currently waiting for the first part of the RRD Manifest?
     pub fn is_downloading_first_part_of_manifest(&self) -> bool {
         self.redap_connection_state() == RedapConnectionState::DownloadingFirstManifestPart
     }
@@ -391,7 +406,7 @@ impl EntityDb {
                     .chunk_prioritizer()
                     .latest_result()
                 {
-                    !state.all_required_are_loaded
+                    state.all_required_are_loaded != Some(true)
                 } else {
                     true // no prefetch done yet
                 }
@@ -430,7 +445,7 @@ impl EntityDb {
     }
 
     /// What redap URI does this thing live on?
-    pub fn redap_uri(&self) -> Option<&re_uri::DatasetSegmentUri> {
+    pub fn redap_uri(&self) -> Option<&re_uri::DatasetUri> {
         if let Some(re_log_channel::LogSource::RedapGrpcStream { uri, .. }) = &self.data_source {
             Some(uri)
         } else {
@@ -531,10 +546,12 @@ impl EntityDb {
         entity_path: &EntityPath,
         components: impl IntoIterator<Item = ComponentIdentifier>,
     ) -> re_query::LatestAtResults {
-        self.storage_engine
-            .read()
-            .cache()
-            .latest_at(query, entity_path, components)
+        self.storage_engine.read().cache().latest_at(
+            re_chunk_store::ChunkTrackingMode::Report,
+            query,
+            entity_path,
+            components,
+        )
     }
 
     /// Get the latest index and value for a given dense [`re_types_core::Component`].
@@ -615,9 +632,13 @@ impl EntityDb {
         component: ComponentIdentifier,
         query: &LatestAtQuery,
     ) -> bool {
+        let Some(timeline) = query.timeline() else {
+            return true; // Static-only query: there are no temporal chunks to load.
+        };
+
         !self
             .rrd_manifest_index()
-            .unloaded_temporal_entries_for(&query.timeline(), entity_path, Some(component))
+            .unloaded_temporal_entries_for(&timeline, entity_path, Some(component))
             .any(|chunk| chunk.time_range.contains(query.at()))
     }
 
@@ -631,8 +652,7 @@ impl EntityDb {
     /// This means all active blueprints are clones.
     #[inline]
     pub fn cloned_from(&self) -> Option<&StoreId> {
-        let info = self.store_info()?;
-        info.cloned_from.as_ref()
+        self.cloned_from.as_ref()
     }
 
     pub fn timelines(&self) -> std::collections::BTreeMap<TimelineName, Timeline> {
@@ -794,7 +814,7 @@ impl EntityDb {
         let chunk_batch =
             re_sorbet::ChunkBatch::try_from(record_batch).map_err(re_chunk::ChunkError::from)?;
         let mut chunk = re_chunk::Chunk::from_chunk_batch(&chunk_batch)?;
-        chunk.sort_if_unsorted();
+        chunk.sort_by_row_ids_if_needed();
         self.add_chunk_with_timestamp_metadata(
             &Arc::new(chunk),
             &chunk_batch.sorbet_schema().timestamps,
@@ -953,6 +973,7 @@ impl EntityDb {
         &mut self,
         timeline: &TimelineName,
         drop_range: AbsoluteTimeRange,
+        reason: re_chunk_store::ChunkDeletionReason,
     ) -> Vec<ChunkStoreEvent> {
         re_tracing::profile_function!();
 
@@ -960,7 +981,7 @@ impl EntityDb {
             .storage_engine
             .write()
             .store()
-            .drop_time_range_deep(timeline, drop_range);
+            .drop_time_range_deep(timeline, drop_range, reason);
 
         self.on_store_events(&store_events);
 
@@ -1077,10 +1098,7 @@ impl EntityDb {
             itertools::Either::Right(std::iter::empty())
         };
 
-        set_store_info_msg
-            .into_iter()
-            .chain(data_messages)
-            .chain(blueprint_ready)
+        chain!(set_store_info_msg, data_messages, blueprint_ready)
     }
 
     /// Make a clone of this [`EntityDb`], assigning it a new [`StoreId`].
@@ -1104,13 +1122,14 @@ impl EntityDb {
         if let Some(store_info) = self.store_info() {
             let mut new_info = store_info.clone();
             new_info.store_id = new_id;
-            new_info.cloned_from = Some(self.store_id().clone());
 
             new_db.set_store_info(SetStoreInfo {
                 row_id: *RowId::new(),
                 info: new_info,
             });
         }
+
+        new_db.cloned_from = Some(self.store_id().clone());
 
         let engine = self.storage_engine.read();
         for chunk in engine.store().iter_physical_chunks() {
@@ -1276,6 +1295,7 @@ impl re_byte_size::SizeBytes for EntityDb {
             store_id,
             enable_viewer_indexes,
             data_source: _,
+            cloned_from,
             rrd_manifest_index,
             set_store_info,
             last_modified_at: _,
@@ -1285,7 +1305,6 @@ impl re_byte_size::SizeBytes for EntityDb {
             data_meta_per_timeline,
             storage_engine,
             store_size_bytes,
-            estimated_application_overhead_bytes: _,
             stats: _,
         } = self;
 
@@ -1302,6 +1321,7 @@ impl re_byte_size::SizeBytes for EntityDb {
 
         store_id.heap_size_bytes()
             + enable_viewer_indexes.heap_size_bytes()
+            + cloned_from.heap_size_bytes()
             + rrd_manifest_index.heap_size_bytes()
             + set_store_info.heap_size_bytes()
             + entity_paths.heap_size_bytes()
@@ -1326,11 +1346,11 @@ impl MemUsageTreeCapture for EntityDb {
             store_id: _,
             enable_viewer_indexes: _,
             data_source: _,
+            cloned_from: _,
             set_store_info: _,
             last_modified_at: _,
             latest_row_id: _,
             store_size_bytes: _,
-            estimated_application_overhead_bytes: _,
             stats: _,
         } = self;
 

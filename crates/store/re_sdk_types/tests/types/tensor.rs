@@ -1,7 +1,7 @@
 use re_sdk_types::archetypes::Tensor;
-use re_sdk_types::datatypes::{TensorBuffer, TensorData};
+use re_sdk_types::encodings::{TensorBuffer, TensorData};
 use re_sdk_types::tensor_data::TensorCastError;
-use re_sdk_types::{Archetype as _, AsComponents as _, Loggable as _};
+use re_sdk_types::{Archetype as _, AsComponents as _, FromArrow as _, ToArrow as _};
 
 #[test]
 fn tensor_buffer_roundtrip() {
@@ -33,7 +33,7 @@ fn tensor_roundtrip() {
         .to_arrow()
         .unwrap()];
 
-    for (expected, serialized) in all_expected.into_iter().zip(all_arch_serialized) {
+    for (expected, serialized) in std::iter::zip(all_expected, all_arch_serialized) {
         for (field, array) in &serialized {
             // NOTE: Keep those around please, very useful when debugging.
             // eprintln!("field = {field:#?}");

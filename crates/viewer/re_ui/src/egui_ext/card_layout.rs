@@ -1,4 +1,4 @@
-use egui::{Frame, NumExt as _, Ui};
+use egui::{Color32, Frame, NumExt as _, Ui};
 
 /// Per-item configuration for [`CardLayout`].
 pub struct CardLayoutItem {
@@ -16,12 +16,13 @@ pub struct CardLayoutItem {
 pub struct CardLayout {
     items: Vec<CardLayoutItem>,
     default_frame: Frame,
+    hover_fill: Option<Color32>,
+    all_rows_use_available_width: bool,
 }
 
 /// Pre-computed assignment of items to a single row.
 struct RowAssignment {
-    first_item: usize,
-    num_items: usize,
+    items: re_span::Span<usize>,
     total_width: f32,
 }
 
@@ -41,6 +42,8 @@ impl CardLayout {
                 })
                 .collect(),
             default_frame: frame,
+            hover_fill: None,
+            all_rows_use_available_width: true,
         }
     }
 
@@ -49,13 +52,39 @@ impl CardLayout {
         Self {
             items,
             default_frame,
+            hover_fill: None,
+            all_rows_use_available_width: true,
         }
     }
 
-    pub fn show(self, ui: &mut Ui, mut show_item: impl FnMut(&mut Ui, usize)) {
+    /// Whether all rows stretch to fill the available width (default: `true`).
+    ///
+    /// When set to `false`, cards on the last row keep the same width
+    /// they would have on a full row.
+    pub fn all_rows_use_available_width(mut self, value: bool) -> Self {
+        self.all_rows_use_available_width = value;
+        self
+    }
+
+    /// Set a fill color used for hovered cards (replaces the default frame fill).
+    ///
+    /// The card's frame fill is swapped to this color when the pointer is over the card.
+    pub fn hover_fill(mut self, color: Color32) -> Self {
+        self.hover_fill = Some(color);
+        self
+    }
+
+    /// Render the grid.
+    ///
+    /// `show_item` receives `(ui, item_index, card_hovered)`. The `card_hovered`
+    /// flag is `true` when the pointer is over the card, which lets content
+    /// (e.g. a flag button) adapt its appearance based on parent hover state.
+    pub fn show(self, ui: &mut Ui, mut show_item: impl FnMut(&mut Ui, usize, bool)) {
         let Self {
             items,
             default_frame,
+            hover_fill,
+            all_rows_use_available_width,
         } = self;
 
         if items.is_empty() {
@@ -95,44 +124,68 @@ impl CardLayout {
         let visible = ui.clip_rect();
         let mut row_y = full_rect.min.y;
 
-        for (row_idx, (row, row_height)) in rows.iter().zip(row_heights.iter()).enumerate() {
+        for (row_idx, (row, row_height)) in std::iter::zip(&rows, &row_heights).enumerate() {
             // Skip rows outside the visible area.
             if row_y > visible.max.y {
                 break; // Done!
             }
             if row_y + row_height < visible.min.y {
                 row_y += row_height + item_spacing.y;
-                ui.skip_ahead_auto_ids(row.num_items);
+                ui.skip_ahead_auto_ids(row.items.len);
                 continue;
             }
 
-            let gap_space = item_spacing.x * (row.num_items - 1) as f32;
-            let gap_space_item = gap_space / row.num_items as f32;
-            let item_growth = available_width / row.total_width;
+            let gap_space = item_spacing.x * (row.items.len - 1) as f32;
+            let gap_space_item = gap_space / row.items.len as f32;
+            let is_last_row = row_idx + 1 == rows.len();
+            let item_growth = if !all_rows_use_available_width && is_last_row && rows.len() > 1 {
+                // Use the first row's growth factor so last-row cards
+                // stay the same width as cards on full rows.
+                available_width / rows[0].total_width
+            } else {
+                available_width / row.total_width
+            };
 
             let mut card_x = full_rect.min.x;
             let mut new_row_stats = RowStats::default();
 
-            for i in 0..row.num_items {
-                let item = &items[row.first_item + i];
+            for i in row.items {
+                let item = &items[i];
                 let frame = item.frame.unwrap_or(default_frame);
                 let frame_margin = frame.inner_margin.sum();
                 let card_width =
                     (item_growth * item.min_width - gap_space_item).at_most(available_width);
 
+                let card_rect = egui::Rect::from_min_size(
+                    egui::pos2(card_x, row_y),
+                    egui::vec2(card_width, *row_height),
+                );
+
                 let mut child_ui = ui.new_child(
                     egui::UiBuilder::new()
-                        .max_rect(egui::Rect::from_min_size(
-                            egui::pos2(card_x, row_y),
-                            egui::vec2(card_width, *row_height),
-                        ))
+                        .max_rect(card_rect)
                         .layout(egui::Layout::left_to_right(egui::Align::Min)),
                 );
+
+                // Check hover on the pre-computed card rect *before* painting.
+                // This replicates the logic of `container_hovered()`: pointer is
+                // inside the rect on this layer and nothing is being dragged.
+                let card_hovered = hover_fill.is_some()
+                    && child_ui.ctx().dragged_id().is_none()
+                    && child_ui
+                        .ctx()
+                        .rect_contains_pointer(child_ui.layer_id(), card_rect);
+
+                let frame = if let (true, Some(fill)) = (card_hovered, hover_fill) {
+                    frame.fill(fill)
+                } else {
+                    frame
+                };
 
                 let mut content_height = 0.0;
                 frame.show(&mut child_ui, |ui| {
                     ui.set_width((card_width - frame_margin.x).at_most(ui.available_width()));
-                    show_item(ui, row.first_item + i);
+                    show_item(ui, i, card_hovered);
 
                     content_height = ui.min_size().y;
                     ui.set_height((row_height - frame_margin.y).at_least(0.0));
@@ -174,8 +227,7 @@ impl CardLayout {
                 idx += 1;
             }
             Some(RowAssignment {
-                first_item,
-                num_items: idx - first_item,
+                items: re_span::Span::from_start_end(first_item, idx),
                 total_width,
             })
         })

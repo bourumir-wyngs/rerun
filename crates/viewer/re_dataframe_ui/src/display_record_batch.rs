@@ -9,6 +9,7 @@ use arrow::array::{
 };
 use arrow::buffer::{NullBuffer as ArrowNullBuffer, ScalarBuffer as ArrowScalarBuffer};
 use arrow::datatypes::DataType as ArrowDataType;
+use itertools::Itertools as _;
 use re_arrow_util::ArrowArrayDowncastRef as _;
 use re_component_ui::REDAP_THUMBNAIL_VARIANT;
 use re_dataframe::external::re_chunk::{TimeColumn, TimeColumnError};
@@ -17,11 +18,11 @@ use re_log_types::{EntityPath, TimeInt, Timeline};
 use re_sdk_types::ComponentDescriptor;
 use re_sdk_types::components::{Blob, MediaType};
 use re_sorbet::ColumnDescriptorRef;
-use re_types_core::{Component as _, DeserializationError, Loggable as _, RowId};
+use re_types_core::{Component as _, DeserializationError, FromArrow as _, RowId};
 use re_ui::UiExt as _;
-use re_viewer_context::{StoreViewContext, UiLayout, VariantName};
+use re_viewer_context::{AppContext, UiLayout, VariantName};
 
-use crate::table_blueprint::ColumnBlueprint;
+use crate::column_blueprint::ColumnBlueprint;
 
 #[derive(thiserror::Error, Debug)]
 pub enum DisplayRecordBatchError {
@@ -200,28 +201,39 @@ impl DisplayComponentColumn {
                 .is_some_and(Self::is_blob_image)
     }
 
-    pub fn string_value_at(&self, row: usize) -> Option<String> {
-        let data = self.component_data.row_data(row)?;
-
-        let string_component = data.downcast_array_ref::<arrow::array::StringArray>()?;
-
-        Some(string_component.value(0).to_owned())
+    pub fn row_value_at(&self, row: usize) -> Option<ArrowArrayRef> {
+        self.component_data.row_data(row)
     }
 
+    pub fn string_value_at(&self, row: usize) -> Option<String> {
+        let data = self.row_value_at(row)?;
+        let string_array = data.downcast_array_ref::<arrow::array::StringArray>()?;
+        if string_array.is_empty() {
+            return None;
+        }
+        Some(string_array.value(0).to_owned())
+    }
+
+    /// Shows a single cell of this component column in the UI.
+    ///
+    /// Returns edited data if the cell was edited, otherwise returns `None`.
     fn data_ui(
         &self,
-        ctx: &StoreViewContext<'_>,
+        ctx: &AppContext<'_>,
         ui: &mut egui::Ui,
         row_index: usize,
         instance_index: Option<u64>,
-    ) {
+        ui_layout: UiLayout,
+        force_variant_name: Option<VariantName>,
+        editable: bool,
+    ) -> Option<ArrowArrayRef> {
         // handle null columns
         if self.component_data.is_null() {
             // don't repeat the null value when expanding instances
             if instance_index.is_none() {
                 ui.label("null");
             }
-            return;
+            return None;
         }
 
         let data = self.component_data.row_data(row_index);
@@ -241,14 +253,14 @@ impl DisplayComponentColumn {
                 .and_then(|row_ids| row_ids.get(row_index))
                 .copied();
 
-            let mut variant_name = self.variant_name;
+            let mut inferred_variant_name = self.variant_name;
 
             let blob = Blob::from_arrow(&data_to_display).ok();
 
             if let Some(blob) = blob.as_ref().and_then(|b| b.first())
                 && Self::is_blob_image(blob)
             {
-                variant_name = Some(VariantName::from(REDAP_THUMBNAIL_VARIANT));
+                inferred_variant_name = Some(VariantName::from_static_str(REDAP_THUMBNAIL_VARIANT));
 
                 // TODO(ab): we should find an alternative to using content-hashing to generate cache
                 // keys.
@@ -269,21 +281,31 @@ impl DisplayComponentColumn {
                 }
             }
 
-            if let Some(variant_name) = variant_name {
-                ctx.component_ui_registry().variant_ui_raw(
+            if let Some(variant_name) = force_variant_name.or(inferred_variant_name) {
+                if editable {
+                    return ctx.component_ui_registry.variant_edit_ui_raw(
+                        ctx,
+                        ui,
+                        variant_name,
+                        &self.component_descr,
+                        row_id,
+                        data_to_display.as_ref(),
+                    );
+                }
+                ctx.component_ui_registry.variant_ui_raw(
                     ctx,
                     ui,
-                    UiLayout::List,
+                    ui_layout,
                     variant_name,
                     &self.component_descr,
                     row_id,
                     data_to_display.as_ref(),
                 );
             } else {
-                ctx.component_ui_registry().component_ui_raw(
+                ctx.component_ui_registry.component_ui_raw(
                     ctx,
                     ui,
-                    UiLayout::List,
+                    ui_layout,
                     &self.entity_path,
                     &self.component_descr,
                     row_id,
@@ -293,6 +315,7 @@ impl DisplayComponentColumn {
         } else {
             ui.label("-");
         }
+        None
     }
 }
 
@@ -365,25 +388,31 @@ impl DisplayColumn {
     /// - Argument `instance_index` is the specific instance within the row to display. If `None`,
     ///   a summary of all instances is displayed. If the instance is out-of-bound (aka greater than
     ///   [`Self::instance_count`]), nothing is displayed.
+    /// - Argument `force_variant_name` overrides the configured variant UI when set.
+    ///
+    /// Returns edited data if the cell was edited, otherwise returns `None`.
     pub fn data_ui(
         &self,
-        ctx: &StoreViewContext<'_>,
+        ctx: &AppContext<'_>,
         ui: &mut egui::Ui,
         row_index: usize,
         instance_index: Option<u64>,
-    ) {
+        ui_layout: UiLayout,
+        force_variant_name: Option<VariantName>,
+        editable: bool,
+    ) -> Option<ArrowArrayRef> {
         if let Some(instance_index) = instance_index
             && instance_index >= self.instance_count(row_index)
         {
             // do not display anything for out-of-bound instance index
-            return;
+            return None;
         }
 
         match self {
             Self::RowId { row_ids } => {
                 if instance_index.is_some() {
                     // we only ever display the row id on the summary line
-                    return;
+                    return None;
                 }
 
                 ui.label(row_ids[row_index].to_string());
@@ -395,7 +424,7 @@ impl DisplayColumn {
             } => {
                 if instance_index.is_some() {
                     // we only ever display the row id on the summary line
-                    return;
+                    return None;
                 }
 
                 let is_valid = time_nulls
@@ -408,7 +437,7 @@ impl DisplayColumn {
                             ui.label(
                                 timeline
                                     .typ()
-                                    .format(timestamp, ctx.app_options().timestamp_format),
+                                    .format(timestamp, ctx.app_options.timestamp_format),
                             );
                         }
                         Err(err) => {
@@ -421,9 +450,18 @@ impl DisplayColumn {
             }
 
             Self::Component(component_column) => {
-                component_column.data_ui(ctx, ui, row_index, instance_index);
+                return component_column.data_ui(
+                    ctx,
+                    ui,
+                    row_index,
+                    instance_index,
+                    ui_layout,
+                    force_variant_name,
+                    editable,
+                );
             }
         }
+        None
     }
 
     /// Try to decode the time from the given row index.
@@ -457,7 +495,7 @@ impl DisplayRecordBatch {
         let mut num_rows = None;
         let mut batch_row_ids = None;
 
-        let mut columns = data
+        let mut columns: Vec<DisplayColumn> = data
             .map(|(column_descriptor, column_blueprint, column_data)| {
                 if num_rows.is_none() {
                     num_rows = Some(column_data.len());
@@ -475,7 +513,7 @@ impl DisplayRecordBatch {
 
                 column
             })
-            .collect::<Result<Vec<DisplayColumn>, _>>()?;
+            .try_collect()?;
 
         // If we have row_ids, give a reference to all component columns.
         if let Some(batch_row_ids) = batch_row_ids {

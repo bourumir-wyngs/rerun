@@ -125,7 +125,7 @@ impl std::fmt::Debug for BatcherHooks {
 /// Defines the different thresholds of the associated [`ChunkBatcher`].
 ///
 /// See [`Self::default`] and [`Self::from_env`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, re_byte_size::SizeBytes)]
 pub struct ChunkBatcherConfig {
     /// Duration of the periodic tick.
     //
@@ -166,9 +166,9 @@ impl ChunkBatcherConfig {
     /// Default configuration, applicable to most use cases.
     pub const DEFAULT: Self = Self {
         flush_tick: Duration::from_millis(200),
-        flush_num_bytes: 1024 * 1024, // 1 MiB
+        flush_num_bytes: 2 * 1024 * 1024, // 2 MiB
         flush_num_rows: u64::MAX,
-        chunk_max_rows_if_unsorted: 256,
+        chunk_max_rows_if_unsorted: 8192,
         max_bytes_in_flight: 100 * 1024 * 1024, // Apply backpressure
     };
 
@@ -179,7 +179,16 @@ impl ChunkBatcherConfig {
     };
 
     /// Always flushes ASAP.
-    pub const ALWAYS: Self = Self {
+    ///
+    /// # WARNING: test-only configuration.
+    ///
+    /// This produces an unrealistically large number of chunks and is **not** suitable for
+    /// production workloads. In particular, with a file sink it can drive memory usage through
+    /// the roof: per-chunk metadata has to be accumulated in memory until the SDK process ends
+    /// and the file footer can be written.
+    ///
+    /// Use [`Self::LOW_LATENCY`] if you actually want fast flushing in real applications.
+    pub const ALWAYS_TEST_ONLY: Self = Self {
         flush_tick: Duration::MAX,
         flush_num_bytes: 0,
         flush_num_rows: 0,
@@ -195,6 +204,16 @@ impl ChunkBatcherConfig {
         chunk_max_rows_if_unsorted: 256,
         ..Self::DEFAULT
     };
+
+    /// Returns true if this config flushes after every single row (one chunk per row).
+    ///
+    /// This is the case for [`Self::ALWAYS_TEST_ONLY`] and any config where either the row or
+    /// byte threshold is zero — the batcher flushes whenever pending rows/bytes meet *or exceed*
+    /// the threshold, so a zero threshold triggers on the first row.
+    #[inline]
+    pub fn always_flushes(&self) -> bool {
+        self.flush_num_rows == 0 || self.flush_num_bytes == 0
+    }
 
     /// Environment variable to configure [`Self::flush_tick`].
     pub const ENV_FLUSH_TICK: &'static str = "RERUN_FLUSH_TICK_SECS";
@@ -405,24 +424,16 @@ impl Drop for ChunkBatcherInner {
     }
 }
 
+#[derive(re_byte_size::SizeBytes)]
 enum Command {
     AppendChunk(Chunk),
     AppendRow(EntityPath, PendingRow),
     Flush {
+        #[size_bytes(ignore)]
         on_done: crossbeam::channel::Sender<()>,
     },
     UpdateConfig(ChunkBatcherConfig),
     Shutdown,
-}
-
-impl re_byte_size::SizeBytes for Command {
-    fn heap_size_bytes(&self) -> u64 {
-        match self {
-            Self::AppendChunk(chunk) => chunk.heap_size_bytes(),
-            Self::AppendRow(_, row) => row.heap_size_bytes(),
-            Self::Flush { .. } | Self::UpdateConfig(_) | Self::Shutdown => 0,
-        }
-    }
 }
 
 impl Command {
@@ -629,14 +640,14 @@ fn batching_thread(
             // NOTE: This can only fail if all receivers have been dropped, which simply cannot happen
             // as long the batching thread is alive… which is where we currently are.
 
-            if !chunk.components.is_empty() {
-                // make sure the chunk didn't contain *only* indicators!
-                tx_chunk.send(chunk).ok();
-            } else {
+            if chunk.components.is_empty() {
                 re_log::warn_once!(
                     "Dropping chunk without components. Entity path: {}",
                     chunk.entity_path()
                 );
+            } else {
+                // make sure the chunk didn't contain *only* indicators!
+                tx_chunk.send(chunk).ok();
             }
         }
 
@@ -676,14 +687,14 @@ fn batching_thread(
                         // NOTE: This can only fail if all receivers have been dropped, which simply cannot happen
                         // as long the batching thread is alive… which is where we currently are.
 
-                        if !chunk.components.is_empty() {
-                            // make sure the chunk didn't contain *only* indicators!
-                            tx_chunk.send(chunk).ok();
-                        } else {
+                        if chunk.components.is_empty() {
                             re_log::warn_once!(
                                 "Dropping chunk without components. Entity path: {}",
                                 chunk.entity_path()
                             );
+                        } else {
+                            // make sure the chunk didn't contain *only* indicators!
+                            tx_chunk.send(chunk).ok();
                         }
                     },
                     Command::AppendRow(entity_path, row) => {
@@ -767,7 +778,7 @@ fn batching_thread(
 /// A single row's worth of data (i.e. a single log call).
 ///
 /// Send those to the batcher to build up a [`Chunk`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, re_byte_size::SizeBytes)]
 pub struct PendingRow {
     /// Auto-generated `TUID`, uniquely identifying this event and keeping track of the client's
     /// wall-clock.
@@ -807,19 +818,6 @@ impl PendingRow {
                 .map(|component| (component.descriptor.component, component))
                 .collect(),
         )
-    }
-}
-
-impl re_byte_size::SizeBytes for PendingRow {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        let Self {
-            row_id,
-            timepoint,
-            components,
-        } = self;
-
-        row_id.heap_size_bytes() + timepoint.heap_size_bytes() + components.heap_size_bytes()
     }
 }
 
@@ -915,7 +913,7 @@ impl PendingRow {
         per_timeline_set.into_values().flat_map(move |rows| {
             re_tracing::profile_scope!("iterate per timeline set");
 
-            // Then we split the micro batches even further -- one sub-batch per unique set of datatypes.
+            // Then we split the micro batches even further -- one sub-batch per unique set of encodings.
             let mut per_datatype_set: IntMap<u64 /* ArrowDatatype set */, Vec<Self>> =
                 Default::default();
             {
@@ -1011,7 +1009,7 @@ impl PendingRow {
                                 },
                             ));
 
-                            components = all_components.clone();
+                            components.clone_from(&all_components);
                         }
                     }
 
@@ -1124,7 +1122,7 @@ impl PendingTimeColumn {
 mod tests {
     use crossbeam::channel::TryRecvError;
     use re_log_types::example_components::{MyIndex, MyLabel, MyPoint, MyPoint64, MyPoints};
-    use re_types_core::{ComponentDescriptor, Loggable as _};
+    use re_types_core::{ComponentDescriptor, ToArrow as _};
 
     use super::*;
 
@@ -1665,7 +1663,7 @@ mod tests {
 
     /// A bunch of rows with different datatypes will end up in different batches.
     #[test]
-    fn different_datatypes() -> anyhow::Result<()> {
+    fn different_encodings() -> anyhow::Result<()> {
         let batcher = ChunkBatcher::new(ChunkBatcherConfig::NEVER, BatcherHooks::NONE)?;
 
         let timeline1 = Timeline::new_duration("log_time");

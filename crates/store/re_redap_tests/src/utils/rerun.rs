@@ -21,18 +21,18 @@ use crate::TempPath;
 pub type TuidPrefix = u64;
 
 pub fn next_chunk_id_generator(prefix: u64) -> impl FnMut() -> re_chunk::ChunkId {
-    let mut chunk_id = re_chunk::ChunkId::from_tuid(Tuid::from_nanos_and_inc(prefix, 0));
+    let mut tuid = Tuid::from_nanos_and_inc(prefix, 0);
     move || {
-        chunk_id = chunk_id.next();
-        chunk_id
+        tuid = tuid.next();
+        re_chunk::ChunkId::from_tuid(tuid)
     }
 }
 
 pub fn next_row_id_generator(prefix: u64) -> impl FnMut() -> re_chunk::RowId {
-    let mut row_id = re_chunk::RowId::from_tuid(Tuid::from_nanos_and_inc(prefix, 0));
+    let mut tuid = Tuid::from_nanos_and_inc(prefix, 0);
     move || {
-        row_id = row_id.next();
-        row_id
+        tuid = tuid.next();
+        re_chunk::RowId::from_tuid(tuid)
     }
 }
 
@@ -84,10 +84,12 @@ pub fn create_simple_recording_in(
 
     let tmp_path = in_dir.join(format!("{segment_id}.rrd"));
 
-    let rec = RecordingStreamBuilder::new(format!("rerun_example_{segment_id}"))
-        .recording_id(segment_id)
-        .send_properties(false)
-        .save(tmp_path.clone())?;
+    let rec = RecordingStreamBuilder::new(
+        re_log_types::ApplicationId::try_new(format!("rerun_example_{segment_id}")).unwrap(),
+    )
+    .recording_id(segment_id)
+    .send_properties(false)
+    .save(tmp_path.clone())?;
 
     let mut next_chunk_id = next_chunk_id_generator(tuid_prefix);
     let mut next_row_id = next_row_id_generator(tuid_prefix);
@@ -168,6 +170,105 @@ pub fn create_simple_recording_in(
     Ok(tmp_path)
 }
 
+/// Like [`create_simple_recording`], but emits one temporal chunk per frame.
+///
+/// Used by per-segment chunk-filter regression tests that need multiple
+/// temporal chunks per `(segment, entity)` to prove a filter actually
+/// narrows the result set.
+pub fn create_simple_recording_one_chunk_per_frame(
+    tuid_prefix: TuidPrefix,
+    segment_id: &str,
+    entity_paths: &[&str],
+    start_time: i64,
+    time_type: TimeType,
+) -> anyhow::Result<TempPath> {
+    let tmp_dir = tempfile::tempdir()?;
+    let path = create_simple_recording_one_chunk_per_frame_in(
+        tuid_prefix,
+        segment_id,
+        entity_paths,
+        start_time,
+        time_type,
+        tmp_dir.path(),
+    )?;
+    Ok(TempPath::new(tmp_dir, path))
+}
+
+/// Like [`create_simple_recording_in`], but emits one temporal chunk per frame.
+///
+/// Frames are at `start_time + {10, 20, 30, 40}` plus the same single static
+/// chunk per entity. The recording is non-compactable for the same reasons
+/// as the single-chunk variant.
+pub fn create_simple_recording_one_chunk_per_frame_in(
+    tuid_prefix: TuidPrefix,
+    segment_id: &str,
+    entity_paths: &[&str],
+    start_time: i64,
+    time_type: TimeType,
+    in_dir: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    use re_chunk::{Chunk, TimePoint};
+    use re_log_types::example_components::{MyColor, MyLabel, MyPoint, MyPoints};
+    use re_log_types::{EntityPath, TimeInt};
+
+    if !std::fs::metadata(in_dir)?.is_dir() {
+        return Err(anyhow::anyhow!("Expected `in_dir` to be a directory"));
+    }
+
+    let tmp_path = in_dir.join(format!("{segment_id}.rrd"));
+
+    let rec = RecordingStreamBuilder::new(
+        re_log_types::ApplicationId::try_new(format!("rerun_example_{segment_id}")).unwrap(),
+    )
+    .recording_id(segment_id)
+    .send_properties(false)
+    .save(tmp_path.clone())?;
+
+    let mut next_chunk_id = next_chunk_id_generator(tuid_prefix);
+    let mut next_row_id = next_row_id_generator(tuid_prefix);
+
+    for entity_path in entity_paths {
+        let entity_path = EntityPath::from(*entity_path);
+
+        let labels = vec![MyLabel("simple".to_owned())];
+
+        for frame_offset in [10_i64, 20, 30, 40] {
+            let frame = TimeInt::new_temporal(start_time + frame_offset);
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let i = (frame_offset / 10) as u32 - 1;
+            let points = MyPoint::from_iter(i..=i);
+            let colors = MyColor::from_iter(i..=i);
+
+            let chunk = Chunk::builder_with_id(next_chunk_id(), entity_path.clone())
+                .with_sparse_component_batches(
+                    next_row_id(),
+                    [build_index_value(frame, time_type)],
+                    [
+                        (MyPoints::descriptor_points(), Some(&points as _)),
+                        (MyPoints::descriptor_colors(), Some(&colors as _)),
+                    ],
+                )
+                .build()?;
+
+            rec.send_chunk(chunk);
+        }
+
+        let static_chunk = Chunk::builder_with_id(next_chunk_id(), entity_path.clone())
+            .with_sparse_component_batches(
+                next_row_id(),
+                TimePoint::default(),
+                [(MyPoints::descriptor_labels(), Some(&labels as _))],
+            )
+            .build()?;
+
+        rec.send_chunk(static_chunk);
+    }
+
+    rec.flush_blocking()?;
+
+    Ok(tmp_path)
+}
+
 /// Creates a simple blueprint.
 pub fn create_simple_blueprint(
     tuid_prefix: TuidPrefix,
@@ -183,11 +284,13 @@ pub fn create_simple_blueprint(
         TempPath::new(dir, path)
     };
 
-    let rec = RecordingStreamBuilder::new(format!("rerun_example_{segment_id}"))
-        .blueprint()
-        .recording_id(segment_id)
-        .send_properties(false)
-        .save(tmp_path.clone())?;
+    let rec = RecordingStreamBuilder::new(
+        re_log_types::ApplicationId::try_new(format!("rerun_example_{segment_id}")).unwrap(),
+    )
+    .blueprint()
+    .recording_id(segment_id)
+    .send_properties(false)
+    .save(tmp_path.clone())?;
 
     let mut next_chunk_id = next_chunk_id_generator(tuid_prefix);
     let mut next_row_id = next_row_id_generator(tuid_prefix);
@@ -226,13 +329,15 @@ pub fn create_nasty_recording(
         TempPath::new(dir, path)
     };
 
-    let rec = RecordingStreamBuilder::new(format!("rerun_example_{segment_id}"))
-        .recording_id(segment_id)
-        // NOTE: Don't send builtin properties (e.g. recording start time): these are non
-        // deterministic (neither their values nor their Chunk/Row IDs) and are not what we're
-        // trying to test anyhow. We have dedicated, in-depth deterministic test suites for properties.
-        .send_properties(false)
-        .save(tmp_path.clone())?;
+    let rec = RecordingStreamBuilder::new(
+        re_log_types::ApplicationId::try_new(format!("rerun_example_{segment_id}")).unwrap(),
+    )
+    .recording_id(segment_id)
+    // NOTE: Don't send builtin properties (e.g. recording start time): these are non
+    // deterministic (neither their values nor their Chunk/Row IDs) and are not what we're
+    // trying to test anyhow. We have dedicated, in-depth deterministic test suites for properties.
+    .send_properties(false)
+    .save(tmp_path.clone())?;
 
     let mut next_chunk_id = next_chunk_id_generator(tuid_prefix);
     let mut next_row_id = next_row_id_generator(tuid_prefix);
@@ -468,6 +573,126 @@ pub fn create_nasty_recording(
     Ok(tmp_path)
 }
 
+/// Create a recording with deliberately divergent per-component time ranges within chunks.
+///
+/// This is designed to test correctness of latest-at and range queries when per-component
+/// time ranges differ significantly from the chunk's global time range.
+///
+/// Creates two chunks for entity `/sensor`:
+///
+/// ```text
+/// Chunk F: global [5, 20]
+///   - row at T=5:  points present, colors absent
+///   - row at T=8:  points present, colors absent
+///   - row at T=15: points absent,  colors present
+///   - row at T=20: points absent,  colors present
+///   → points@[5, 8], colors@[15, 20]
+///
+/// Chunk G: global [1, 3]
+///   - row at T=1: colors present
+///   - row at T=3: colors present
+///   → colors@[1, 3]
+/// ```
+pub fn create_divergent_component_ranges_recording(
+    tuid_prefix: TuidPrefix,
+    segment_id: &str,
+) -> anyhow::Result<TempPath> {
+    use re_chunk::Chunk;
+    use re_log_types::example_components::{MyColor, MyPoint, MyPoints};
+    use re_log_types::{TimeInt, build_frame_nr};
+
+    let tmp_path = {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(format!("{segment_id}.rrd"));
+        TempPath::new(dir, path)
+    };
+
+    let rec = RecordingStreamBuilder::new(
+        re_log_types::ApplicationId::try_new(format!("rerun_example_{segment_id}")).unwrap(),
+    )
+    .recording_id(segment_id)
+    .send_properties(false)
+    .save(tmp_path.clone())?;
+
+    let mut next_chunk_id = next_chunk_id_generator(tuid_prefix);
+    let mut next_row_id = next_row_id_generator(tuid_prefix);
+
+    let entity_path = EntityPath::from("sensor");
+
+    let t5 = TimeInt::new_temporal(5);
+    let t8 = TimeInt::new_temporal(8);
+    let t15 = TimeInt::new_temporal(15);
+    let t20 = TimeInt::new_temporal(20);
+
+    let t1 = TimeInt::new_temporal(1);
+    let t3 = TimeInt::new_temporal(3);
+
+    let points_a = MyPoint::from_iter(0..1);
+    let points_b = MyPoint::from_iter(1..2);
+    let colors_a = MyColor::from_iter(0..1);
+    let colors_b = MyColor::from_iter(1..2);
+    let colors_c = MyColor::from_iter(2..3);
+    let colors_d = MyColor::from_iter(3..4);
+
+    // Chunk F: global [5, 20], points@[5, 8], colors@[15, 20]
+    let chunk_f = Chunk::builder_with_id(next_chunk_id(), entity_path.clone())
+        .with_sparse_component_batches(
+            next_row_id(),
+            [build_frame_nr(t5)],
+            [
+                (MyPoints::descriptor_points(), Some(&points_a as _)),
+                (MyPoints::descriptor_colors(), None),
+            ],
+        )
+        .with_sparse_component_batches(
+            next_row_id(),
+            [build_frame_nr(t8)],
+            [
+                (MyPoints::descriptor_points(), Some(&points_b as _)),
+                (MyPoints::descriptor_colors(), None),
+            ],
+        )
+        .with_sparse_component_batches(
+            next_row_id(),
+            [build_frame_nr(t15)],
+            [
+                (MyPoints::descriptor_points(), None),
+                (MyPoints::descriptor_colors(), Some(&colors_a as _)),
+            ],
+        )
+        .with_sparse_component_batches(
+            next_row_id(),
+            [build_frame_nr(t20)],
+            [
+                (MyPoints::descriptor_points(), None),
+                (MyPoints::descriptor_colors(), Some(&colors_b as _)),
+            ],
+        )
+        .build()?;
+
+    rec.send_chunk(chunk_f);
+
+    // Chunk G: global [1, 3], colors@[1, 3]
+    let chunk_g = Chunk::builder_with_id(next_chunk_id(), entity_path.clone())
+        .with_sparse_component_batches(
+            next_row_id(),
+            [build_frame_nr(t1)],
+            [(MyPoints::descriptor_colors(), Some(&colors_c as _))],
+        )
+        .with_sparse_component_batches(
+            next_row_id(),
+            [build_frame_nr(t3)],
+            [(MyPoints::descriptor_colors(), Some(&colors_d as _))],
+        )
+        .build()?;
+
+    rec.send_chunk(chunk_g);
+
+    rec.flush_blocking()?;
+
+    Ok(tmp_path)
+}
+
 /// Create an rrd recording with embeddings with 256 floats each. Total number of embeddings (rows)
 /// and number of embeddings per row can be specified.
 ///
@@ -490,13 +715,15 @@ pub fn create_recording_with_embeddings(
         TempPath::new(dir, path)
     };
 
-    let rec = re_sdk::RecordingStreamBuilder::new(format!("rerun_example_{segment_id}"))
-        .recording_id(segment_id)
-        // NOTE: Don't send builtin properties (e.g. recording start time): these are non
-        // deterministic (neither their values nor their Chunk/Row IDs) and are not what we're
-        // trying to test anyhow. We have dedicated, in-depth deterministic test suites for properties.
-        .send_properties(false)
-        .save(tmp_path.clone())?;
+    let rec = re_sdk::RecordingStreamBuilder::new(
+        re_log_types::ApplicationId::try_new(format!("rerun_example_{segment_id}")).unwrap(),
+    )
+    .recording_id(segment_id)
+    // NOTE: Don't send builtin properties (e.g. recording start time): these are non
+    // deterministic (neither their values nor their Chunk/Row IDs) and are not what we're
+    // trying to test anyhow. We have dedicated, in-depth deterministic test suites for properties.
+    .send_properties(false)
+    .save(tmp_path.clone())?;
 
     let mut next_chunk_id = next_chunk_id_generator(tuid_prefix);
     let mut next_row_id = next_row_id_generator(tuid_prefix);
@@ -615,13 +842,15 @@ pub fn create_recording_with_scalars(
         TempPath::new(dir, path)
     };
 
-    let rec = re_sdk::RecordingStreamBuilder::new(format!("rerun_example_{segment_id}"))
-        .recording_id(segment_id)
-        // NOTE: Don't send builtin properties (e.g. recording start time): these are non
-        // deterministic (neither their values nor their Chunk/Row IDs) and are not what we're
-        // trying to test anyhow. We have dedicated, in-depth deterministic test suites for properties.
-        .send_properties(false)
-        .save(tmp_path.clone())?;
+    let rec = re_sdk::RecordingStreamBuilder::new(
+        re_log_types::ApplicationId::try_new(format!("rerun_example_{segment_id}")).unwrap(),
+    )
+    .recording_id(segment_id)
+    // NOTE: Don't send builtin properties (e.g. recording start time): these are non
+    // deterministic (neither their values nor their Chunk/Row IDs) and are not what we're
+    // trying to test anyhow. We have dedicated, in-depth deterministic test suites for properties.
+    .send_properties(false)
+    .save(tmp_path.clone())?;
 
     let mut next_chunk_id = next_chunk_id_generator(tuid_prefix);
     let mut next_row_id = next_row_id_generator(tuid_prefix);
@@ -662,13 +891,15 @@ pub fn create_recording_with_text(
         TempPath::new(dir, path)
     };
 
-    let rec = re_sdk::RecordingStreamBuilder::new(format!("rerun_example_{segment_id}"))
-        .recording_id(segment_id)
-        // NOTE: Don't send builtin properties (e.g. recording start time): these are non
-        // deterministic (neither their values nor their Chunk/Row IDs) and are not what we're
-        // trying to test anyhow. We have dedicated, in-depth deterministic test suites for properties.
-        .send_properties(false)
-        .save(tmp_path.clone())?;
+    let rec = re_sdk::RecordingStreamBuilder::new(
+        re_log_types::ApplicationId::try_new(format!("rerun_example_{segment_id}")).unwrap(),
+    )
+    .recording_id(segment_id)
+    // NOTE: Don't send builtin properties (e.g. recording start time): these are non
+    // deterministic (neither their values nor their Chunk/Row IDs) and are not what we're
+    // trying to test anyhow. We have dedicated, in-depth deterministic test suites for properties.
+    .send_properties(false)
+    .save(tmp_path.clone())?;
 
     let sentences = [
         "A sagging bookshelf overflows with worn paperbacks.",
@@ -765,15 +996,51 @@ pub fn create_recording_with_static_components(
     segment_id: &str,
     components: BTreeMap<EntityPath, Box<dyn AsComponents>>,
 ) -> anyhow::Result<TempPath> {
+    create_store_with_static_components(
+        tuid_prefix,
+        segment_id,
+        components,
+        re_log_types::StoreKind::Recording,
+    )
+}
+
+/// Like [`create_recording_with_static_components`], but writes a blueprint store.
+pub fn create_blueprint_with_static_components(
+    tuid_prefix: TuidPrefix,
+    segment_id: &str,
+    components: BTreeMap<EntityPath, Box<dyn AsComponents>>,
+) -> anyhow::Result<TempPath> {
+    create_store_with_static_components(
+        tuid_prefix,
+        segment_id,
+        components,
+        re_log_types::StoreKind::Blueprint,
+    )
+}
+
+fn create_store_with_static_components(
+    tuid_prefix: TuidPrefix,
+    segment_id: &str,
+    components: BTreeMap<EntityPath, Box<dyn AsComponents>>,
+    store_kind: re_log_types::StoreKind,
+) -> anyhow::Result<TempPath> {
     use re_chunk::Chunk;
 
+    let extension = match store_kind {
+        re_log_types::StoreKind::Recording => "rrd",
+        re_log_types::StoreKind::Blueprint => "rbl",
+    };
     let tmp_path = {
         let dir = tempfile::tempdir()?;
-        let path = dir.path().join(format!("{segment_id}.rrd"));
+        let path = dir.path().join(format!("{segment_id}.{extension}"));
         TempPath::new(dir, path)
     };
 
-    let rec = re_sdk::RecordingStreamBuilder::new("rerun_example_properties")
+    let mut builder = re_sdk::RecordingStreamBuilder::new("rerun_example_properties");
+    if store_kind == re_log_types::StoreKind::Blueprint {
+        builder = builder.blueprint();
+    }
+    let rec = builder
         .recording_id(segment_id)
         .send_properties(false)
         .save(tmp_path.clone())?;
@@ -792,6 +1059,25 @@ pub fn create_recording_with_static_components(
     rec.flush_blocking()?;
 
     Ok(tmp_path)
+}
+
+/// Create a recording containing only a single static chunk.
+pub fn create_minimal_static_recording(
+    tuid_prefix: TuidPrefix,
+    segment_id: &str,
+) -> anyhow::Result<TempPath> {
+    use re_sdk_types::AnyValues;
+    create_recording_with_static_components(
+        tuid_prefix,
+        segment_id,
+        BTreeMap::from([(
+            EntityPath::from("static/data"),
+            Box::new(AnyValues::default().with_component_from_data(
+                "test",
+                std::sync::Arc::new(arrow::array::Int32Array::from(vec![1i32])),
+            )) as Box<dyn AsComponents>,
+        )]),
+    )
 }
 
 /// Create a minimal rerun recording with one entity and one component.
@@ -815,10 +1101,12 @@ pub fn create_minimal_binary_recording_in(
 
     let tmp_path = in_dir.join(format!("{segment_id}.rrd"));
 
-    let rec = re_sdk::RecordingStreamBuilder::new(format!("rerun_example_{segment_id}"))
-        .recording_id(segment_id)
-        .send_properties(false)
-        .save(tmp_path.clone())?;
+    let rec = re_sdk::RecordingStreamBuilder::new(
+        re_log_types::ApplicationId::try_new(format!("rerun_example_{segment_id}")).unwrap(),
+    )
+    .recording_id(segment_id)
+    .send_properties(false)
+    .save(tmp_path.clone())?;
 
     let mut next_chunk_id = next_chunk_id_generator(tuid_prefix);
     let mut next_row_id = next_row_id_generator(tuid_prefix);
@@ -877,10 +1165,12 @@ pub fn multi_chunked_entities_recording(
 
     let tmp_path = in_dir.join(format!("{segment_id}.rrd"));
 
-    let rec = RecordingStreamBuilder::new(format!("rerun_example_{segment_id}"))
-        .recording_id(segment_id)
-        .send_properties(false)
-        .save(tmp_path.clone())?;
+    let rec = RecordingStreamBuilder::new(
+        re_log_types::ApplicationId::try_new(format!("rerun_example_{segment_id}")).unwrap(),
+    )
+    .recording_id(segment_id)
+    .send_properties(false)
+    .save(tmp_path.clone())?;
 
     let mut next_chunk_id = next_chunk_id_generator(tuid_prefix);
     let mut next_row_id = next_row_id_generator(tuid_prefix);
