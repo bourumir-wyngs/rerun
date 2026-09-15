@@ -1,11 +1,13 @@
-//! Run-time reflection for reading meta-data about components and archetypes.
+//! Run-time reflection for reading meta-data about components, archetypes, and views.
 
 use std::sync::Arc;
 
 use arrow::array::{Array as _, ArrayRef};
 use arrow::datatypes::TimeUnit;
 
-use crate::{ArchetypeName, ComponentDescriptor, ComponentIdentifier, ComponentType};
+use crate::{
+    ArchetypeName, ComponentDescriptor, ComponentIdentifier, ComponentType, ViewClassIdentifier,
+};
 
 /// A trait for code-generated enums.
 pub trait Enum:
@@ -33,15 +35,26 @@ pub trait Enum:
     }
 }
 
-/// Runtime reflection about components and archetypes.
+/// Runtime reflection about components, archetypes, and views.
 #[derive(Clone, Debug, Default)]
 pub struct Reflection {
     pub components: ComponentReflectionMap,
     pub component_identifiers: ComponentIdentifierReflectionMap,
     pub archetypes: ArchetypeReflectionMap,
+    pub views: ViewReflectionMap,
 }
 
 impl Reflection {
+    /// Iterates over the views that statically support the given archetype.
+    pub fn views_for_archetype(
+        &self,
+        archetype: ArchetypeName,
+    ) -> impl Iterator<Item = ViewClassIdentifier> + '_ {
+        self.views.iter().filter_map(move |(identifier, view)| {
+            view.supports_archetype(archetype).then_some(*identifier)
+        })
+    }
+
     /// Looks up the expected Arrow datatype for a given [`ComponentIdentifier`] using reflection.
     pub fn lookup_datatype(
         &self,
@@ -199,30 +212,18 @@ pub fn generic_placeholder_for_datatype(
 
         DataType::FixedSizeList(field, size) => {
             let size = *size as usize;
-            let value_data: ArrayRef = {
-                match field.data_type() {
-                    DataType::Boolean => Arc::new(array::BooleanArray::from(vec![false; size])),
-
-                    DataType::Int8 => Arc::new(array::Int8Array::from(vec![0; size])),
-                    DataType::Int16 => Arc::new(array::Int16Array::from(vec![0; size])),
-                    DataType::Int32 => Arc::new(array::Int32Array::from(vec![0; size])),
-                    DataType::Int64 => Arc::new(array::Int64Array::from(vec![0; size])),
-
-                    DataType::UInt8 => Arc::new(array::UInt8Array::from(vec![0; size])),
-                    DataType::UInt16 => Arc::new(array::UInt16Array::from(vec![0; size])),
-                    DataType::UInt32 => Arc::new(array::UInt32Array::from(vec![0; size])),
-                    DataType::UInt64 => Arc::new(array::UInt64Array::from(vec![0; size])),
-
-                    DataType::Float16 => {
-                        Arc::new(array::Float16Array::from(vec![half::f16::ZERO; size]))
-                    }
-                    DataType::Float32 => Arc::new(array::Float32Array::from(vec![0.0; size])),
-                    DataType::Float64 => Arc::new(array::Float64Array::from(vec![0.0; size])),
-
-                    _ => {
-                        // TODO(emilk)
-                        re_log::debug_once!(
-                            "Unimplemented: placeholder value for FixedSizeListArray of {:?}",
+            // Build the `size` inner values by repeating a single placeholder element.
+            // Recursing into `field.data_type()` handles any inner type, including nested
+            // fixed-size lists (e.g. `FixedSizeList<FixedSizeList<Float16, 3>, 15>`).
+            let value_data: ArrayRef = if size == 0 {
+                array::new_empty_array(field.data_type())
+            } else {
+                let element = generic_placeholder_for_datatype(field.data_type());
+                match re_arrow_util::concat_arrays(&vec![element.as_ref(); size]) {
+                    Ok(value_data) => value_data,
+                    Err(err) => {
+                        re_log::warn_once!(
+                            "Failed to build placeholder for FixedSizeListArray of {}: {err}",
                             field.data_type()
                         );
                         return array::new_empty_array(datatype);
@@ -294,6 +295,9 @@ pub fn generic_placeholder_for_datatype(
 /// Runtime reflection about components.
 pub type ComponentReflectionMap = nohash_hasher::IntMap<ComponentType, ComponentReflection>;
 
+/// A set of component types.
+pub type ComponentTypeSet = nohash_hasher::IntSet<ComponentType>;
+
 /// Runtime reflection about component identifiers.
 pub type ComponentIdentifierReflectionMap =
     nohash_hasher::IntMap<ComponentIdentifier, ComponentDescriptor>;
@@ -337,8 +341,79 @@ pub struct ComponentReflection {
     /// Whether this component is an enum type (as opposed to a struct/union).
     pub is_enum: bool,
 
+    /// Whether this component always belongs in a chunk of its own.
+    ///
+    /// Set for small components that a reader wants without the bulk they are logged next to,
+    /// e.g. `IsKeyframe` beside the video samples it points at.
+    /// Chunk optimization splits such a component out of any chunk it shares with others,
+    /// even when that breaks up an archetype.
+    pub own_chunk: bool,
+
     /// Checks that the given Arrow array can be deserialized into a collection of [`Self`]s.
     pub verify_arrow_array: fn(&dyn arrow::array::Array) -> crate::DeserializationResult<()>,
+}
+
+/// Runtime reflection about views.
+pub type ViewReflectionMap = nohash_hasher::IntMap<ViewClassIdentifier, ViewReflection>;
+
+/// Describes the archetypes statically associated with a view.
+///
+/// This is a coarse type-level hint and does not account for runtime visualizer availability,
+/// required components, topology, or other contextual constraints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewApplicability {
+    /// The view is applicable regardless of which archetype the data belongs to.
+    AllArchetypes,
+
+    /// The view is statically associated with the listed archetypes.
+    Archetypes(Vec<ArchetypeName>),
+}
+
+impl ViewApplicability {
+    /// Whether the view is associated with the given archetype.
+    pub fn supports_archetype(&self, archetype: ArchetypeName) -> bool {
+        match self {
+            Self::AllArchetypes => true,
+            Self::Archetypes(archetypes) => archetypes.contains(&archetype),
+        }
+    }
+
+    /// Merges another set of archetype associations into this one.
+    pub fn merge(&mut self, other: Self) {
+        match (self, other) {
+            (Self::AllArchetypes, _) => {}
+            (this, Self::AllArchetypes) => *this = Self::AllArchetypes,
+            (Self::Archetypes(this), Self::Archetypes(other)) => {
+                for archetype in other {
+                    if !this.contains(&archetype) {
+                        this.push(archetype);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Runtime reflection about a view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewReflection {
+    /// What archetypes this view is applicable to.
+    pub applicability: ViewApplicability,
+}
+
+impl ViewReflection {
+    /// Whether this view supports showing the given archetype.
+    pub fn supports_archetype(&self, archetype: ArchetypeName) -> bool {
+        self.applicability.supports_archetype(archetype)
+    }
+}
+
+impl Default for ViewReflection {
+    fn default() -> Self {
+        Self {
+            applicability: ViewApplicability::Archetypes(Vec::new()),
+        }
+    }
 }
 
 /// Runtime reflection about archetypes.
@@ -352,11 +427,6 @@ pub struct ArchetypeReflection {
 
     /// If deprecated, this explains since when, and what to use instead.
     pub deprecation_summary: Option<&'static str>,
-
-    /// The views that this archetype can be added to.
-    ///
-    /// e.g. `Spatial3DView`.
-    pub view_types: &'static [&'static str],
 
     /// Does this have a particular scope?
     ///
@@ -448,7 +518,7 @@ impl ArchetypeFieldReflection {
     /// Returns the component identifier for this field.
     #[inline]
     pub fn component(&self, archetype_name: ArchetypeName) -> ComponentIdentifier {
-        format!("{}:{}", archetype_name.short_name(), self.name).into()
+        ComponentIdentifier::from_archetype_field(archetype_name, self.name)
     }
 }
 
@@ -480,22 +550,13 @@ pub trait ComponentDescriptorExt {
     fn or_with_builtin_archetype(self, archetype: impl Fn() -> ArchetypeName) -> Self;
 }
 
-/// Constructs a [`ComponentIdentifier`] from this archetype by supplying a field name.
-///
-/// Mainly used as a convenience function to create [`ComponentDescriptor`]s for
-/// Rerun-builtin types. In general, the [`ArchetypeName`] does not place any restrictions
-/// on the contents of [`ComponentIdentifier`].
-#[inline]
-fn with_field(archetype: ArchetypeName, field_name: impl AsRef<str>) -> ComponentIdentifier {
-    format!("{}:{}", archetype.short_name(), field_name.as_ref()).into()
-}
-
 impl ComponentDescriptorExt for ComponentDescriptor {
     fn archetype_field_name(&self) -> &str {
         self.archetype
             .and_then(|archetype| {
                 self.component
-                    .strip_prefix(&format!("{}:", archetype.short_name()))
+                    .strip_prefix(archetype.short_name())?
+                    .strip_prefix(':')
             })
             .unwrap_or_else(|| self.component.as_str())
     }
@@ -505,7 +566,7 @@ impl ComponentDescriptorExt for ComponentDescriptor {
         let archetype = archetype.into();
         {
             let field_name = self.archetype_field_name();
-            self.component = with_field(archetype, field_name);
+            self.component = ComponentIdentifier::from_archetype_field(archetype, field_name);
         }
         self.archetype = Some(archetype);
         self
@@ -515,7 +576,8 @@ impl ComponentDescriptorExt for ComponentDescriptor {
     fn or_with_builtin_archetype(mut self, archetype: impl Fn() -> ArchetypeName) -> Self {
         if self.archetype.is_none() {
             let archetype = archetype();
-            self.component = with_field(archetype, self.component);
+            self.component =
+                ComponentIdentifier::from_archetype_field(archetype, self.component.as_str());
             self.archetype = Some(archetype);
         }
         self
@@ -524,15 +586,15 @@ impl ComponentDescriptorExt for ComponentDescriptor {
 
 #[cfg(test)]
 mod test {
-    use super::{ComponentDescriptor, ComponentDescriptorExt as _, with_field};
-    use crate::ArchetypeName;
+    use super::{ComponentDescriptor, ComponentDescriptorExt as _};
+    use crate::{ArchetypeName, ComponentIdentifier};
 
     #[test]
     fn component_descriptor_manipulation() {
         let archetype_name: ArchetypeName = "rerun.archetypes.MyExample".into();
         let descr = ComponentDescriptor {
             archetype: Some(archetype_name),
-            component: with_field(archetype_name, "test"),
+            component: ComponentIdentifier::from_archetype_field(archetype_name, "test"),
             component_type: Some("user.Whatever".into()),
         };
         assert_eq!(descr.archetype_field_name(), "test");
@@ -542,5 +604,15 @@ mod test {
         let descr = descr.with_builtin_archetype(archetype_name);
         assert_eq!(descr.archetype_field_name(), "test");
         assert_eq!(descr.display_name(), "MyOtherExample:test");
+
+        let non_builtin_component = ComponentDescriptor {
+            archetype: Some(archetype_name),
+            component: "MyOtherExampleExtra:test".into(),
+            component_type: None,
+        };
+        assert_eq!(
+            non_builtin_component.archetype_field_name(),
+            "MyOtherExampleExtra:test"
+        );
     }
 }

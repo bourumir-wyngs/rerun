@@ -3,8 +3,9 @@
 use arrow::array::RecordBatch;
 use pyo3::prelude::*;
 use pyo3::{Bound, PyResult};
-use re_grpc_client::write_table::viewer_client;
+use re_grpc_client::write_table::channel;
 use re_protos::sdk_comms::v1alpha1::message_proxy_service_client::MessageProxyServiceClient;
+use re_protos::sdk_comms::v1alpha1::viewer_control_service_client::ViewerControlServiceClient;
 
 use crate::catalog::to_py_err;
 use crate::utils::wait_for_future;
@@ -64,23 +65,41 @@ impl PyViewerClientInternal {
 
         conn.save_screenshot(py, file_path, view_id_str)
     }
+
+    fn set_time_cursor(
+        self_: Py<Self>,
+        timeline: Option<String>,
+        time: i64,
+        play: bool,
+        py: Python<'_>,
+    ) -> PyResult<()> {
+        let mut conn = self_.borrow(py).conn.clone();
+
+        conn.set_time_cursor(py, timeline, time, play)
+    }
 }
 
-/// Connection handle to the message proxy service.
-///
-/// This handle is modelled after [`crate::catalog::ConnectionHandle`] and only concerned with
-/// table-related operations, most importantly `WriteTable`.
+/// Connection handle for sending data to and controlling a viewer.
 // TODO(grtlr): In the future, we probably want to merge this with the other APIs.
 #[derive(Clone)]
 pub struct ViewerConnectionHandle {
     client: MessageProxyServiceClient<tonic::transport::Channel>,
+    control_client: ViewerControlServiceClient<tonic::transport::Channel>,
 }
 
 impl ViewerConnectionHandle {
     pub fn new(py: Python<'_>, origin: re_uri::Origin) -> PyResult<Self> {
-        let client = wait_for_future(py, viewer_client(origin.clone())).map_err(to_py_err)?;
+        let channel = wait_for_future(py, channel(origin.clone())).map_err(to_py_err)?;
 
-        Ok(Self { client })
+        let client = MessageProxyServiceClient::new(channel.clone())
+            .max_decoding_message_size(re_grpc_client::MAX_DECODING_MESSAGE_SIZE);
+        let control_client = ViewerControlServiceClient::new(channel)
+            .max_decoding_message_size(re_grpc_client::MAX_DECODING_MESSAGE_SIZE);
+
+        Ok(Self {
+            client,
+            control_client,
+        })
     }
 }
 
@@ -112,11 +131,32 @@ impl ViewerConnectionHandle {
     ) -> PyResult<()> {
         wait_for_future(
             py,
-            self.client
-                .save_screenshot(re_protos::sdk_comms::v1alpha1::SaveScreenshotRequest {
-                    view_id,
-                    file_path,
-                }),
+            self.control_client.save_screenshot(
+                re_protos::sdk_comms::v1alpha1::SaveScreenshotRequest { view_id, file_path },
+            ),
+        )
+        .map_err(to_py_err)?;
+
+        Ok(())
+    }
+
+    fn set_time_cursor(
+        &mut self,
+        py: Python<'_>,
+        timeline: Option<String>,
+        time: i64,
+        play: bool,
+    ) -> PyResult<()> {
+        wait_for_future(
+            py,
+            self.control_client.set_time_cursor(
+                re_protos::sdk_comms::v1alpha1::SetTimeCursorRequest {
+                    store_id: None,
+                    timeline: timeline.map(|name| re_protos::common::v1alpha1::Timeline { name }),
+                    time: Some(time.into()),
+                    play,
+                },
+            ),
         )
         .map_err(to_py_err)?;
 

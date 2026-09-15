@@ -1,11 +1,39 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use itertools::Itertools as _;
+use itertools::{Either, Itertools as _};
 
 use re_chunk::{Chunk, ChunkId};
 
 use crate::ChunkStore;
+
+// ---
+
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
+pub(crate) struct TrackedDirectChunkLineage {
+    pub(crate) lineage: ChunkDirectLineage,
+
+    /// How many other [`TrackedDirectChunkLineage`] or physical chunks that
+    /// reference this lineage.
+    pub(crate) ref_count: u32,
+    pub(crate) descends_from_manifest: bool,
+}
+
+impl std::ops::Deref for TrackedDirectChunkLineage {
+    type Target = ChunkDirectLineage;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.lineage
+    }
+}
+
+impl std::ops::DerefMut for TrackedDirectChunkLineage {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lineage
+    }
+}
 
 // ---
 
@@ -18,7 +46,7 @@ use crate::ChunkStore;
 /// This makes it usable in virtual contexts where lineage information alone should never force the
 /// underlying data to remain in local memory, such as the store's virtual indexes.
 /// Use [`ChunkDirectLineage::to_report`] to generate a [`ChunkDirectLineageReport`] instead.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, re_byte_size::SizeBytes)]
 pub enum ChunkDirectLineage {
     /// This chunk resulted from the splitting of that other chunk. It must have siblings, somewhere.
     ///
@@ -35,7 +63,7 @@ pub enum ChunkDirectLineage {
     /// chunk at depth=1.
     ///
     /// Value: `(parent_id, sibling_ids)`.
-    SplitFrom(ChunkId, Vec<ChunkId>),
+    SplitFrom(ChunkId, Box<[ChunkId]>),
 
     /// This chunk resulted from the compaction of these other chunks.
     ///
@@ -50,31 +78,27 @@ pub enum ChunkDirectLineage {
     ///
     /// If a chunk descends from a split, it can never take part in a compaction event again.
     ///
-    /// Value: `(parent, siblings)`.
-    CompactedFrom(BTreeSet<ChunkId>),
+    /// Value: `parents`.
+    CompactedFrom(Box<[ChunkId]>),
 
     /// This chunk's data was originally fetched from an RRD manifest.
     ///
     /// Even if it gets garbage collected, it can be re-fetched as needed (as long as the backing
     /// Redap server is still available).
-    RootFromManifest { is_static: bool },
+    RootFromManifest {
+        is_static: bool,
+
+        /// The segment whose manifest this chunk came from.
+        ///
+        /// This is the store's own segment for ordinary data, or some other segment
+        /// if it came from an asset. See [`ChunkStore::find_source_segments`].
+        segment_id: Arc<re_sdk_types::SegmentId>,
+    },
 
     /// This chunk's data was originally logged from volatile memory.
     ///
     /// Once garbage collected, this data will be unrecoverable.
     Volatile,
-}
-
-impl re_byte_size::SizeBytes for ChunkDirectLineage {
-    fn heap_size_bytes(&self) -> u64 {
-        match self {
-            Self::SplitFrom(chunk_id, chunk_ids) => {
-                chunk_id.heap_size_bytes() + chunk_ids.heap_size_bytes()
-            }
-            Self::CompactedFrom(btree_set) => btree_set.heap_size_bytes(),
-            Self::RootFromManifest { .. } | Self::Volatile => 0,
-        }
-    }
 }
 
 impl std::fmt::Debug for ChunkDirectLineage {
@@ -90,8 +114,11 @@ impl std::fmt::Debug for ChunkDirectLineage {
                 chunk_ids.iter().join(", ")
             )),
 
-            Self::RootFromManifest { is_static } => {
-                write!(f, "origin:(static: {is_static})")
+            Self::RootFromManifest {
+                is_static,
+                segment_id,
+            } => {
+                write!(f, "origin:(static: {is_static}, segment: {segment_id})")
             }
 
             Self::Volatile => f.write_str("origin:<volatile> (cannot be re-fetched)"),
@@ -117,8 +144,12 @@ impl From<&ChunkDirectLineageReport> for ChunkDirectLineage {
                 Self::CompactedFrom(chunks.keys().copied().collect())
             }
 
-            ChunkDirectLineageReport::RootFromManifest { is_static } => Self::RootFromManifest {
+            ChunkDirectLineageReport::RootFromManifest {
+                is_static,
+                segment_id,
+            } => Self::RootFromManifest {
                 is_static: *is_static,
+                segment_id: segment_id.clone(),
             },
 
             ChunkDirectLineageReport::Volatile => Self::Volatile,
@@ -160,14 +191,26 @@ impl ChunkDirectLineage {
                 Some(ChunkDirectLineageReport::CompactedFrom(chunks))
             }
 
-            Self::RootFromManifest { is_static } => {
-                Some(ChunkDirectLineageReport::RootFromManifest {
-                    is_static: *is_static,
-                })
-            }
+            Self::RootFromManifest {
+                is_static,
+                segment_id,
+            } => Some(ChunkDirectLineageReport::RootFromManifest {
+                is_static: *is_static,
+                segment_id: segment_id.clone(),
+            }),
 
             Self::Volatile => Some(ChunkDirectLineageReport::Volatile),
         }
+    }
+
+    pub fn iter_referenced_chunks(&self) -> impl Iterator<Item = &ChunkId> {
+        match self {
+            Self::SplitFrom(chunk_id, _) => Some(Either::Left(std::iter::once(chunk_id))),
+            Self::CompactedFrom(chunks) => Some(Either::Right(chunks.iter())),
+            Self::RootFromManifest { .. } | Self::Volatile => None,
+        }
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -220,7 +263,14 @@ pub enum ChunkDirectLineageReport {
     ///
     /// Even if it gets garbage collected, it can be re-fetched as needed (as long as the backing
     /// Redap server is still available).
-    RootFromManifest { is_static: bool },
+    RootFromManifest {
+        is_static: bool,
+
+        /// The segment whose manifest this chunk came from.
+        ///
+        /// See [`ChunkDirectLineage::RootFromManifest`].
+        segment_id: Arc<re_sdk_types::SegmentId>,
+    },
 
     /// This chunk's data was originally logged from volatile memory.
     ///
@@ -240,8 +290,14 @@ impl std::fmt::Debug for ChunkDirectLineageReport {
                 .debug_map()
                 .entries(map.iter().map(|(k, v)| (k, v.id())))
                 .finish(),
-            Self::RootFromManifest { is_static } => {
-                write!(f, "RootFromManifest(static: {is_static})")
+            Self::RootFromManifest {
+                is_static,
+                segment_id,
+            } => {
+                write!(
+                    f,
+                    "RootFromManifest(static: {is_static}, segment: {segment_id})"
+                )
             }
             Self::Volatile => write!(f, "Volatile"),
         }
@@ -262,8 +318,8 @@ impl ChunkStore {
             // OTOH, if it has been offloaded, now we need to track down its roots and determine
             // whether it is static or not from the lineage info.
             for root_id in store.find_root_manifest_chunks(chunk_id) {
-                if let Some(ChunkDirectLineage::RootFromManifest { is_static }) =
-                    store.chunks_lineage.get(&root_id)
+                if let Some(ChunkDirectLineage::RootFromManifest { is_static, .. }) =
+                    store.chunks_lineage.get(&root_id).map(|l| &l.lineage)
                 {
                     return if *is_static { "yes" } else { "no" };
                 }
@@ -277,7 +333,7 @@ impl ChunkStore {
         fn recurse(store: &ChunkStore, chunk_id: &ChunkId, depth: usize) -> String {
             let chunk = store.physical_chunks_per_chunk_id.get(chunk_id);
 
-            let lineage = store.chunks_lineage.get(chunk_id);
+            let lineage = store.chunks_lineage.get(chunk_id).map(|l| &l.lineage);
             let status = if chunk.is_some() {
                 "loaded"
             } else {
@@ -287,7 +343,7 @@ impl ChunkStore {
             let width = (depth + 1) * 4;
 
             let sibling_ids = match lineage {
-                Some(ChunkDirectLineage::SplitFrom(_, sibling_ids)) => sibling_ids.as_slice(),
+                Some(ChunkDirectLineage::SplitFrom(_, sibling_ids)) => &**sibling_ids,
                 _ => &[],
             };
 
@@ -342,7 +398,7 @@ impl ChunkStore {
             return true;
         };
         matches!(
-            lineage,
+            lineage.lineage,
             ChunkDirectLineage::RootFromManifest { .. } | ChunkDirectLineage::Volatile
         )
     }
@@ -362,7 +418,7 @@ impl ChunkStore {
 
     /// See [`Self::find_root_chunks`].
     pub fn collect_root_ids(&self, chunk_id: &ChunkId, roots: &mut Vec<ChunkId>) {
-        let lineage = self.chunks_lineage.get(chunk_id);
+        let lineage = self.chunks_lineage.get(chunk_id).map(|l| &l.lineage);
         match lineage {
             Some(ChunkDirectLineage::SplitFrom(chunk_id, _sibling_ids)) => {
                 self.collect_root_ids(chunk_id, roots);
@@ -399,7 +455,7 @@ impl ChunkStore {
 
     /// See [`Self::find_root_manifest_chunks`].
     fn collect_root_manifest_chunks(&self, chunk_id: &ChunkId, roots: &mut Vec<ChunkId>) {
-        let lineage = self.chunks_lineage.get(chunk_id);
+        let lineage = self.chunks_lineage.get(chunk_id).map(|l| &l.lineage);
         match lineage {
             Some(ChunkDirectLineage::SplitFrom(chunk_id, _sibling_ids)) => {
                 self.collect_root_manifest_chunks(chunk_id, roots);
@@ -417,6 +473,21 @@ impl ChunkStore {
 
             _ => {}
         }
+    }
+
+    /// Returns the segments that the given chunk's data is from, if any.
+    ///
+    /// An empty result means the data doesn't come from a manifest.
+    pub fn find_source_segments(&self, chunk_id: &ChunkId) -> BTreeSet<re_sdk_types::SegmentId> {
+        self.find_root_manifest_chunks(chunk_id)
+            .into_iter()
+            .filter_map(|root_id| match self.direct_lineage(&root_id) {
+                Some(ChunkDirectLineage::RootFromManifest { segment_id, .. }) => {
+                    Some((**segment_id).clone())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Collects all physical chunks that descend from the given chunk in some way.
@@ -454,12 +525,19 @@ impl ChunkStore {
         }
     }
 
+    /// Returns true if either the specified chunk or one of its ancestors is from a manifest.
+    pub fn descends_from_manifest(&self, chunk: &ChunkId) -> bool {
+        self.chunks_lineage
+            .get(chunk)
+            .is_some_and(|l| l.descends_from_manifest)
+    }
+
     /// Returns true if either the specified chunk or one of its ancestors resulted from a split.
     pub fn descends_from_a_split(&self, chunk_id: &ChunkId) -> bool {
         if cfg!(debug_assertions) {
             // Do a bit more expensive recursion as a form of sanity checking:
             fn recurse(store: &ChunkStore, chunk_id: &ChunkId, compaction_found: bool) -> bool {
-                let lineage = store.chunks_lineage.get(chunk_id);
+                let lineage = store.chunks_lineage.get(chunk_id).map(|l| &l.lineage);
                 match lineage {
                     Some(ChunkDirectLineage::SplitFrom(_chunk_id, _sibling_ids)) => {
                         re_log::debug_assert!(
@@ -488,7 +566,7 @@ impl ChunkStore {
             // We never mix splits and compactions in the same lineage tree,
             // so no need to recurse:
             matches!(
-                self.chunks_lineage.get(chunk_id),
+                self.chunks_lineage.get(chunk_id).map(|l| &l.lineage),
                 Some(ChunkDirectLineage::SplitFrom { .. })
             )
         }
@@ -497,7 +575,7 @@ impl ChunkStore {
     /// Returns true if either the specified chunk or one of its ancestors resulted from a compaction.
     pub fn descends_from_a_compaction(&self, chunk_id: &ChunkId) -> bool {
         fn recurse(store: &ChunkStore, chunk_id: &ChunkId, split_found: bool) -> bool {
-            let lineage = store.chunks_lineage.get(chunk_id);
+            let lineage = store.chunks_lineage.get(chunk_id).map(|l| &l.lineage);
             match lineage {
                 Some(ChunkDirectLineage::SplitFrom(chunk_id, _sibling_ids)) => {
                     recurse(store, chunk_id, true)
@@ -523,7 +601,7 @@ impl ChunkStore {
 
     /// Returns the direct lineage of a chunk.
     pub fn direct_lineage(&self, chunk_id: &ChunkId) -> Option<&ChunkDirectLineage> {
-        self.chunks_lineage.get(chunk_id)
+        self.chunks_lineage.get(chunk_id).map(|l| &l.lineage)
     }
 }
 
@@ -535,6 +613,7 @@ mod tests {
     use re_log_types::StoreId;
     use re_log_types::example_components::{MyPoint, MyPoints};
     use re_log_types::external::re_tuid::Tuid;
+    use std::assert_matches;
 
     use crate::ChunkStoreConfig;
 
@@ -878,7 +957,8 @@ mod tests {
         {
             let chunk_ids = store
                 .physical_chunk_ids_per_min_row_id
-                .values()
+                .iter()
+                .map(|(_, id)| id)
                 .collect_vec();
 
             assert_eq!(true, store.descends_from_a_split(chunk_ids[0]));
@@ -909,7 +989,8 @@ mod tests {
         {
             let chunk_ids = store
                 .physical_chunk_ids_per_min_row_id
-                .values()
+                .iter()
+                .map(|(_, id)| id)
                 .collect_vec();
 
             assert_eq!(true, store.descends_from_a_split(chunk_ids[0]));
@@ -1056,8 +1137,14 @@ mod tests {
 
             let lineage: ChunkDirectLineage = event.direct_lineage.clone().into();
             if let Some(prev_chunk) = prev_chunk.take() {
+                // `CompactedFrom` keeps its parents sorted by `ChunkId` (it is built from the
+                // report's `BTreeMap`), so canonicalize the expected ids the same way.
                 let expected = ChunkDirectLineage::CompactedFrom(
-                    [chunk.id(), prev_chunk.id()].into_iter().collect(),
+                    [chunk.id(), prev_chunk.id()]
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
                 );
                 assert_eq!(expected, lineage);
                 assert_eq!(
@@ -1131,6 +1218,334 @@ mod tests {
         );
     }
 
+    // --- ref-counting ---
+
+    #[test]
+    fn ref_count_single_volatile_chunk() {
+        let mut store = temporal_store(10);
+        let mut make_chunk = chunk_factory();
+
+        let chunk = make_chunk(1);
+        store.insert_chunk(&chunk).unwrap();
+
+        {
+            let lineage = store
+                .chunks_lineage
+                .get(&chunk.id())
+                .expect("a physical chunk must always be tracked");
+            assert_eq!(lineage.ref_count, 1, "a single physical reference");
+            assert_eq!(lineage.descends_from_manifest, false);
+            assert_matches!(lineage.lineage, ChunkDirectLineage::Volatile);
+        }
+        assert_eq!(true, store.is_root_chunk(&chunk.id()));
+        assert_store_invariants(&store);
+
+        // A volatile root has no manifest to fall back on, so once nothing references it anymore
+        // its lineage is dropped rather than kept around forever.
+        store.gc(&crate::GarbageCollectionOptions::gc_everything());
+        assert_eq!(0, store.num_physical_chunks());
+        assert!(
+            !store.chunks_lineage.contains_key(&chunk.id()),
+            "an unreferenced volatile lineage must not linger after GC",
+        );
+    }
+
+    #[test]
+    fn ref_count_compaction_protects_sources() {
+        let mut store = temporal_store(10);
+        let mut make_chunk = chunk_factory();
+
+        let chunk_a = make_chunk(1);
+        let chunk_b = make_chunk(1);
+
+        store.insert_chunk(&chunk_a).unwrap();
+        // The two tiny chunks fold into a single compacted chunk.
+        let events = store.insert_chunk(&chunk_b).unwrap();
+
+        let compacted = events
+            .iter()
+            .find_map(|event| event.to_addition())
+            .expect("the compaction must emit an addition")
+            .chunk_after_processing
+            .clone();
+        let compacted_id = compacted.id();
+
+        assert_eq!(1, store.num_physical_chunks());
+        assert_eq!(
+            vec![compacted_id],
+            store
+                .physical_chunks_per_chunk_id
+                .keys()
+                .copied()
+                .collect_vec(),
+        );
+
+        // The compacted chunk holds the only physical reference and points at both sources.
+        {
+            let lineage = &store.chunks_lineage[&compacted_id];
+            assert_eq!(lineage.ref_count, 1, "a single physical reference");
+            let referenced: ahash::HashSet<ChunkId> =
+                lineage.iter_referenced_chunks().copied().collect();
+            assert_eq!(
+                referenced,
+                [chunk_a.id(), chunk_b.id()].into_iter().collect(),
+            );
+            assert_eq!(true, store.descends_from_a_compaction(&compacted_id));
+            assert_eq!(false, store.is_root_chunk(&compacted_id));
+        }
+
+        // Both sources are physically gone, but their lineage is kept alive by the compacted chunk
+        // that now carries their data.
+        for src in [&chunk_a, &chunk_b] {
+            assert_eq!(
+                false,
+                store.physical_chunks_per_chunk_id.contains_key(&src.id()),
+            );
+            let lineage = &store.chunks_lineage[&src.id()];
+            assert_eq!(lineage.ref_count, 1, "kept alive by the compacted chunk");
+            assert_eq!(true, store.is_root_chunk(&src.id()));
+        }
+
+        // Both sources resolve to the compacted result, so re-inserting the same data is a no-op.
+        assert_eq!(
+            Some(&compacted_id),
+            store.leaky_compactions.get(&chunk_a.id()),
+        );
+        assert_eq!(
+            Some(&compacted_id),
+            store.leaky_compactions.get(&chunk_b.id()),
+        );
+
+        assert_store_invariants(&store);
+    }
+
+    #[test]
+    fn compacted_lineage_fully_reclaimed_on_gc() {
+        let mut store = temporal_store(10);
+        let mut make_chunk = chunk_factory();
+
+        // A handful of tiny chunks fold into one compacted chunk, leaving a whole lineage tree
+        // behind it.
+        for _ in 0..4 {
+            store.insert_chunk(&make_chunk(1)).unwrap();
+        }
+        assert_eq!(1, store.num_physical_chunks());
+        assert!(
+            store.chunks_lineage.len() > 1,
+            "the compacted sources should still be tracked",
+        );
+        assert!(!store.leaky_compactions.is_empty());
+        assert_store_invariants(&store);
+
+        // Dropping the one physical chunk must cascade through the whole tree and reclaim it all,
+        // otherwise the bookkeeping maps grow without bound over a long session.
+        store.gc(&crate::GarbageCollectionOptions::gc_everything());
+        assert_eq!(0, store.num_physical_chunks());
+        assert!(
+            store.chunks_lineage.is_empty(),
+            "compacted lineage tree leaked: {:?}",
+            store.chunks_lineage,
+        );
+        assert!(
+            store.leaky_compactions.is_empty(),
+            "leaky-compaction tracker leaked: {:?}",
+            store.leaky_compactions,
+        );
+        assert_store_invariants(&store);
+    }
+
+    #[test]
+    fn split_parent_ref_count_and_reclamation() {
+        let mut store = temporal_store(1); // force every row into its own chunk
+        let mut make_chunk = chunk_factory();
+
+        let parent = make_chunk(4);
+        store.insert_chunk(&parent).unwrap();
+
+        // We end up with four split children, and the parent itself is never physically stored.
+        assert_eq!(4, store.num_physical_chunks());
+        assert_eq!(
+            false,
+            store
+                .physical_chunks_per_chunk_id
+                .contains_key(&parent.id()),
+        );
+
+        // The parent's lineage is kept alive by one reference per child.
+        {
+            let lineage = store
+                .chunks_lineage
+                .get(&parent.id())
+                .expect("the split parent must stay tracked while its children live");
+            assert_eq!(lineage.ref_count, 4);
+        }
+        assert_eq!(true, store.split_on_ingest.contains(&parent.id()));
+        assert_eq!(
+            Some(4),
+            store.dangling_splits.get(&parent.id()).map(|s| s.len()),
+        );
+
+        for child in store.iter_physical_chunks() {
+            let lineage = &store.chunks_lineage[&child.id()];
+            assert_eq!(
+                lineage.ref_count, 1,
+                "each child holds one physical reference"
+            );
+            assert_eq!(true, store.descends_from_a_split(&child.id()));
+        }
+        assert_store_invariants(&store);
+
+        // Reclaiming the children must take the parent's bookkeeping down with them.
+        store.gc(&crate::GarbageCollectionOptions::gc_everything());
+        assert_eq!(0, store.num_physical_chunks());
+        assert!(
+            !store.chunks_lineage.contains_key(&parent.id()),
+            "split parent lineage leaked",
+        );
+        assert_eq!(false, store.split_on_ingest.contains(&parent.id()));
+        assert_eq!(false, store.dangling_splits.contains_key(&parent.id()));
+        assert_store_invariants(&store);
+    }
+
+    #[test]
+    fn manifest_lineage_survives_gc() {
+        let store_id = StoreId::recording("app_id", "rec_id");
+        let mut make_chunk = chunk_factory();
+        let chunk = make_chunk(1);
+
+        let rrd_manifest =
+            RrdManifest::build_in_memory_from_chunks(store_id.clone(), std::iter::once(&*chunk))
+                .unwrap();
+        let mut store = ChunkStore::new(store_id, temporal_config(10));
+
+        // Load it virtually: the chunk is tracked and flagged as descending from a manifest, but
+        // it isn't physically present yet.
+        let _ignored_events = store.insert_rrd_manifest(rrd_manifest);
+        {
+            let lineage = store
+                .chunks_lineage
+                .get(&chunk.id())
+                .expect("a manifest chunk must be tracked");
+            assert_eq!(lineage.ref_count, 0, "no physical reference yet");
+            assert_eq!(lineage.descends_from_manifest, true);
+            assert_matches!(lineage.lineage, ChunkDirectLineage::RootFromManifest { .. });
+        }
+        assert_eq!(
+            false,
+            store.physical_chunks_per_chunk_id.contains_key(&chunk.id()),
+        );
+        assert_eq!(true, store.descends_from_manifest(&chunk.id()));
+
+        // Load it physically. The manifest lineage must not get clobbered.
+        store.insert_chunk(&chunk).unwrap();
+        {
+            let lineage = &store.chunks_lineage[&chunk.id()];
+            assert_eq!(lineage.ref_count, 1, "now physically referenced");
+            assert_eq!(lineage.descends_from_manifest, true);
+            assert!(
+                matches!(lineage.lineage, ChunkDirectLineage::RootFromManifest { .. }),
+                "physical insertion must keep the manifest lineage",
+            );
+        }
+        assert_store_invariants(&store);
+
+        // GC the physical data away. Because the chunk descends from a manifest, its lineage must
+        // stick around so the data stays re-fetchable, unlike a volatile chunk.
+        store.gc(&crate::GarbageCollectionOptions::gc_everything());
+        assert_eq!(0, store.num_physical_chunks());
+        let lineage = store
+            .chunks_lineage
+            .get(&chunk.id())
+            .expect("a manifest lineage must survive GC");
+        assert_eq!(lineage.descends_from_manifest, true);
+        assert_eq!(lineage.ref_count, 0);
+    }
+
+    #[test]
+    fn physical_chunks_keep_live_lineage_through_mixed_workload() {
+        let mut store = temporal_store(4);
+        let mut make_chunk = chunk_factory();
+
+        assert_store_invariants(&store);
+
+        for round in 0..6 {
+            // A few tiny chunks that the compactor will happily merge together.
+            for _ in 0..5 {
+                store.insert_chunk(&make_chunk(1)).unwrap();
+                assert_store_invariants(&store);
+            }
+
+            // A fat chunk that gets split into several smaller ones.
+            store.insert_chunk(&make_chunk(8)).unwrap();
+            assert_store_invariants(&store);
+
+            // Drop part of the store, alternating between shallow-friendly and deep deletions.
+            store.gc(&crate::GarbageCollectionOptions {
+                target: crate::GarbageCollectionTarget::DropAtLeastFraction(0.5),
+                time_budget: std::time::Duration::MAX,
+                protect_latest: 0,
+                protected_time_ranges: Default::default(),
+                protected_chunks: Default::default(),
+                furthest_from: None,
+                perform_deep_deletions: round % 2 == 0,
+            });
+            assert_store_invariants(&store);
+        }
+
+        // Finally drop everything and make sure the bookkeeping maps don't keep growing: every
+        // non-manifest lineage and leaky-compaction entry must be reclaimed.
+        store.gc(&crate::GarbageCollectionOptions::gc_everything());
+        assert_store_invariants(&store);
+        assert_eq!(0, store.num_physical_chunks());
+        assert!(
+            store.chunks_lineage.is_empty(),
+            "no volatile lineage should linger once the store is empty, got {} entries",
+            store.chunks_lineage.len(),
+        );
+        assert!(
+            store.leaky_compactions.is_empty(),
+            "the leaky-compaction tracker should be empty once the store is empty, got {} entries",
+            store.leaky_compactions.len(),
+        );
+        assert!(
+            store.dangling_splits.is_empty(),
+            "no dangling-split bookkeeping should linger, got {} entries",
+            store.dangling_splits.len(),
+        );
+        assert!(
+            store.split_on_ingest.is_empty(),
+            "no split-on-ingest bookkeeping should linger, got {} entries",
+            store.split_on_ingest.len(),
+        );
+    }
+
+    // Test that `ChunkIdSetPerTimePerComponentPerTimelinePerEntity` and `ChunkIdSetPerTimePerTimelinePerEntity`
+    // are correctly tracked even under tight time budget.
+    #[test]
+    fn deep_removal_under_tight_budget_keeps_indices_consistent() {
+        let mut store = temporal_store(1); // force every row into its own non-root split chunk
+        let mut make_chunk = chunk_factory();
+
+        store.insert_chunk(&make_chunk(8)).unwrap();
+        let chunks = store.iter_physical_chunks().cloned().collect_vec();
+        assert!(
+            chunks.len() >= 2,
+            "we need several chunks to exercise an early bail",
+        );
+        assert_store_invariants(&store);
+
+        // A near-zero budget makes the shallow pass bail after the first chunk, while the deep pass
+        // clears every virtual entry regardless of the budget. The two indices must not drift
+        // apart, otherwise a later GC pass trips the deep-superset-of-shallow assertion.
+        store.remove_chunks_deep(
+            chunks,
+            Some(std::time::Duration::ZERO),
+            crate::ChunkDeletionReason::GarbageCollection,
+        );
+
+        assert_store_invariants(&store);
+    }
+
     // ---
 
     fn next_chunk_id_generator(prefix: u64) -> impl FnMut() -> re_chunk::ChunkId {
@@ -1162,5 +1577,82 @@ mod tests {
         }
 
         lineage_report
+    }
+
+    fn temporal_config(chunk_max_rows: u64) -> ChunkStoreConfig {
+        ChunkStoreConfig {
+            enable_changelog: false, // irrelevant
+            chunk_max_bytes: u64::MAX,
+            chunk_max_rows,
+            chunk_max_rows_if_unsorted: chunk_max_rows,
+        }
+    }
+
+    fn temporal_store(chunk_max_rows: u64) -> ChunkStore {
+        ChunkStore::new(
+            StoreId::recording("app_id", "rec_id"),
+            temporal_config(chunk_max_rows),
+        )
+    }
+
+    /// Builds chunks with deterministic ids, all on the same entity and timeline.
+    fn chunk_factory() -> impl FnMut(usize) -> Arc<Chunk> {
+        let mut next_chunk_id = next_chunk_id_generator(1);
+        let entity_path = EntityPath::from("this/that");
+        let timepoint = [(Timeline::new_sequence("frame"), 1)];
+        let points = [MyPoint::new(1.0, 1.0)];
+
+        move |num_rows: usize| {
+            let mut builder = Chunk::builder_with_id(next_chunk_id(), entity_path.clone());
+            for _ in 0..num_rows {
+                builder = builder.with_component_batches(
+                    RowId::new(),
+                    timepoint,
+                    [(MyPoints::descriptor_points(), &points as _)],
+                );
+            }
+            Arc::new(builder.build().unwrap())
+        }
+    }
+
+    /// All temporal chunk ids that currently live in the virtual indices.
+    fn virtual_chunk_ids(store: &ChunkStore) -> ahash::HashSet<ChunkId> {
+        let mut ids = ahash::HashSet::default();
+        for per_timeline in store.temporal_chunk_ids_per_entity.values() {
+            for set_per_time in per_timeline.values() {
+                ids.extend(set_per_time.per_start_time.values().flatten().copied());
+                ids.extend(set_per_time.per_end_time.values().flatten().copied());
+            }
+        }
+        ids
+    }
+
+    /// Checks the two invariants that the ref-counted lineage tracking must uphold.
+    ///
+    /// Every physical chunk must keep a lineage entry with a non-zero ref count, otherwise
+    /// `is_root_chunk` silently treats it as a root and reroutes its GC deletion.
+    /// Every physical temporal chunk must also live in the virtual indices, which is exactly the
+    /// `deep ⊇ shallow` invariant that `remove_chunks_deep` asserts on.
+    fn assert_store_invariants(store: &ChunkStore) {
+        let virtual_ids = virtual_chunk_ids(store);
+
+        for chunk in store.physical_chunks_per_chunk_id.values() {
+            let chunk_id = chunk.id();
+
+            let lineage = store.chunks_lineage.get(&chunk_id);
+            assert!(
+                lineage.is_some_and(|l| l.ref_count >= 1),
+                "physical chunk {chunk_id} lost its live lineage entry, so is_root_chunk would \
+                 wrongly treat it as a root. lineage: {lineage:?}",
+            );
+
+            if !chunk.is_static() {
+                assert!(
+                    virtual_ids.contains(&chunk_id),
+                    "physical chunk {chunk_id} is missing from the virtual indices, which breaks \
+                     the deep-superset-of-shallow GC invariant",
+                );
+            }
+        }
     }
 }

@@ -1,3 +1,7 @@
+//! Test-only helpers, behind the `test` feature.
+
+#![expect(clippy::unwrap_used)] // test-only code
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -140,15 +144,15 @@ impl RecordBatchTestExt for arrow::array::RecordBatch {
     }
 
     fn sort_rows_by(&self, columns: &[&str]) -> Result<Self, DataFusionError> {
-        let sort_exprs = columns
+        let sort_exprs: Vec<_> = columns
             .iter()
-            .map(|column| {
+            .map(|column| -> Result<_, DataFusionError> {
                 Ok(PhysicalSortExpr::new(
                     col(column, self.schema_ref())?,
                     SortOptions::default(),
                 ))
             })
-            .collect::<Result<Vec<_>, DataFusionError>>()?;
+            .try_collect()?;
 
         let Some(ordering) = LexOrdering::new(sort_exprs) else {
             return Ok(self.clone());
@@ -158,17 +162,17 @@ impl RecordBatchTestExt for arrow::array::RecordBatch {
     }
 
     fn auto_sort_rows(&self) -> Result<Self, DataFusionError> {
-        let sort_exprs = self
+        let sort_exprs: Vec<_> = self
             .schema()
             .fields()
             .iter()
-            .map(|column| {
+            .map(|column| -> Result<_, DataFusionError> {
                 Ok(PhysicalSortExpr::new(
                     col(column.name(), self.schema_ref())?,
                     SortOptions::default(),
                 ))
             })
-            .collect::<Result<Vec<_>, DataFusionError>>()?;
+            .try_collect()?;
 
         let Some(ordering) = LexOrdering::new(sort_exprs) else {
             return Ok(self.clone());
@@ -208,13 +212,11 @@ impl RecordBatchTestExt for arrow::array::RecordBatch {
 
         let mut arrays: Vec<ArrayRef> = Vec::new();
         for column in schema.fields() {
-            let array = self.column_by_name(column.name()).expect("no such column");
+            let array = self.try_get_column(column.name()).unwrap();
 
             if column.name() == column_name {
                 // Only transform the specified column
-                let string_array = array
-                    .try_downcast_array_ref::<StringArray>()
-                    .expect("expected column to be StringArray");
+                let string_array = array.try_downcast_array_ref::<StringArray>().unwrap();
 
                 let new_values = string_array
                     .iter()
@@ -241,7 +243,7 @@ impl RecordBatchTestExt for arrow::array::RecordBatch {
 
         let schema = self.schema();
         for column in schema.fields() {
-            let array = self.column_by_name(column.name()).expect("no such column");
+            let array = self.try_get_column(column.name()).unwrap();
 
             if !columns.contains(&column.name().as_str()) {
                 arrays.push(array.clone());
@@ -275,7 +277,7 @@ impl RecordBatchTestExt for arrow::array::RecordBatch {
                 arrow::datatypes::DataType::List(field) => {
                     let list_array = array
                         .try_downcast_array_ref::<arrow::array::ListArray>()
-                        .expect("expected column to be ListArray");
+                        .unwrap();
 
                     let (redacted_values, inner_field) = match field.data_type() {
                         arrow::datatypes::DataType::Utf8 => {
@@ -324,6 +326,24 @@ impl RecordBatchTestExt for arrow::array::RecordBatch {
                 arrow::datatypes::DataType::Binary => {
                     arrays.push(redact_array!(array, arrow::array::BinaryArray, |opt| opt
                         .map(|_| [0u8; 8].as_slice())));
+                }
+                arrow::datatypes::DataType::FixedSizeBinary(size) => {
+                    let typed_array = array
+                        .try_downcast_array_ref::<arrow::array::FixedSizeBinaryArray>()
+                        .unwrap();
+                    let zeroes = vec![0u8; *size as usize];
+                    let redacted_values = typed_array
+                        .iter()
+                        .map(|opt| opt.map(|_| zeroes.as_slice()))
+                        .collect_vec();
+
+                    arrays.push(Arc::new(
+                        arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                            redacted_values.into_iter(),
+                            *size,
+                        )
+                        .expect("all redacted values share the column's fixed size"),
+                    ) as ArrayRef);
                 }
                 // TODO(zehiko) add support for other types as needed
                 _ => {
@@ -409,7 +429,7 @@ impl SchemaTestExt for arrow::datatypes::Schema {
             }
         });
 
-        metadata.into_iter().chain(fields).join("\n")
+        std::iter::chain(metadata, fields).join("\n")
     }
 }
 

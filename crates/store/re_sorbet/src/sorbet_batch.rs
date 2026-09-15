@@ -54,6 +54,34 @@ impl SorbetBatch {
             batch: self.batch.slice(0, 0),
         }
     }
+
+    /// Replace the data of one column by index, keeping the same schema.
+    ///
+    /// Returns `None` if the column index is out of bounds or if the new
+    /// `RecordBatch` cannot be constructed.
+    #[must_use]
+    pub fn with_replaced_column(&self, col_idx: usize, new_array: ArrowArrayRef) -> Option<Self> {
+        if col_idx >= self.batch.num_columns() {
+            return None;
+        }
+        re_log::debug_assert_eq!(
+            self.batch.column(col_idx).data_type(),
+            new_array.data_type(),
+            "with_replaced_column: data type mismatch for column {col_idx}"
+        );
+        let mut columns: Vec<ArrowArrayRef> = self.batch.columns().to_vec();
+        columns[col_idx] = new_array;
+        let batch = ArrowRecordBatch::try_new_with_options(
+            self.batch.schema(),
+            columns,
+            &RecordBatchOptions::default(),
+        )
+        .ok()?;
+        Some(Self {
+            schema: self.schema.clone(),
+            batch,
+        })
+    }
 }
 
 impl SorbetBatch {
@@ -90,7 +118,7 @@ impl SorbetBatch {
 
     /// The columns of the indices (timelines).
     pub fn index_columns(&self) -> impl Iterator<Item = (&IndexColumnDescriptor, &ArrowArrayRef)> {
-        itertools::izip!(self.schema.columns.iter(), self.batch.columns().iter()).filter_map(
+        itertools::izip!(self.schema.columns.iter(), self.batch.columns()).filter_map(
             |(descr, array)| {
                 if let ColumnDescriptor::Time(descr) = descr {
                     Some((descr, array))
@@ -105,7 +133,7 @@ impl SorbetBatch {
     pub fn component_columns(
         &self,
     ) -> impl Iterator<Item = (&ComponentColumnDescriptor, &ArrowArrayRef)> {
-        itertools::izip!(self.schema.columns.iter(), self.batch.columns().iter()).filter_map(
+        itertools::izip!(self.schema.columns.iter(), self.batch.columns()).filter_map(
             |(descr, array)| {
                 if let ColumnDescriptor::Component(descr) = descr {
                     Some((descr, array))
@@ -161,7 +189,6 @@ impl SorbetBatch {
     ///
     /// Non-Rerun metadata will be preserved (both at batch-level and column-level).
     /// Rerun metadata will be updated and added to the batch if needed.
-    #[tracing::instrument(level = "trace", skip_all)]
     pub fn try_from_record_batch(
         batch: &ArrowRecordBatch,
         batch_type: crate::BatchType,

@@ -9,8 +9,8 @@ The main purpose of this component existing separately from the labels themselve
 is to be overridden when desired, to allow hiding and showing from the viewer and
 blueprints.
 
-## Rerun datatype
-[`Bool`](../datatypes/bool.md)
+## Rerun encoding
+[`Bool`](../encodings/bool.md)
 
 
 ## Arrow datatype
@@ -32,6 +32,7 @@ Boolean
 * [`Boxes3D`](../archetypes/boxes3d.md)
 * [`Capsules3D`](../archetypes/capsules3d.md)
 * [`Cylinders3D`](../archetypes/cylinders3d.md)
+* [`Ellipses2D`](../archetypes/ellipses2d.md)
 * [`Ellipsoids3D`](../archetypes/ellipsoids3d.md)
 * [`GraphNodes`](../archetypes/graph_nodes.md)
 * [`LineStrips2D`](../archetypes/line_strips2d.md)

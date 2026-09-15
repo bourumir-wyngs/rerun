@@ -2,18 +2,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
 use camino::Utf8PathBuf;
-use itertools::Itertools as _;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use super::util::{append_tokens, doc_as_lines};
 use crate::codegen::{Target, autogen_warning};
-use crate::{
-    ATTR_RERUN_COMPONENT_NO_UI_EDIT, ATTR_RERUN_COMPONENT_REQUIRED, ATTR_RUST_DERIVE,
-    ATTR_RUST_DERIVE_ONLY, ObjectKind, Objects, Reporter,
-};
+use crate::{DocsAttr, ObjectKind, Objects, Reporter, RerunAttr, RustAttr};
 
-/// Generate reflection about components and archetypes.
+/// Generate reflection about components, archetypes, and views.
 pub fn generate_reflection(
     reporter: &Reporter,
     objects: &Objects,
@@ -33,6 +29,7 @@ pub fn generate_reflection(
         &mut imports,
     );
     let archetype_reflection = generate_archetype_reflection(reporter, objects);
+    let view_reflection = generate_view_reflection(objects);
 
     let mut code = format!("// {}\n\n", autogen_warning!());
     code.push_str("#![allow(clippy::allow_attributes)]\n");
@@ -49,8 +46,10 @@ pub fn generate_reflection(
         use re_types_core::{
             ArchetypeName,
             ComponentType,
+            ViewClassIdentifier,
             Component,
-            Loggable as _,
+            ArrowDataType as _,
+            FromArrow as _,
             ComponentBatch as _,
             reflection::{
                 generate_component_identifier_reflection,
@@ -60,29 +59,65 @@ pub fn generate_reflection(
                 ArchetypeReflectionMap,
                 ComponentReflection,
                 ComponentReflectionMap,
+                ComponentTypeSet,
                 Reflection,
+                ViewApplicability,
+                ViewReflection,
+                ViewReflectionMap,
             },
             SerializationError,
         };
 
+        #[doc = "Reflection about all known components, archetypes, and views."]
+        #[doc = ""]
+        #[doc = "Built on first use and shared from then on."]
+        #[doc = "Clone it if you need to extend it, as the viewer does for custom archetypes."]
+        pub fn reflection() -> &'static Reflection {
+            static REFLECTION: std::sync::OnceLock<Reflection> = std::sync::OnceLock::new();
+            REFLECTION.get_or_init(generate_reflection)
+        }
+
         #[doc = "Generates reflection about all known components."]
         #[doc = ""]
-        #[doc = "Call only once and reuse the results."]
-        pub fn generate_reflection() -> Result<Reflection, SerializationError> {
+        #[doc = "Private: go through [`reflection`], which builds this once and shares it."]
+        #[doc = ""]
+        #[doc = "# Panics"]
+        #[doc = "If a component's placeholder cannot be serialized, which is a bug in Rerun."]
+        fn generate_reflection() -> Reflection {
             re_tracing::profile_function!();
 
             let archetypes = generate_archetype_reflection();
 
-            Ok(Reflection {
-                components: generate_component_reflection()?,
+            Reflection {
+                components: generate_component_reflection()
+                    .expect("Failed to serialize the component placeholders — this is a bug in Rerun"),
                 component_identifiers: generate_component_identifier_reflection(&archetypes),
-                archetypes
+                archetypes,
+                views: generate_view_reflection(),
+            }
+        }
+
+        #[doc = "The component types marked `#[rerun(own_chunk)]`."]
+        #[doc = ""]
+        #[doc = "Each of these always gets a chunk of its own, never sharing one with any other"]
+        #[doc = "component, not even one of its own archetype."]
+        pub fn own_chunk_components() -> &'static ComponentTypeSet {
+            static COMPONENTS: std::sync::OnceLock<ComponentTypeSet> = std::sync::OnceLock::new();
+            COMPONENTS.get_or_init(|| {
+                reflection()
+                    .components
+                    .iter()
+                    .filter(|(_, reflection)| reflection.own_chunk)
+                    .map(|(component_type, _)| *component_type)
+                    .collect()
             })
         }
 
         #component_reflection
 
         #archetype_reflection
+
+        #view_reflection
     };
 
     let code = append_tokens(reporter, code, &quoted_reflection, &path);
@@ -117,7 +152,7 @@ fn generate_component_reflection(
         } else {
             // Works too
             let fqname = &obj.fqname;
-            quote!( ComponentType::new(#fqname) )
+            quote!( ComponentType::from(#fqname) )
         };
 
         let docstring_md = doc_as_lines(
@@ -138,16 +173,16 @@ fn generate_component_reflection(
                 .iter()
                 .any(|field| field.attrs.has(crate::ATTR_DEFAULT));
         let has_default_attr = obj
-            .try_get_attr::<String>(ATTR_RUST_DERIVE_ONLY)
-            .or_else(|| obj.try_get_attr::<String>(ATTR_RUST_DERIVE))
+            .try_get_attr::<String>(RustAttr::DeriveOnly)
+            .or_else(|| obj.try_get_attr::<String>(RustAttr::Derive))
             .is_some_and(|derives| derives.contains("Default"));
         let auto_derive_default = is_enum_with_default || has_default_attr;
         let has_custom_default_impl =
             extension_contents_for_fqname
                 .get(&obj.fqname)
                 .is_some_and(|contents| {
-                    contents.contains(&format!("impl Default for {}", &obj.name))
-                        || contents.contains(&format!("impl Default for super::{}", &obj.name))
+                    contents.contains(&format!("impl Default for {}", obj.name))
+                        || contents.contains(&format!("impl Default for super::{}", obj.name))
                 });
         let custom_placeholder = if auto_derive_default || has_custom_default_impl {
             quote! { Some(#type_name::default().to_arrow()?) }
@@ -162,13 +197,15 @@ fn generate_component_reflection(
         };
 
         let is_enum = obj.is_enum();
+        let own_chunk = obj.attrs.has(RerunAttr::OwnChunk);
         let quoted_reflection = quote! {
             ComponentReflection {
                 docstring_md: #docstring_md,
                 deprecation_summary: #deprecation_summary,
                 custom_placeholder: #custom_placeholder,
-                datatype: #type_name::arrow_datatype(),
+                datatype: #type_name::arrow_data_type(),
                 is_enum: #is_enum,
+                own_chunk: #own_chunk,
                 verify_arrow_array: #type_name::verify_arrow_array,
             }
         };
@@ -181,10 +218,10 @@ fn generate_component_reflection(
         #[doc = "Call only once and reuse the results."]
         fn generate_component_reflection() -> Result<ComponentReflectionMap, SerializationError> {
             re_tracing::profile_function!();
-            let array = [
+            let entries = vec![
                 #(#quoted_pairs,)*
             ];
-            Ok(ComponentReflectionMap::from_iter(array))
+            Ok(ComponentReflectionMap::from_iter(entries))
         }
     }
 }
@@ -218,8 +255,8 @@ fn generate_archetype_reflection(reporter: &Reporter, objects: &Objects) -> Toke
                 Target::WebDocsMarkdown,
             )
             .join("\n");
-            let required = field.attrs.has(ATTR_RERUN_COMPONENT_REQUIRED);
-            let ui_editable = !field.attrs.has(ATTR_RERUN_COMPONENT_NO_UI_EDIT);
+            let required = field.attrs.has(RerunAttr::Required);
+            let ui_editable = !field.attrs.has(RerunAttr::NoUiEdit);
 
             let mut flag_tokens: Vec<TokenStream> = Vec::new();
             if required {
@@ -249,7 +286,7 @@ fn generate_archetype_reflection(reporter: &Reporter, objects: &Objects) -> Toke
         });
 
         let fqname = &obj.fqname;
-        let quoted_name = quote!( ArchetypeName::new(#fqname) );
+        let quoted_name = quote!( ArchetypeName::from(#fqname) );
         let display_name = re_case::to_human_case(&obj.name);
         if false {
             // We currently skip the docstring for the archetype itself,
@@ -273,16 +310,6 @@ fn generate_archetype_reflection(reporter: &Reporter, objects: &Objects) -> Toke
             quote!(None)
         };
 
-        let quoted_view_types = obj
-            .archetype_view_types()
-            .unwrap_or_default()
-            .iter()
-            .map(|view_type| {
-                let view_name = &view_type.view_name;
-                quote! { #view_name }
-            })
-            .collect_vec();
-
         let deprecation_summary = if let Some(notice) = obj.deprecation_summary() {
             quote! { Some(#notice) }
         } else {
@@ -296,10 +323,6 @@ fn generate_archetype_reflection(reporter: &Reporter, objects: &Objects) -> Toke
                 deprecation_summary: #deprecation_summary,
 
                 scope: #scope,
-
-                view_types: &[
-                    #(#quoted_view_types,)*
-                ],
 
                 fields: vec![
                     #(#quoted_field_reflections,)*
@@ -319,6 +342,58 @@ fn generate_archetype_reflection(reporter: &Reporter, objects: &Objects) -> Toke
                 #(#quoted_pairs,)*
             ];
             ArchetypeReflectionMap::from_iter(array)
+        }
+    }
+}
+
+/// Generate reflection about views.
+fn generate_view_reflection(objects: &Objects) -> TokenStream {
+    let quoted_pairs = objects
+        .objects_of_kind(ObjectKind::View)
+        .filter(|view| !view.is_testing())
+        .map(|view| {
+            let identifier = view.get_attr::<String>(RerunAttr::ViewIdentifier);
+            let quoted_identifier = quote!(ViewClassIdentifier::from_static_str(#identifier));
+
+            let applicability = if view.is_attr_set(DocsAttr::ArchetypeAgnostic) {
+                quote!(ViewApplicability::AllArchetypes)
+            } else {
+                let archetypes = objects
+                    .objects_of_kind(ObjectKind::Archetype)
+                    .filter(|archetype| !archetype.is_testing())
+                    .filter(|archetype| {
+                        archetype
+                            .archetype_view_types()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|reference| reference.view_name == view.name)
+                    })
+                    .map(|archetype| {
+                        let fqname = &archetype.fqname;
+                        quote!(ArchetypeName::from(#fqname))
+                    });
+                quote!(ViewApplicability::Archetypes(vec![#(#archetypes),*]))
+            };
+
+            quote! {
+                (
+                    #quoted_identifier,
+                    ViewReflection {
+                        applicability: #applicability,
+                    },
+                )
+            }
+        });
+
+    quote! {
+        #[doc = "Generates reflection about all known views."]
+        #[doc = ""]
+        #[doc = "Call only once and reuse the results."]
+        fn generate_view_reflection() -> ViewReflectionMap {
+            let entries = [
+                #(#quoted_pairs),*
+            ];
+            ViewReflectionMap::from_iter(entries)
         }
     }
 }

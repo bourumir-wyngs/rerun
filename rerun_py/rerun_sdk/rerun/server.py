@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import socket
 from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,6 +14,8 @@ from .catalog import CatalogClient
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from types import TracebackType
+
+__all__ = ["Server"]
 
 
 class Server:
@@ -47,11 +48,13 @@ class Server:
     def __init__(
         self,
         *,
-        host: str = "0.0.0.0",
+        # Binding all interfaces is the intended default: the viewer is normally opened
+        # from another machine. Narrow it with `host=` when that is not wanted.
+        host: str = "0.0.0.0",  # noqa: S104
         port: int | None = None,
         datasets: dict[str, str | PathLike[str] | Sequence[str | PathLike[str]]] | None = None,
         tables: dict[str, PathLike[str]] | None = None,
-        addr: str = "0.0.0.0",
+        addr: str = "0.0.0.0",  # noqa: S104
     ) -> None:
         """
         Create a new Rerun server instance and start it.
@@ -64,7 +67,8 @@ class Server:
         host:
             The IP address to bind the server to.
         port:
-            The port to bind the server to, or `None` to select a random available port.
+            The port to bind the server to, or `None` (or `0`) to let the OS select a random
+            available port. Use `url()` to get the address of the running server.
         datasets:
             Optional dictionary specifying dataset to load in the server at startup. Values in the dictionary may be
             either of:
@@ -78,7 +82,7 @@ class Server:
 
         """
 
-        if host == "0.0.0.0" and addr != "0.0.0.0":
+        if host == "0.0.0.0" and addr != "0.0.0.0":  # noqa: S104
             host = addr
             _send_warning_or_raise(
                 "The `addr` parameter is deprecated in Rerun 0.29, and has been renamed to `host`.",
@@ -86,14 +90,8 @@ class Server:
                 warning_type=DeprecationWarning,
             )
 
-        # Select a random open port if none is specified
-        resolved_port: int
-        if port is None:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("", 0))
-                resolved_port = s.getsockname()[1]
-        else:
-            resolved_port = port
+        # Port 0 lets the OS pick a free port for us. `url()` reports the actual port.
+        resolved_port = 0 if port is None else port
 
         all_datasets = {}
         all_dataset_prefixes = {}

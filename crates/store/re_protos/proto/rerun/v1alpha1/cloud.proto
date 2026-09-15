@@ -1,3 +1,13 @@
+// The catalog server public API.
+//
+// This is the entire public gRPC surface a client (SDK, viewer, or CLI) uses to talk to a catalog
+// server. It covers the catalog itself (datasets and tables), reading and writing the manifest
+// registry, Rerun-native queries and chunk fetching, table access, task management and
+// maintenance.
+//
+// Everything in here is public and versioned. The private endpoints that back it live in
+// `redap/v1alpha1/`.
+
 syntax = "proto3";
 
 package rerun.cloud.v1alpha1;
@@ -8,11 +18,11 @@ import "google/protobuf/timestamp.proto";
 import "rerun/v1alpha1/common.proto";
 import "rerun/v1alpha1/log_msg.proto";
 
-// The Rerun Cloud public API.
+// The catalog server public API.
 //
 // ## Headers
 //
-// Most endpoints in the Rerun Cloud service require specific gRPC headers to be set.
+// Most endpoints in the catalog server service require specific gRPC headers to be set.
 //
 // The so-called "standard dataset headers" correspond to at least one of the following headers:
 // * x-rerun-entry-id: ID of the entry of interest, e.g. `1860390B087BC65F602d68eb646c385c`.
@@ -20,7 +30,18 @@ import "rerun/v1alpha1/log_msg.proto";
 //
 // Headers with a -bin suffix must be base64-encoded (HTTP only supports ASCII values, UTF8 strings must
 // binary encoded).
+//
+// Some entry-addressed endpoints also accept the entry id in a deprecated body field. Every server
+// resolves those the same way: the `x-rerun-entry-id` header wins, the body field is a fallback for
+// old clients, and both unset fails with `INVALID_ARGUMENT` (a gRPC status code). If both are set
+// but disagree, the call fails with `INVALID_ARGUMENT` naming the two ids, rather than silently
+// picking one. `x-rerun-entry-name-bin` is never resolved on these endpoints.
 service RerunCloudService {
+  // Returns version and build information about the server.
+  //
+  // Also reports the optional features this server supports, so clients can stay safe against
+  // rolling deployments where the server is older than the client
+  // (see `ConnectionClient::supports_feature`).
   rpc Version(VersionRequest) returns (VersionResponse) {}
 
   // Returns information about the currently authenticated user.
@@ -29,26 +50,115 @@ service RerunCloudService {
   // is successful and to retrieve the user's identity.
   rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse) {}
 
+  // Returns a payload of pseudo-random (incompressible) bytes of the requested size.
+  //
+  // Intended for measuring round-trip time and bandwidth between client and server:
+  // * Send a few small requests (e.g. `num_bytes = 1`) to estimate RTT.
+  // * Send a larger request (e.g. `num_bytes = 1 MiB`), subtract the RTT, and divide
+  //   `num_bytes` by the remaining time to estimate bandwidth.
+  //
+  // The response is streamed as one or more chunks; the total number of bytes across
+  // all chunks is exactly `num_bytes`.
+  rpc DoBandwidthTest(DoBandwidthTestRequest) returns (stream DoBandwidthTestResponse) {}
+
   // --- Catalog ---
 
+  // Subscribe to catalog events as they happen.
+  //
+  // The stream yields one response per event and stays open until the client drops it.
+  // Events are emitted for entry creation (datasets and tables) and entry deletion. Renames
+  // produce no event, and neither do implicitly created blueprint or asset datasets.
+  //
+  // Servers may not support this at all: a server without event support returns
+  // `UNIMPLEMENTED`, and clients must treat that as permanent rather than retrying.
+  // Rerun Hub currently returns `UNIMPLEMENTED` (RR-4859).
+  rpc WatchEvents(WatchEventsRequest) returns (stream WatchEventsResponse) {}
+
+  // List the entries of the catalog that match the given filter.
   rpc FindEntries(FindEntriesRequest) returns (FindEntriesResponse) {}
 
+  // Mark an entry as deleted, making it unavailable for future use.
+  //
+  // Deleting a dataset or table also deletes the blueprint and asset datasets it owns, and
+  // frees its name for immediate reuse. Whether the underlying data is removed right away is
+  // server-defined: Rerun Hub soft-deletes and reclaims storage in a later
+  // garbage-collection pass, while the OSS server deletes synchronously.
+  //
+  // The entry is identified by the `x-rerun-entry-id` header, falling back to the deprecated
+  // body `id` field (see the `Headers` section at the top of this file).
   rpc DeleteEntry(DeleteEntryRequest) returns (DeleteEntryResponse) {}
 
+  // Update the kind-agnostic details of an entry, i.e. its name.
+  //
+  // Fails with `ALREADY_EXISTS` if the new name is taken. A rename to the current name is a
+  // no-op.
+  //
+  // The entry is identified by the `x-rerun-entry-id` header, falling back to the deprecated
+  // body `id` field (see the `Headers` section at the top of this file).
   rpc UpdateEntry(UpdateEntryRequest) returns (UpdateEntryResponse) {}
 
+  // Create a new dataset entry, with no segments.
+  //
+  // A blueprint dataset and an asset dataset are created alongside it and referenced from the
+  // returned `dataset_details`; both are owned by the entry and cascade on delete. The request
+  // may carry a caller-chosen `id`; otherwise the server allocates one.
+  //
+  // Fails with `ALREADY_EXISTS` if an entry with the same name (or the same id) already
+  // exists.
   rpc CreateDatasetEntry(CreateDatasetEntryRequest) returns (CreateDatasetEntryResponse) {}
 
+  // Create a new table entry with the given schema.
+  //
+  // Backed by a fresh Lance table at a server-chosen URL. Naming your own storage URL via
+  // `provider_details` is not supported on Rerun Hub (`UNIMPLEMENTED`); the OSS
+  // server honors it. Fails with `FAILED_PRECONDITION` if the server has no table storage
+  // configured, and with `ALREADY_EXISTS` if an entry with the same name already exists.
+  //
+  // Use `RegisterTable` instead to adopt a table that already exists.
   rpc CreateTableEntry(CreateTableEntryRequest) returns (CreateTableEntryResponse) {}
 
   // Fetch metadata about a specific dataset.
   //
-  // This endpoint requires the standard dataset headers.
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   rpc ReadDatasetEntry(ReadDatasetEntryRequest) returns (ReadDatasetEntryResponse) {}
 
+  // Overwrite the dataset-specific details of a dataset entry, e.g. its associated blueprint dataset.
+  //
+  // This is a full replace, not a merge: any field left unset in `dataset_details` is cleared.
+  // [`blueprint_dataset`] and [`asset_dataset`] deliberately differ on that point; see their
+  // own docs.
+  //
+  // [`blueprint_dataset`]: crate::cloud::v1alpha1::DatasetDetails::blueprint_dataset
+  // [`asset_dataset`]: crate::cloud::v1alpha1::DatasetDetails::asset_dataset
+  //
+  // The dataset is identified by the `x-rerun-entry-id` header, falling back to the deprecated
+  // body `id` field (see the `Headers` section at the top of this file).
   rpc UpdateDatasetEntry(UpdateDatasetEntryRequest) returns (UpdateDatasetEntryResponse) {}
 
+  // Fetch metadata about a specific table.
+  //
+  // The table is identified by the `x-rerun-entry-id` header, falling back to the deprecated
+  // body `id` field (see the `Headers` section at the top of this file).
+  // Fails with the gRPC status code `NOT_FOUND` for unknown or soft-deleted entries.
   rpc ReadTableEntry(ReadTableEntryRequest) returns (ReadTableEntryResponse) {}
+
+  // Overwrite the table-specific details of a table entry, e.g. its associated blueprint dataset.
+  //
+  // This is a full replace, not a merge: any field left unset in `table_details` is cleared,
+  // except `blueprint_dataset`, which cannot be cleared: the server makes sure the table keeps
+  // a blueprint dataset.
+  //
+  // The table is identified by the `x-rerun-entry-id` header, falling back to the deprecated
+  // body `id` field (see the `Headers` section at the top of this file).
+  rpc UpdateTableEntry(UpdateTableEntryRequest) returns (UpdateTableEntryResponse) {}
+
+  // --- Grants ---
+
+  // Returns authorization to write one object at the requested key.
+  //
+  // The grant applies to exactly `size_bytes` bytes and expires at the time in the response.
+  // TODO(grtlr): Add a `GetReadAccessGrant` when clients need direct read access.
+  rpc GetWriteAccessGrant(GetWriteAccessGrantRequest) returns (GetWriteAccessGrantResponse) {}
 
   // --- Manifest Registry ---
 
@@ -56,25 +166,22 @@ service RerunCloudService {
 
   // Register new segments with the Dataset.
   //
-  // This endpoint requires the standard dataset headers.
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   rpc RegisterWithDataset(RegisterWithDatasetRequest) returns (RegisterWithDatasetResponse) {}
 
   // Unregisters segments and layers from the Dataset.
   //
-  // Excluding IO errors, this will always succeed as long the target dataset exists.
-  // Corollary: unregistering data that doesn't exist is a no-op.
+  // This is an asynchronous operation, and returns a list of task ids.
+  // The response is a stream only for historical reasons.
   //
-  // This always returns a subset of the data from `ScanDatasetManifest`, and therefore the data will
-  // also follow the schema returned by `GetDatasetManifestSchema`.
-  //
-  // This endpoint requires the standard dataset headers.
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   rpc UnregisterFromDataset(UnregisterFromDatasetRequest) returns (stream UnregisterFromDatasetResponse) {}
 
   // Write chunks to one or more segments.
   //
   // The segment ID for each individual chunk is extracted from their metadata (`rerun:segment_id`).
   //
-  // This endpoint requires the standard dataset headers.
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   rpc WriteChunks(stream WriteChunksRequest) returns (WriteChunksResponse) {}
 
   /* Query schemas */
@@ -86,14 +193,14 @@ service RerunCloudService {
   // To inspect the data of the segment table, which is guaranteed to match the schema returned by
   // this endpoint, check out `ScanSegmentTable`.
   //
-  // This endpoint requires the standard dataset headers.
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   rpc GetSegmentTableSchema(GetSegmentTableSchemaRequest) returns (GetSegmentTableSchemaResponse) {}
 
   // Inspect the contents of the segment table.
   //
   // The data will follow the schema returned by `GetSegmentTableSchema`.
   //
-  // This endpoint requires the standard dataset headers.
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   rpc ScanSegmentTable(ScanSegmentTableRequest) returns (stream ScanSegmentTableResponse) {}
 
   // Returns the schema of the dataset manifest.
@@ -101,14 +208,14 @@ service RerunCloudService {
   // To inspect the data of the dataset manifest, which is guaranteed to match the schema returned by
   // this endpoint, check out `ScanDatasetManifest`.
   //
-  // This endpoint requires the standard dataset headers.
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   rpc GetDatasetManifestSchema(GetDatasetManifestSchemaRequest) returns (GetDatasetManifestSchemaResponse) {}
 
   // Inspect the contents of the dataset manifest.
   //
   // The data will follow the schema returned by `GetDatasetManifestSchema`.
   //
-  // This endpoint requires the standard dataset headers.
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   rpc ScanDatasetManifest(ScanDatasetManifestRequest) returns (stream ScanDatasetManifestResponse) {}
 
   // Returns the schema of the dataset.
@@ -116,7 +223,7 @@ service RerunCloudService {
   // This is the union of all the schemas from all the underlying segments. It will contain all the indexes,
   // entities and components present in the dataset.
   //
-  // This endpoint requires the standard dataset headers.
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   rpc GetDatasetSchema(GetDatasetSchemaRequest) returns (GetDatasetSchemaResponse) {}
 
   // Get the RRD Footer manifest.
@@ -127,34 +234,30 @@ service RerunCloudService {
   // When that happens, it is guaranteed that all parts have the same exact Sorbet schemas (and therefore
   // identical Sorbet schema hashes too).
   // That means it is always semantically valid to concatenate the data from these RRD manifests.
+  //
+  // If the client sets `generate_direct_urls`, the server may instead return keys pointing at
+  // encoded `rerun.log_msg.v1alpha1.RrdFooter` payloads for the client to fetch and decode.
+  // This is best-effort: the response may still inline the manifests: clients must handle both forms.
+  // However, all the items in a stream will either send inline manifest or urls, uniformly.
   rpc GetRrdManifest(GetRrdManifestRequest) returns (stream GetRrdManifestResponse) {}
+
+  // Get the assets that apply to this dataset.
+  //
+  // Returns the dataset's asset dataset and the asset segments within it.
+  // The asset segment ids may be spread over multiple responses, at the discretion of the server.
+  //
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
+  rpc GetAssetsForSegment(GetAssetsForSegmentRequest) returns (stream GetAssetsForSegmentResponse) {}
 
   /* Indexing */
 
-  // Creates a custom index for a specific column (vector search, full-text search, etc).
-  //
-  // This endpoint requires the standard dataset headers.
-  rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse) {}
-
-  // List all user-defined indexes in this dataset.
-  //
-  // This endpoint requires the standard dataset headers.
-  rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse) {}
-
-  // Delete a custom index for a specific column.
-  //
-  // This endpoint requires the standard dataset headers.
-  rpc DeleteIndexes(DeleteIndexesRequest) returns (DeleteIndexesResponse) {}
+  // Reserved (removed): the custom-index / vector-search subsystem was removed.
+  // Do not reuse these RPC names: CreateIndex, ListIndexes, DeleteIndexes, SearchDataset.
 
   /* Queries */
 
-  // Search a previously created index.
-  //
-  // This endpoint requires the standard dataset headers.
-  rpc SearchDataset(SearchDatasetRequest) returns (stream SearchDatasetResponse) {}
-
   // Perform Rerun-native queries on a dataset, returning the matching chunk IDs, as well
-  // as information that can be sent back to Rerun Cloud to fetch the actual chunks as part
+  // as information that can be sent back to the catalog server to fetch the actual chunks as part
   // of `FetchChunks` request. In this 2-step query process, 1st step is getting information
   // from the server about the chunks that contain relevant information. 2nd step is fetching
   // those chunks (the actual data).
@@ -168,10 +271,17 @@ service RerunCloudService {
   //
   // Passing chunk IDs to this method effectively acts as a IF_EXIST filter.
   //
-  // This endpoint requires the standard dataset headers.
+  // For latest-at queries, the returned chunks are a **correctness-preserving
+  // superset** of the minimum set needed to answer the query: the server may
+  // include additional candidate chunks (e.g., overlap siblings within the
+  // global max chunk length, or chunks that pass segment-level bounds without
+  // per-value narrowing). Clients are expected to run their own latest-at
+  // resolution on the returned chunks.
+  //
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   rpc QueryDataset(QueryDatasetRequest) returns (stream QueryDatasetResponse) {}
 
-  // Fetch specific chunks from Rerun Cloud. In a 2-step query process, result of 1st phase,
+  // Fetch specific chunks from the catalog server. In a 2-step query process, result of 1st phase,
   // that is, the result of `QueryDataset` should include all the necessary information to send
   // the actual chunk requests, which is the 2nd step of the query process.
   //
@@ -184,13 +294,24 @@ service RerunCloudService {
   // Register a foreign table as a new table entry in the catalog.
   rpc RegisterTable(RegisterTableRequest) returns (RegisterTableResponse) {}
 
+  // Returns the schema of a table entry.
+  //
+  // The table is identified by the `x-rerun-entry-id` header, falling back to the deprecated
+  // body `table_id` field (see the `Headers` section at the top of this file).
   rpc GetTableSchema(GetTableSchemaRequest) returns (GetTableSchemaResponse) {}
 
+  // Inspect the contents of a table entry.
+  //
+  // The data follows the schema returned by `GetTableSchema`, assuming no concurrent write
+  // changed the table in between.
+  //
+  // The table is identified by the `x-rerun-entry-id` header, falling back to the deprecated
+  // body `table_id` field (see the `Headers` section at the top of this file).
   rpc ScanTable(ScanTableRequest) returns (stream ScanTableResponse) {}
 
   // Write record batches to a table.
   //
-  // This endpoint requires the standard dataset headers.
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   //
   // TODO(#11645): endpoints with streaming input are not supported by `grpc-web`.
   // A non-streaming shim will need to be added if/when the viewer uses this endpoint.
@@ -204,11 +325,14 @@ service RerunCloudService {
   // Query the status of submitted tasks as soon as they are no longer pending
   rpc QueryTasksOnCompletion(QueryTasksOnCompletionRequest) returns (stream QueryTasksOnCompletionResponse) {}
 
+  // Cancel existing tasks
+  rpc CancelTasks(CancelTasksRequest) returns (CancelTasksResponse);
+
   // --- Utilities ---
 
   // Rerun Manifests maintenance operations: scalar index creation, compaction, etc.
   //
-  // This endpoint requires the standard dataset headers.
+  // This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
   rpc DoMaintenance(DoMaintenanceRequest) returns (DoMaintenanceResponse) {}
 
   // Run global maintenance operations on the platform: this includes optimization
@@ -218,9 +342,12 @@ service RerunCloudService {
 
 // ---
 
+// Request for `Version`. Empty: the whole version report is always returned.
 message VersionRequest {}
 
+// Response for `Version`.
 message VersionResponse {
+  // Detailed build information for the server binary.
   rerun.common.v1alpha1.BuildInfo build_info = 1;
 
   // A single version string representing the version of the whole stack.
@@ -231,10 +358,42 @@ message VersionResponse {
 
   // Cloud region where this instance is deployed (e.g. "us-west-2", "eastus"). Null if not deployed on cloud.
   optional string cloud_region = 4;
+
+  // Server-supported feature flags. Clients use this to gate optional behavior
+  // and stay safe against rolling deployments where the server may be older
+  // than the client.
+  //
+  // The format is a list of opaque feature strings. Known features:
+  //
+  // * `per_segment_index_values` — the server consumes
+  //   `QueryLatestAt.per_segment_values` (RR-4355). Clients that omit this
+  //   capability check and send `per_segment_values` to an old server will
+  //   silently get static-only data.
+  //
+  // Unknown features must be ignored. Adding new features is additive and
+  // never breaks compatibility — old clients see an empty list and fall back
+  // to today's slow-but-correct path.
+  repeated string features = 5;
 }
 
+// Capability names describing what a server implements and supports.
+//
+// A capability does not depend on the caller. Whether the caller is allowed to
+// use one is answered by `can_read` and `can_write`.
+//
+// A name is lowercase segments separated by `:`, most general segment first, so
+// a client can query a whole group by prefix. A server advertises full names
+// only, never a prefix and never a `*`. Clients ignore names they do not know,
+// so a new name never breaks an older client.
+message ServerCapabilities {
+  // Every capability this server implements and supports.
+  repeated string capabilities = 1;
+}
+
+// Request for `WhoAmI`. Empty: the caller is identified by their credentials.
 message WhoAmIRequest {}
 
+// Response for `WhoAmI`.
 message WhoAmIResponse {
   // The user ID of the authenticated user, if any.
   optional string user_id = 1;
@@ -244,14 +403,89 @@ message WhoAmIResponse {
 
   // Whether the user has write access.
   bool can_write = 3;
+
+  // What this server implements and supports, for any caller.
+  //
+  // Always set, empty when the server advertises none. Only a server from
+  // before capabilities existed leaves it unset, which is not the same as
+  // advertising none. Clients must tell the two apart, and send the request
+  // anyway rather than treat everything as unsupported.
+  optional ServerCapabilities capabilities = 4;
+}
+
+// Request for `DoBandwidthTest`.
+message DoBandwidthTestRequest {
+  // Total number of pseudo-random (incompressible) bytes the server should return,
+  // summed across all streamed response chunks.
+  uint64 num_bytes = 1;
+}
+
+// One chunk of the payload yielded by `DoBandwidthTest`.
+message DoBandwidthTestResponse {
+  // A chunk of pseudo-random (incompressible) bytes.
+  //
+  // The total length across all streamed chunks equals `DoBandwidthTestRequest.num_bytes`.
+  bytes payload = 1;
+}
+
+// WatchEvents
+
+// Request for `WatchEvents`.
+message WatchEventsRequest {
+  // Which kinds of events to subscribe to.
+  //
+  // If empty, the server subscribes to all event kinds.
+  repeated EventKind kinds = 1;
+}
+
+// Selects a category of events to subscribe to in `WatchEvents`.
+message EventKind {
+  // Which category of events this selects.
+  oneof kind {
+    // Catalog entry lifecycle events (created, deleted).
+    EntryEvents entry = 1;
+
+    // TODO(RR-4853): RegistrationEvents registration = 2;
+  }
+}
+
+// Subscribe to all catalog entry lifecycle events.
+message EntryEvents {}
+
+// One event yielded by `WatchEvents`.
+message WatchEventsResponse {
+  // Which event this is.
+  oneof kind {
+    // A catalog entry was created.
+    EntryCreatedEvent entry_created = 1;
+
+    // A catalog entry was deleted.
+    EntryDeletedEvent entry_deleted = 2;
+
+    // TODO(RR-4853): Add register events here too.
+  }
+}
+
+// A catalog entry was created.
+message EntryCreatedEvent {
+  // The entry that was created.
+  rerun.common.v1alpha1.EntryId id = 1;
+}
+
+// A catalog entry was deleted.
+message EntryDeletedEvent {
+  // The entry that was deleted.
+  rerun.common.v1alpha1.EntryId id = 1;
 }
 
 // Application level error - used as `details` in the `google.rpc.Status` message
 message Error {
   // error code
   ErrorCode code = 1;
+
   // unique identifier associated with the request (e.g. recording id, recording storage url)
   string id = 2;
+
   // human readable details about the error
   string message = 3;
 }
@@ -271,42 +505,133 @@ enum ErrorCode {
   ERROR_CODE_CODEC_ERROR = 3;
 }
 
+// --- Grants ---
+
+// Requests authorization to write one object.
+message GetWriteAccessGrantRequest {
+  // The exact size of the object in bytes.
+  // The client may upload incrementally, but it must send exactly this many bytes.
+  uint64 size_bytes = 1;
+
+  // The full object key, including the file name, relative to the location's base.
+  string key = 2;
+
+  // The requested storage location.
+  // The request fails if this is absent and the server has no default location.
+  optional Location location = 3;
+}
+
+// Selects a cloud location for an object.
+//
+// TODO(grtlr): Define provider, region, and network constraints.
+message Location {}
+
+// Contains the URL that identifies the object and the authorization needed to write it.
+message GetWriteAccessGrantResponse {
+  // Stable, credential-free URL naming the object.
+  //
+  // Pass this URL to `RegisterWithDataset` after writing the object.
+  string storage_url = 1;
+
+  // Authorization for the write operation.
+  AccessGrant grant = 2;
+}
+
+// Authorizes one storage operation until `expires_at`.
+message AccessGrant {
+  // The time after which the caller must not redeem this grant.
+  google.protobuf.Timestamp expires_at = 1;
+
+  // How the caller redeems this grant.
+  // TODO(grtlr): Add data-plane and client-side SDK redemption mechanisms when needed.
+  oneof redemption {
+    // The HTTP request that redeems this grant.
+    HttpRequest http_request = 2;
+  }
+}
+
+// Describes an HTTP request that the caller can perform directly.
+message HttpRequest {
+  // Uppercase HTTP method.
+  string method = 1;
+
+  // Absolute HTTP(S) URL.
+  string url = 2;
+
+  // Headers the caller must send exactly as returned.
+  // A name may appear more than once.
+  repeated HttpHeader headers = 3;
+}
+
+// Describes one HTTP header field.
+message HttpHeader {
+  // Field name, matched case-insensitively.
+  string name = 1;
+
+  // Field value, sent verbatim.
+  string value = 2;
+}
+
 // --- Manifest Registry ---
 
 /* Write data */
 
+// One place to read data from when registering it with a dataset.
 message DataSource {
   // Where is the data for this data source stored (e.g. s3://bucket/file or file:///path/to/file)?
   optional string storage_url = 1;
 
-  /// Which segment layer should this data source be registered to?
-  ///
-  /// Defaults to `base` if unspecified.
+  // Which segment layer should this data source be registered to?
+  //
+  // Defaults to `base` if unspecified.
   optional string layer = 3;
 
-  /// Is this a prefix URL (a directory)?
-  /// If true, all files of `typ` under this prefix will be
-  /// considered part of this data source.
+  // Is this a prefix URL (a directory)?
+  // If true, all files of `typ` under this prefix will be
+  // considered part of this data source.
   bool prefix = 4;
 
   // What kind of data is it (e.g. rrd, mcap, Lance, etc)?
   DataSourceKind typ = 2;
+
+  // Removed experimental field.
+  reserved 5;
+  reserved "layer_class";
 }
 
+// What format the data behind a `DataSource` is stored in.
 enum DataSourceKind {
+  // Always reserve unspecified as default value.
   DATA_SOURCE_KIND_UNSPECIFIED = 0;
+
+  // A Rerun recording (`.rrd`).
   DATA_SOURCE_KIND_RRD = 1;
 }
 
+// Request for `RegisterWithDataset`.
 message RegisterWithDatasetRequest {
+  // The data sources to register as segments of the dataset.
   repeated DataSource data_sources = 2;
+
+  // What to do about a data source that is already registered with this dataset.
   rerun.common.v1alpha1.IfDuplicateBehavior on_duplicate = 3;
 
   reserved 1;
   reserved "dataset_id";
 }
 
+// Response for `RegisterWithDataset`.
 message RegisterWithDatasetResponse {
+  // One row per registered `(segment, layer)` pair, with the non-null `Utf8` columns
+  // `rerun_segment_id`, `rerun_segment_layer`, `rerun_segment_type`, `rerun_storage_url`, and
+  // `rerun_task_id`, in that order (pinned by
+  // [`RegisterWithDatasetDataframe`](crate::cloud::v1alpha1::ext::RegisterWithDatasetDataframe)).
+  //
+  // Several rows can share a `rerun_task_id`: one registration task covers a whole batch. Data
+  // sources that resolve to the same segment ID collapse into a single row, so the row count
+  // is not necessarily `len(data_sources)`, and it is zero if every data source was skipped
+  // (`IF_DUPLICATE_BEHAVIOR_SKIP`). Servers that register synchronously report a sentinel task
+  // ID that is always "successful".
   rerun.common.v1alpha1.DataframePart data = 1;
 }
 
@@ -335,29 +660,80 @@ message UnregisterFromDatasetRequest {
   bool force = 3;
 }
 
+// Response for `UnregisterFromDataset`.
 message UnregisterFromDatasetResponse {
-  // This contains all the information about the segments and layers that were actually removed.
-  //
-  // This dataframe is always guaranteed to be a subset of the one found in `ScanDatasetManifestResponse`.
-  // They share the same semantics, schemas, etc.
+  // This dataframe is always empty. It remains here for format compatibility with older SDKs.
+  // TODO(ilya): remove this once the clients are all new enough
   rerun.common.v1alpha1.DataframePart data = 1;
+
+  // Id of the task that performs the unregistration. The data is not deleted until the task completes.
+  rerun.common.v1alpha1.TaskId task_id = 2;
 }
 
+// One chunk pushed by `WriteChunks`.
 message WriteChunksRequest {
+  // The chunk to write. Its target segment comes from the chunk's own schema-level
+  // `rerun:segment_id` metadata (legacy alias: `rerun:partition_id`); a chunk without it is
+  // rejected with `INVALID_ARGUMENT`. Chunks are always written to the `base` layer.
+  //
+  // Not all servers implement `WriteChunks`; Rerun Hub currently returns
+  // `UNIMPLEMENTED`.
   rerun.common.v1alpha1.RerunChunk chunk = 1;
 }
 
+// Response for `WriteChunks`. Empty: an error is reported as a gRPC status instead.
 message WriteChunksResponse {}
 
 /* Query schemas */
 
-message GetSegmentTableSchemaRequest {}
-
-message GetSegmentTableSchemaResponse {
-  rerun.common.v1alpha1.Schema schema = 1;
+// Identifies the dataset and revision associated with this response.
+message DatasetResponseMeta {
+  // The dataset entry this response belongs to.
+  rerun.common.v1alpha1.EntryId entry_id = 1;
+  // The dataset revision associated with this response.
+  uint64 dataset_revision = 2;
 }
 
+// Request for `GetSegmentTableSchema`.
+//
+// Empty: the dataset is identified by the standard dataset headers (see the `Headers` section at the top of this file).
+message GetSegmentTableSchemaRequest {}
+
+// Response for `GetSegmentTableSchema`.
+message GetSegmentTableSchemaResponse {
+  // Schema of the segment table.
+  rerun.common.v1alpha1.Schema schema = 1;
+  // Dataset identity and revision metadata for this response.
+  DatasetResponseMeta meta = 100;
+}
+
+// A plain list of segment IDs.
+message SegmentIdList {
+  // The segment IDs.
+  repeated string segment_ids = 1;
+}
+
+// Narrows a manifest scan down to, or away from, a set of segments.
+message SegmentIdFilter {
+  // Whether the listed segments are the ones to keep or the ones to drop.
+  oneof strategy {
+    // Scan only manifest rows belonging to these segment IDs.
+    // An empty list scans no segment rows.
+    SegmentIdList scan_only = 1;
+
+    // Scan all manifest rows except those belonging to these segment IDs.
+    // An empty list skips no segment rows.
+    SegmentIdList skip = 2;
+  }
+}
+
+// Request for `ScanSegmentTable`.
+//
+// The dataset is identified by the standard dataset headers (see the `Headers` section at the top of this file).
 message ScanSegmentTableRequest {
+  reserved 2;
+  reserved "sql_filter";
+
   // A list of column names to be projected server-side.
   //
   // If empty, all columns are returned.
@@ -368,20 +744,44 @@ message ScanSegmentTableRequest {
   // If a projected column does not exist, or is projected more than once, the `ScanSegmentTable` call will fail with
   // an `InvalidArgument` error.
   repeated string columns = 1;
+
+  // An optional best-effort hint for pruning segment IDs from the server-side scan.
+  //
+  // Servers may apply or ignore this filter.
+  // Clients must re-apply filters locally if correctness depends on them.
+  SegmentIdFilter segment_id_filter = 3;
 }
 
+// One batch of the segment table.
 message ScanSegmentTableResponse {
-  // Segments metadata as Arrow RecordBatch.
+  // Segments metadata as Arrow RecordBatch, with the columns pinned by
+  // [`ScanSegmentTableDataframe`](crate::cloud::v1alpha1::ext::ScanSegmentTableDataframe).
   rerun.common.v1alpha1.DataframePart data = 1;
+  // Dataset identity and revision for the entire stream.
+  // Set only on the first response message; omitted from subsequent messages.
+  DatasetResponseMeta meta = 100;
 }
 
+// Request for `GetDatasetManifestSchema`.
+//
+// Empty: the dataset is identified by the standard dataset headers (see the `Headers` section at the top of this file).
 message GetDatasetManifestSchemaRequest {}
 
+// Response for `GetDatasetManifestSchema`.
 message GetDatasetManifestSchemaResponse {
+  // Schema of the dataset manifest.
   rerun.common.v1alpha1.Schema schema = 1;
+  // Dataset identity and revision metadata for this response.
+  DatasetResponseMeta meta = 100;
 }
 
+// Request for `ScanDatasetManifest`.
+//
+// The dataset is identified by the standard dataset headers (see the `Headers` section at the top of this file).
 message ScanDatasetManifestRequest {
+  reserved 4;
+  reserved "sql_filter";
+
   // A list of column names to be projected server-side.
   //
   // If empty, all columns are returned.
@@ -392,224 +792,104 @@ message ScanDatasetManifestRequest {
   // If a projected column does not exist, or is projected more than once, the `ScanDatasetManifest` call will fail with
   // an `InvalidArgument` error.
   repeated string columns = 3;
+
+  // An optional best-effort hint for pruning segment IDs from the server-side scan.
+  //
+  // Servers may apply or ignore this filter.
+  // Clients must re-apply filters locally if correctness depends on them.
+  SegmentIdFilter segment_id_filter = 5;
 }
 
+// One batch of the dataset manifest.
 message ScanDatasetManifestResponse {
-  // The contents of the dataset manifest (i.e. information about layers) as Arrow RecordBatch.
+  // The contents of the dataset manifest (i.e. information about layers) as Arrow RecordBatch,
+  // with the columns pinned by
+  // [`ScanDatasetManifestDataframe`](crate::cloud::v1alpha1::ext::ScanDatasetManifestDataframe).
   rerun.common.v1alpha1.DataframePart data = 1;
+  // Dataset identity and revision for the entire stream.
+  // Set only on the first response message; omitted from subsequent messages.
+  DatasetResponseMeta meta = 100;
 }
 
+// Request for `GetDatasetSchema`.
+//
+// The dataset is identified by the standard dataset headers (see the `Headers` section at the top of this file).
 message GetDatasetSchemaRequest {
   reserved 1;
   reserved "dataset_id";
 }
 
+// Response for `GetDatasetSchema`.
 message GetDatasetSchemaResponse {
+  // The union of the schemas of every layer of every segment in the dataset (a field-wise
+  // Arrow schema merge).
+  //
+  // Servers are allowed to return a superset: some maintain this schema incrementally and only
+  // ever widen it, so fields from unregistered or replaced segments can linger until
+  // `RematerializeDatasetSchema` recomputes it. A dataset with no registered segments yields
+  // an empty schema rather than an error.
   rerun.common.v1alpha1.Schema schema = 1;
+  // Dataset identity and revision metadata for this response.
+  DatasetResponseMeta meta = 100;
 }
 
+// Request for `GetRrdManifest`.
+//
+// The dataset is identified by the standard dataset headers (see the `Headers` section at the top of this file).
 message GetRrdManifestRequest {
+  // Which segment of the dataset to fetch the RRD manifest of.
   rerun.common.v1alpha1.SegmentId segment_id = 1;
+
+  // Asks the server to return direct URLs pointing at encoded
+  // `rerun.log_msg.v1alpha1.RrdFooter` payloads instead of inlining manifests.
+  //
+  // It is not guaranteed that the server will honor this.
+  bool generate_direct_urls = 2;
 }
 
+// One part of an RRD manifest, yielded by `GetRrdManifest`.
 message GetRrdManifestResponse {
+  // Exactly one of `rrd_manifest` and `manifest_key` is set per response.
+
+  // The manifest, inlined.
   rerun.log_msg.v1alpha1.RrdManifest rrd_manifest = 1;
+
+  // Points at an encoded `rerun.log_msg.v1alpha1.RrdFooter` payload for the client to fetch and decode.
+  RrdManifestKey manifest_key = 2;
+
+  // Dataset identity and revision for the entire stream.
+  // Set only on the first response message; omitted from subsequent messages.
+  DatasetResponseMeta meta = 100;
+}
+
+// Request for `GetAssetsForSegment`.
+//
+// Empty: the dataset is identified by the standard dataset headers (see the `Headers` section at the top of this file).
+message GetAssetsForSegmentRequest {}
+
+// One part of the asset listing, yielded by `GetAssetsForSegment`.
+message GetAssetsForSegmentResponse {
+  // The asset dataset. Set on every response in the stream.
+  rerun.common.v1alpha1.EntryId assets_entry = 1;
+
+  // The segments of the asset dataset. Concatenate across all responses in the stream.
+  repeated rerun.common.v1alpha1.SegmentId asset_segment_ids = 2;
 }
 
 /* Indexing */
 
-message CreateIndexRequest {
-  IndexConfig config = 3;
-
-  reserved 1;
-  reserved "dataset_id";
-
-  reserved 2;
-  reserved "partition_ids";
-
-  reserved 4;
-  reserved "on_duplicate";
-
-  reserved 5;
-  reserved "partition_layers";
-}
-
-message CreateIndexResponse {
-  reserved 1;
-  reserved "data";
-
-  // The properties/configuration of the newly created index.
-  IndexConfig index = 3;
-
-  // Backend-specific statistics about the index.
-  //
-  // This is guaranteed to be valid JSON.
-  bytes statistics_json = 4;
-
-  // Optional debug information about the index-creation task
-  DebugInfo debug_info = 2;
-}
-
-message ListIndexesRequest {}
-
-message ListIndexesResponse {
-  // The respective properties/configuration of the indexes.
-  repeated IndexConfig indexes = 1;
-
-  // Backend-specific statistics about the indexes.
-  //
-  // This is guaranteed to be valid JSON.
-  //
-  // If non-empty, this is the same length as `indexes`, and in the same order.
-  repeated bytes statistics_json = 2;
-}
-
-message DeleteIndexesRequest {
-  // Which column to delete the indexes for.
-  IndexColumn column = 1;
-}
-
-message DeleteIndexesResponse {
-  // Which indexes were actually deleted.
-  //
-  // Can be empty if no matching indexes were found.
-  repeated IndexConfig indexes = 1;
-}
-
-message IndexConfig {
-  // what kind of index do we want to create and what are its index specific properties.
-  IndexProperties properties = 1;
-
-  // Component / column we want to index.
-  IndexColumn column = 2;
-
-  // What is the filter index i.e. timeline for which we will query the timepoints.
-  //
-  // TODO(zehiko) this might go away and we might just index across all the timelines
-  rerun.common.v1alpha1.IndexColumnSelector time_index = 3;
-}
-
-// used to define which column we want to index
-message IndexColumn {
-  // The path of the entity.
-  rerun.common.v1alpha1.EntityPath entity_path = 1;
-
-  // Component details
-  rerun.common.v1alpha1.ComponentDescriptor component = 2;
-}
-
-message IndexProperties {
-  oneof props {
-    InvertedIndex inverted = 1;
-    VectorIvfPqIndex vector = 2;
-    BTreeIndex btree = 3;
-  }
-}
-
-message InvertedIndex {
-  optional bool store_position = 1;
-  optional string base_tokenizer = 2;
-  // TODO(zehiko) add other properties as needed
-}
-
-message VectorIvfPqIndex {
-  optional uint32 num_sub_vectors = 2;
-
-  VectorDistanceMetric distance_metrics = 3;
-
-  // Target size of the IVF partition in rows.
-  // NOTE: "partition" here refers to Lance's IVF (Inverted File Index) partitions,
-  // not Rerun segments.
-  //
-  // This maps to lance's underlying `target_partition_size` property
-  // and it indirectly determines how many inverted indices (partitions)
-  // to build (the larger this value, the fewer partitions will be built):
-  // num_partitions = total_vectors / target_partition_num_rows
-  //
-  // A smaller number here will lead to more partitions, which can improve
-  // search recall at the cost of higher training time and memory usage.
-  //
-  // If missing, we let Lance will pick a default value, which, today, is
-  // 8192 rows per partition.
-  //
-  // Note that Lance will cap the maximum `num_partitions` to 4096:
-  // `num_partitions = min(4096, total_vectors / target_partition_num_rows)`
-  // So this means that setting this value too low will have no effect for
-  // large enough datasets.
-  //
-  // References:
-  // - [https://github.com/rerun-io/lance/blob/547bf3e288ff0bc13e96f29c7af46155fbd9f5c2/rust/lance/src/index/vector.rs#L336]
-  // - [https://github.com/rerun-io/lance/blob/a55c3afe250bcbe4d338c108ebe4a03d8a92697b/rust/lance-index/src/vector/ivf/builder.rs#L123]
-  // - [https://github.com/rerun-io/lance/blob/a55c3afe250bcbe4d338c108ebe4a03d8a92697b/rust/lance-index/src/lib.rs#L280]
-  optional uint32 target_partition_num_rows = 4;
-
-  // num_partitions is deprecated starting from rerun-cloud v0.7.0
-  // Use target_partition_num_rows instead
-  // See: RR-2798
-  reserved 1;
-  reserved "num_partitions";
-}
-
-enum VectorDistanceMetric {
-  VECTOR_DISTANCE_METRIC_UNSPECIFIED = 0;
-  VECTOR_DISTANCE_METRIC_L2 = 1;
-  VECTOR_DISTANCE_METRIC_COSINE = 2;
-  VECTOR_DISTANCE_METRIC_DOT = 3;
-  VECTOR_DISTANCE_METRIC_HAMMING = 4;
-}
-
-message BTreeIndex {
-  // TODO(zehiko) add properties as needed
-}
+// Reserved (removed): the custom-index / vector-search subsystem was removed.
+// The following message and enum names were deleted and must not be reused:
+// CreateIndexRequest, CreateIndexResponse, ListIndexesRequest, ListIndexesResponse,
+// DeleteIndexesRequest, DeleteIndexesResponse, IndexConfig, IndexColumn, IndexProperties,
+// InvertedIndex, VectorIvfPqIndex, VectorDistanceMetric, BTreeIndex, SearchDatasetRequest,
+// SearchDatasetResponse, IndexQueryProperties, InvertedIndexQuery, VectorIndexQuery, BTreeIndexQuery.
 
 /* Queries */
 
-message SearchDatasetRequest {
-  // Index column that is queried
-  IndexColumn column = 2;
-
-  // Query data - type of data is index specific. Caller must ensure
-  // to provide the right type. For vector search this should
-  // be a vector of appropriate size, for inverted index this should be a string.
-  // Query data is represented as a unit (single row) RecordBatch with 1 column.
-  rerun.common.v1alpha1.DataframePart query = 3;
-
-  // Index type specific properties
-  IndexQueryProperties properties = 4;
-
-  // Scan parameters
-  rerun.common.v1alpha1.ScanParameters scan_parameters = 5;
-
-  reserved 1;
-  reserved "dataset_id";
-}
-
-message SearchDatasetResponse {
-  // Chunks as arrow RecordBatch
-  rerun.common.v1alpha1.DataframePart data = 1;
-}
-
-message IndexQueryProperties {
-  // specific index query properties based on the index type
-  oneof props {
-    InvertedIndexQuery inverted = 1;
-    VectorIndexQuery vector = 2;
-    BTreeIndexQuery btree = 3;
-  }
-}
-
-message InvertedIndexQuery {
-  // TODO(zehiko) add properties as needed
-}
-
-message VectorIndexQuery {
-  optional uint32 top_k = 1;
-}
-
-message BTreeIndexQuery {
-  // TODO(zehiko) add properties as needed
-}
-
+// Request for `QueryDataset`.
+//
+// The dataset is identified by the standard dataset headers (see the `Headers` section at the top of this file).
 message QueryDatasetRequest {
   // Client can specify what segments are queried. If left unspecified (empty list),
   // all segments will be queried.
@@ -661,6 +941,8 @@ message QueryDatasetRequest {
   // Generic parameters that will influence the behavior of the Lance scanner.
   rerun.common.v1alpha1.ScanParameters scan_parameters = 5;
 
+  // The Rerun-native query to run. Leave unset to match on the other filters alone: an unset
+  // `query` applies no temporal narrowing.
   Query query = 6;
 
   reserved 1;
@@ -669,10 +951,27 @@ message QueryDatasetRequest {
   reserved "partition_ids";
 }
 
+// One batch of query results, yielded by `QueryDataset`.
 message QueryDatasetResponse {
+  // One row per matching chunk. These columns are always present, in this order (pinned by
+  // [`QueryDatasetDataframe`](crate::cloud::v1alpha1::ext::QueryDatasetDataframe)): `chunk_id`, `chunk_segment_id`, `rerun_segment_layer`,
+  // `chunk_key`, `chunk_entity_path`, `chunk_is_static`, `chunk_byte_len`,
+  // `chunk_byte_size_uncompressed`, `rerun_layer_direct_url`,
+  // `rerun_layer_direct_url_expires_at`.
+  //
+  // `chunk_key` is the opaque handle to pass to `FetchChunks`. The direct-URL columns are all
+  // null unless the server honored `generate_direct_urls`. Additional columns appear on
+  // demand: one nullable Int64 `{timeline}:start` column per timeline the query can see, and
+  // more per the `columns_always_include_*` flags on `Query` and `scan_parameters.columns`.
+  //
+  // Every batch of one stream carries the same schema, so clients can concatenate them.
   rerun.common.v1alpha1.DataframePart data = 1;
+  // Dataset identity and revision for the entire stream.
+  // Set only on the first response message; omitted from subsequent messages.
+  DatasetResponseMeta meta = 100;
 }
 
+// A Rerun-native query over a dataset's chunks.
 message Query {
   // If specified, will perform a latest-at query with the given parameters.
   //
@@ -711,22 +1010,59 @@ message Query {
 // A chunk-level latest-at query, aka `LatestAtRelevantChunks`.
 //
 // This has the exact same semantics as the query of the same name on our `ChunkStore`.
+//
+// Two modes of use (mutually exclusive):
+//   1. Global: set `at`. Applied to all segments.
+//   2. Per-segment: set `per_segment_values`. Each entry is positionally
+//      matched to `QueryDatasetRequest.segment_ids`. `at` and `Query.range`
+//      must be unset — the server reconstructs global bounds internally
+//      from the per-segment values.
 message QueryLatestAt {
   // Which index column should we perform the query on? E.g. `log_time`.
   //
   // Leave this empty to query for static data.
   rerun.common.v1alpha1.IndexColumnSelector index = 1;
 
-  // What index value are we looking for?
+  // Global query value — applied to all segments.
   //
-  // Leave this empty to query for static data.
+  // Omit this field to query for static data only.
+  // Mutually exclusive with `per_segment_values`.
   optional int64 at = 2;
+
+  // Per-segment index values, positionally matched to
+  // `QueryDatasetRequest.segment_ids`.
+  //
+  // When non-empty, `at` and `Query.range` must be unset — the server
+  // reconstructs global bounds from the values for Lance pre-filtering,
+  // then applies a per-segment post-filter for precision.
+  //
+  // Constraints (server returns `invalid_argument` on violation):
+  //   - `segment_ids` must be non-empty.
+  //   - `per_segment_values.len()` must equal `segment_ids.len()`.
+  //   - `segment_ids` must contain no duplicates.
+  //
+  // Each entry's values list corresponds to the segment at the same
+  // position in `segment_ids`. An empty values list for a segment means
+  // no temporal chunks are returned for that segment (only static data).
+  repeated IndexValueList per_segment_values = 4;
 
   reserved 3;
   reserved "fuzzy_descriptors";
+
+  // Reserved for a future `QueryAtMode mode` enum (LATEST_AT vs EXACT
+  // semantics). Tracked separately from this PR to keep scope narrow.
+  reserved 5;
+  reserved "mode";
 }
 
-/// A chunk-level range query, aka `RangeRelevantChunks`.
+// A list of index values for a single segment.
+// Used in `QueryLatestAt.per_segment_values`.
+message IndexValueList {
+  // The index values, in the units of the queried index column.
+  repeated int64 values = 1;
+}
+
+// A chunk-level range query, aka `RangeRelevantChunks`.
 //
 // This has the exact same semantics as the query of the same name on our `ChunkStore`.
 message QueryRange {
@@ -738,17 +1074,26 @@ message QueryRange {
 
   reserved 3;
   reserved "fuzzy_descriptors";
+
+  // Reserved for a future `repeated IndexValueList per_segment_values`
+  // (symmetric per-segment pushdown for range queries). See RR-4355.
+  reserved 4;
+  reserved "per_segment_values";
 }
 
+// Request for `FetchChunks`.
 message FetchChunksRequest {
-  // Information about the chunks to fetch. These dataframes have to include the following columns:
-  // * `chunk_id` - Chunk unique identifier
-  // * `segment_id` - segment this chunk belongs to. Currently needed as we pass this metadata back and forth
-  // * `segment_layer` - specific segment layer. Currently needed as we pass this metadata back and forth
-  // * `chunk_key` - chunk location details
+  // Information about the chunks to fetch, concatenated across parts.
+  //
+  // These are a subset of the columns of
+  // [`QueryDatasetDataframe`](crate::cloud::v1alpha1::ext::QueryDatasetDataframe), which pins
+  // their exact types.
+  // See [`Self::required_column_names`](crate::cloud::v1alpha1::FetchChunksRequest::required_column_names)
+  // for the required column names. Any other column is ignored.
   repeated rerun.common.v1alpha1.DataframePart chunk_infos = 1;
 }
 
+// One batch of chunks yielded by `FetchChunks`.
 message FetchChunksResponse {
   // Every gRPC response, even within the confines of a stream, involves HTTP2 overhead, which isn't
   // cheap by any means, which is why we're returning a batch of `ArrowMsg` rather than a single one.
@@ -757,25 +1102,41 @@ message FetchChunksResponse {
 
 // --- Table Apis ---
 
+// Request for `GetTableSchema`.
 message GetTableSchemaRequest {
+  // Deprecated: use x-rerun-entry-id header instead.
+  // This field should be dropped once all servers are updated
+  // to 0.14.x or later.
   rerun.common.v1alpha1.EntryId table_id = 1;
 }
 
+// Response for `GetTableSchema`.
 message GetTableSchemaResponse {
+  // Schema of the table.
   rerun.common.v1alpha1.Schema schema = 1;
 }
 
+// Request for `ScanTable`.
 message ScanTableRequest {
+  // Deprecated: use x-rerun-entry-id header instead.
+  // This field should be dropped once all servers are updated
+  // to 0.14.x or later.
   rerun.common.v1alpha1.EntryId table_id = 1;
+
   // TODO(jleibs): support ScanParameters iff we can plumb them into Datafusion TableProvider
   // Otherwise, just wait for Arrow Flight
   //rerun.common.v1alpha1.ScanParameters scan_parameters = 2;
 }
 
+// One batch of the table's contents, yielded by `ScanTable`.
 message ScanTableResponse {
+  // A consecutive run of the table's rows: the batches of one stream partition the rows, and
+  // concatenating them in arrival order yields the full scan result. The row order itself is
+  // only meaningful when the scan asked for one.
   rerun.common.v1alpha1.DataframePart dataframe_part = 1;
 }
 
+// How `WriteTable` folds new rows into an existing table.
 enum TableInsertMode {
   // Always reserve unspecified as default value
   TABLE_INSERT_MODE_UNSPECIFIED = 0;
@@ -788,30 +1149,51 @@ enum TableInsertMode {
 
   // Overwrite rows based on the rerun_table_index fields.
   TABLE_INSERT_MODE_REPLACE = 3;
+
+  // Update existing rows matched by rerun_table_index fields. Source rows that
+  // do not match any existing row are dropped. The source schema may be a
+  // subset of the table schema (only the key columns plus the columns to
+  // update). Maps to SQL `UPDATE`.
+  TABLE_INSERT_MODE_UPDATE = 4;
 }
 
+// One batch of rows pushed by `WriteTable`.
 message WriteTableRequest {
+  // The rows to write.
   rerun.common.v1alpha1.DataframePart dataframe_part = 1;
+
+  // How to fold these rows into the existing table.
   TableInsertMode insert_mode = 2;
 }
 
+// Response for `WriteTable`. Empty: an error is reported as a gRPC status instead.
 message WriteTableResponse {}
 
 // --- Maintenance ---
 
+// Request for `DoMaintenance`.
+//
+// Each field turns on one operation; no operation is on by default, so a request with every
+// field unset performs no maintenance and returns an empty report. (It may still do trivial
+// internal bookkeeping, such as creating the dataset's revision row on first contact.)
+//
+// `DoGlobalMaintenance` does not reuse these defaults: it constructs an explicit request per
+// dataset (index optimization, fragment compaction, and an age-bounded cleanup).
 message DoMaintenanceRequest {
-  // Optimize all builtin and user-defined indexes on this dataset.
+  // Optimize all builtin indexes on this dataset.
   //
   // This merges all individual index deltas back in the main index, improving runtime performance
   // of all indexes.
   bool optimize_indexes = 2;
 
-  // Retrain all user-defined indexes on this dataset from scratch.
+  // Fully consolidate every index on this dataset, ignoring the server's segment-count
+  // threshold that normally bounds how often indexes are merged.
   //
-  // This retrains all user-defined indexes from scratch for optimal runtime performance.
-  // This is faster than re-creating the indexes, and automatically keeps track of their configurations.
+  // This is the manual drain hammer for accumulated index segments and deferred index-remap
+  // (fragment-reuse) debt. Implies `optimize_indexes`.
   //
-  // This implies `optimize_indexes`.
+  // Historically this retrained user-defined vector indexes; those are gone, and the remaining
+  // builtin scalar indexes have no trained state — a retrain is exactly a full consolidation.
   bool retrain_indexes = 6;
 
   // Compact the underlying Lance fragments, for all Rerun Manifests.
@@ -829,6 +1211,12 @@ message DoMaintenanceRequest {
   // and https://docs.rs/lance/latest/lance/dataset/cleanup/fn.cleanup_old_versions.html
   google.protobuf.Timestamp cleanup_before = 4;
 
+  // List the replicated dataset in its object store, such as S3, and remove objects that are no
+  // longer present in the local dataset.
+  // This performs a full remote reconciliation, unlike normal cleanup, which only removes replica
+  // objects corresponding to local files deleted during that cleanup.
+  bool gc_object_store = 7;
+
   // Override default platform behavior and allow cleanup of recent files. This will respect
   // the value of `cleanup_before` timestamp even if it's more recent than 1 hour.
   //
@@ -839,13 +1227,16 @@ message DoMaintenanceRequest {
   reserved "dataset_id";
 }
 
+// Response for `DoMaintenance`.
 message DoMaintenanceResponse {
+  // Human-readable report of what the requested operations did.
   string report = 1;
 }
 
 // Request all maintenance operations to run on all datasets
 message DoGlobalMaintenanceRequest {}
 
+// Response for `DoGlobalMaintenance`. Empty: an error is reported as a gRPC status instead.
 message DoGlobalMaintenanceResponse {}
 
 // --- Tasks ---
@@ -859,6 +1250,8 @@ message QueryTasksRequest {
 // `QueryTasksResponse` is the response message for querying tasks status
 // encoded as a record batch
 message QueryTasksResponse {
+  // One row per queried task, describing its status, with the columns pinned by
+  // [`QueryTasksDataframe`](crate::cloud::v1alpha1::ext::QueryTasksDataframe).
   rerun.common.v1alpha1.DataframePart data = 1;
 }
 
@@ -867,6 +1260,7 @@ message QueryTasksResponse {
 message QueryTasksOnCompletionRequest {
   // Empty queries for all tasks if the server allows it.
   repeated rerun.common.v1alpha1.TaskId ids = 1;
+
   // Time limit for the server to wait for task completion.
   // The actual maximum time may be arbitrarily capped by the server.
   google.protobuf.Duration timeout = 2;
@@ -875,39 +1269,68 @@ message QueryTasksOnCompletionRequest {
 // `QueryTaskOnCompletionResponse` is the response message for querying tasks status
 // encoded as a record batch. This is a copy of `QueryTasksResponse`.
 message QueryTasksOnCompletionResponse {
+  // One row per queried task, describing its status, with the columns pinned by
+  // [`QueryTasksDataframe`](crate::cloud::v1alpha1::ext::QueryTasksDataframe).
   rerun.common.v1alpha1.DataframePart data = 1;
 }
+
+// `CancelTasksRequest` is the request message for cancelling a number of tasks
+message CancelTasksRequest {
+  // Unique identifiers for the tasks
+  repeated rerun.common.v1alpha1.TaskId ids = 1;
+}
+
+// `CancelTasksResponse` is the response message for cancelling a number of tasks
+message CancelTasksResponse {}
 
 // --- Catalog ---
 
 // FindEntries
 
+// Request for `FindEntries`.
 message FindEntriesRequest {
+  // Which entries to return. Send an empty `EntryFilter` (not an unset one) to get the
+  // server's default set of entry kinds: some servers reject an unset `filter` with
+  // `INVALID_ARGUMENT`, others treat it as an empty filter.
   EntryFilter filter = 1;
 }
 
+// Response for `FindEntries`.
 message FindEntriesResponse {
+  // The matching entries, in no particular order. The order is not even stable across two
+  // identical calls.
   repeated EntryDetails entries = 1;
 }
 
 // DeleteDatasetEntry
-
+//
+// The entry is identified by the `x-rerun-entry-id` header or the deprecated body `id`.
 message DeleteEntryRequest {
+  // Deprecated: use x-rerun-entry-id header instead.
+  // This field should be dropped once all servers are updated
+  // to 0.14.x or later.
   rerun.common.v1alpha1.EntryId id = 1;
 }
 
+// Response for `DeleteEntry`. Empty: an error is reported as a gRPC status instead.
 message DeleteEntryResponse {}
 
 // UpdateEntry
-
+//
+// The entry is identified by the `x-rerun-entry-id` header or the deprecated body `id`.
 message UpdateEntryRequest {
   // The entry to modify.
+  //
+  // Deprecated: use x-rerun-entry-id header instead.
+  // This field should be dropped once all servers are updated
+  // to 0.14.x or later.
   rerun.common.v1alpha1.EntryId id = 1;
 
   // The new values for updatable fields.
   EntryDetailsUpdate entry_details_update = 2;
 }
 
+// Response for `UpdateEntry`.
 message UpdateEntryResponse {
   // The updated entry details
   EntryDetails entry_details = 1;
@@ -915,11 +1338,14 @@ message UpdateEntryResponse {
 
 // CreateDatasetEntry
 
+// Request for `CreateDatasetEntry`.
 message CreateDatasetEntryRequest {
   // Name of the dataset entry to create.
   //
   // The name should be a short human-readable string. It must be unique within all entries in the catalog. If an entry
-  // with the same name already exists, the request will fail. Entry names ending with `__manifest` are reserved.
+  // with the same name already exists, the request will fail.
+  //
+  // Entry names ending with `__manifest` are reserved, though this is not currently enforced.
   optional string name = 1;
 
   // If specified, create the entry using this specific ID. Use at your own risk.
@@ -928,12 +1354,15 @@ message CreateDatasetEntryRequest {
   //TODO(ab): add IfExistingBehavior?
 }
 
+// Response for `CreateDatasetEntry`.
 message CreateDatasetEntryResponse {
+  // The dataset entry that was created.
   DatasetEntry dataset = 1;
 }
 
 // CreateTableEntry
 
+// Request for `CreateTableEntry`.
 message CreateTableEntryRequest {
   // Name of the dataset entry to create.
   //
@@ -954,31 +1383,44 @@ message CreateTableEntryRequest {
   rerun.common.v1alpha1.Schema schema = 3;
 }
 
+// Response for `CreateTableEntry`.
 message CreateTableEntryResponse {
+  // The table entry that was created.
   TableEntry table = 1;
 }
 
 // ReadDatasetEntry
 
+// Request for `ReadDatasetEntry`.
+//
+// The dataset is identified by the standard dataset headers (see the `Headers` section at the top of this file).
 message ReadDatasetEntryRequest {
   reserved 1;
   reserved "id";
 }
 
+// Response for `ReadDatasetEntry`.
 message ReadDatasetEntryResponse {
+  // The dataset entry that was read.
   DatasetEntry dataset = 1;
 }
 
 // UpdateDatasetEntry
-
+//
+// This endpoint requires the standard dataset headers (see the `Headers` section at the top of this file).
 message UpdateDatasetEntryRequest {
   // The dataset to modify.
+  //
+  // Deprecated: use x-rerun-entry-id header instead.
+  // This field should be dropped once all servers are updated
+  // to 0.14.x or later.
   rerun.common.v1alpha1.EntryId id = 1;
 
   // The new values.
   DatasetDetails dataset_details = 2;
 }
 
+// Response for `UpdateDatasetEntry`.
 message UpdateDatasetEntryResponse {
   // The updated dataset entry
   DatasetEntry dataset = 1;
@@ -986,6 +1428,7 @@ message UpdateDatasetEntryResponse {
 
 // RegisterTable
 
+// Request for `RegisterTable`.
 message RegisterTableRequest {
   // Name of the table entry to create.
   //
@@ -995,32 +1438,79 @@ message RegisterTableRequest {
 
   // Information about the table to register.
   //
-  // This must be encoded message of one one of the following supported types:
+  // This must be encoded message of one of the following supported types:
   // - LanceTable
   google.protobuf.Any provider_details = 2;
 
   //TODO(ab): add IfExistingBehavior?
 }
 
+// Response for `RegisterTable`.
 message RegisterTableResponse {
   // Details about the table that was created and registered.
   TableEntry table_entry = 1;
 }
 
 // ReadTableEntry
-
+//
+// The table is identified by the `x-rerun-entry-id` header or the deprecated body `id`.
 message ReadTableEntryRequest {
+  // Deprecated: use x-rerun-entry-id header instead.
+  // This field should be dropped once all servers are updated
+  // to 0.14.x or later.
   rerun.common.v1alpha1.EntryId id = 1;
 }
 
+// Response for `ReadTableEntry`.
 message ReadTableEntryResponse {
+  // The table entry that was read.
   TableEntry table = 1;
 }
 
+// UpdateTableEntry
+
+// Request for `UpdateTableEntry`.
+message UpdateTableEntryRequest {
+  // The table to modify.
+  //
+  // Deprecated: use the x-rerun-entry-id header instead. This field is only a fallback for
+  // clients that predate header-based addressing on this endpoint.
+  rerun.common.v1alpha1.EntryId id = 1;
+
+  // The new values.
+  TableDetails table_details = 2;
+}
+
+// Response for `UpdateTableEntry`.
+message UpdateTableEntryResponse {
+  // The updated table entry.
+  TableEntry table = 1;
+}
+
+// Narrows `FindEntries` down to a subset of the catalog. Every set field must match (logical
+// AND).
+//
+// A filter with no field set is *not* match-everything: it falls back to the default kind set
+// described on `entry_kinds`. A malformed `id` or `name` matches nothing rather than erroring.
+// `name` matching is exact and case-sensitive.
 message EntryFilter {
+  // Only match the entry with this ID.
   optional rerun.common.v1alpha1.EntryId id = 1;
+
+  // Only match the entry with this exact name.
   optional string name = 2;
+
+  // Deprecated: use `entry_kinds` instead. Ignored by servers when `entry_kinds` is non-empty.
   optional EntryKind entry_kind = 3;
+
+  // The entry kinds to include. If non-empty, the server returns exactly entries of these kinds
+  // (ENTRY_KIND_UNSPECIFIED is rejected with an `invalid_argument` error).
+  //
+  // It is recommended to always explicitly ask for a set of entry kinds.
+  // When unset the server returns a default set of kinds to ensure backwards compatibility with
+  // old clients that did not set this. This behavior may be dropped in future releases.
+  // (condition: after rerun-sdk 0.34 is out of its support cycle)
+  repeated EntryKind entry_kinds = 4;
 }
 
 // What type of entry. This has strong implication on which APIs are available for this entry.
@@ -1031,13 +1521,26 @@ enum EntryKind {
   // Order as TYPE, TYPE_VIEW so things stay consistent as we introduce new types.
   ENTRY_KIND_DATASET = 1;
 
+  // A view over a dataset.
+  //
+  // Reserved: no server currently creates entries of this kind. Filtering for it is legal and
+  // returns no entries.
   ENTRY_KIND_DATASET_VIEW = 2;
 
+  // A table.
   ENTRY_KIND_TABLE = 3;
 
+  // A view over a table.
+  //
+  // Reserved: no server currently creates entries of this kind. Filtering for it is legal and
+  // returns no entries.
   ENTRY_KIND_TABLE_VIEW = 4;
 
+  // A dataset holding the blueprints of another entry.
   ENTRY_KIND_BLUEPRINT_DATASET = 5;
+
+  // A dataset holding the static assets shared by another dataset's segments.
+  ENTRY_KIND_ASSET_DATASET = 6;
 }
 
 // Minimal info about an Entry for high-level catalog summary
@@ -1051,7 +1554,10 @@ message EntryDetails {
   // The kind of entry
   EntryKind entry_kind = 3;
 
+  // When this entry was created.
   google.protobuf.Timestamp created_at = 4;
+
+  // When this entry was last modified. See `TouchDatasetEntry` on the internal Catalog API.
   google.protobuf.Timestamp updated_at = 5;
 }
 
@@ -1061,21 +1567,44 @@ message EntryDetailsUpdate {
   optional string name = 2;
 }
 
+// The dataset-specific part of a `DatasetEntry`. Updatable with `UpdateDatasetEntry`.
 message DatasetDetails {
   // The blueprint dataset associated with this dataset (if any).
+  // This association is owned for lifecycle purposes: deleting this dataset also deletes the associated blueprint dataset.
+  //
+  // Client-owned, unlike [`DatasetDetails::asset_dataset`]: leaving this unset in
+  // `UpdateDatasetEntry` clears the reference, and the dataset keeps working without a blueprint.
   optional rerun.common.v1alpha1.EntryId blueprint_dataset = 3;
 
   // The segment of the blueprint dataset corresponding to the default blueprint (if any).
   optional rerun.common.v1alpha1.SegmentId default_blueprint_segment = 5;
 
+  // The segment of the blueprint dataset corresponding to the default blueprint for this dataset's
+  // segment table (if any).
+  optional rerun.common.v1alpha1.SegmentId default_segment_table_blueprint_segment = 6;
+
+  // The asset dataset associated with this dataset (if any).
+  // This association is owned for lifecycle purposes: deleting this dataset also deletes the associated asset dataset.
+  //
+  // Server-managed, unlike [`DatasetDetails::blueprint_dataset`], because a recording dataset is
+  // never meant to be without an asset dataset. Leaving this unset in `UpdateDatasetEntry` keeps
+  // the stored reference, and the server re-attaches or re-creates the asset dataset if that
+  // reference is missing or dangling (recordings created before asset datasets existed have
+  // none). Set it to move the entry to a different asset dataset. Blueprint and asset datasets
+  // are not recordings, so none of this applies to them: there, unsetting clears the field like
+  // any other.
+  optional rerun.common.v1alpha1.EntryId asset_dataset = 7;
+
   reserved 4;
   reserved "default_blueprint";
 }
 
+// Everything the catalog knows about one dataset.
 message DatasetEntry {
   reserved 3;
   reserved "blueprint_dataset";
 
+  // The kind-agnostic part, shared with every other entry kind.
   EntryDetails details = 1;
 
   // Dataset-specific information, may be update with `UpdateDatasetEntry`
@@ -1085,26 +1614,51 @@ message DatasetEntry {
   rerun.common.v1alpha1.DatasetHandle dataset_handle = 2;
 }
 
+// The table-specific part of a `TableEntry`. Updatable with `UpdateTableEntry`.
+message TableDetails {
+  // Blueprint dataset associated with this table.
+  // This association is owned for lifecycle purposes: deleting this table also deletes the associated blueprint dataset.
+  //
+  // Like recording datasets, tables get an associated blueprint dataset automatically when they are created.
+  //
+  // Server-managed on `UpdateTableEntry`: leaving it unset keeps the stored association instead of clearing it, and creates
+  // the blueprint dataset if the table does not have one yet.
+  optional rerun.common.v1alpha1.EntryId blueprint_dataset = 1;
+
+  // Segment of the blueprint dataset corresponding to the default table blueprint.
+  optional rerun.common.v1alpha1.SegmentId default_blueprint_segment = 2;
+}
+
+// Everything the catalog knows about one table.
 message TableEntry {
+  // The kind-agnostic part, shared with every other entry kind.
   EntryDetails details = 1;
 
   // Details specific to the table-provider
   google.protobuf.Any provider_details = 3;
 
+  // Table-specific information, may be updated with `UpdateTableEntry`.
+  TableDetails table_details = 4;
+
   reserved 2;
   reserved "schema";
 }
 
+// Which built-in table a `SystemTable` refers to.
 enum SystemTableKind {
   // Always reserve unspecified as default value
   SYSTEM_TABLE_KIND_UNSPECIFIED = 0;
+
   // Not used yet
   SYSTEM_TABLE_KIND_NAMESPACES = 1;
+
   // All of the entries in the associated namespace
   SYSTEM_TABLE_KIND_ENTRIES = 2;
 }
 
+// A built-in table maintained by the server rather than registered by a user.
 message SystemTable {
+  // Which built-in table this is.
   SystemTableKind kind = 1;
 }
 
@@ -1118,4 +1672,70 @@ message LanceTable {
 message DebugInfo {
   // The amount of memory used by the task or service call in bytes
   optional uint64 memory_used = 1;
+}
+
+// `ChunkKey` provides chunk location details in the data store.
+//
+// Returned by `QueryDataset` (in the `chunk_key` Arrow column) and forwarded
+// back to the server on `FetchChunks`. The `location` payload is opaque and
+// interpreted per `data_source_kind` (e.g. `RrdChunkLocation` for RRD).
+message ChunkKey {
+  // Chunk unique identifier
+  rerun.common.v1alpha1.Tuid chunk_id = 1;
+
+  // What type of partition is this, rrd, mcap, etc.
+  // This information determines how to interpret the `location` payload.
+  DataSourceKind data_source_kind = 2;
+
+  // The location of the chunk in the data store. Opaque bytes; readers
+  // decode based on `data_source_kind`.
+  optional bytes location = 3;
+
+  // ETag of the source object (segment) as observed at registration time.
+  //
+  // Optional: legacy registrations and stores that do not return an ETag
+  // leave this unset.
+  optional string etag = 4;
+
+  // Wall-clock registration time of the parent segment (nanoseconds since
+  // the Unix epoch), as recorded in the dataset manifest.
+  //
+  // Diagnostic only: not used as a precondition. Lets a client correlate a
+  // decode failure on a stale chunk handle with a subsequent re-registration
+  // event without consulting the dataset manifest. Optional: legacy
+  // registrations leave this unset.
+  optional int64 registration_time_nanos = 5;
+}
+
+// RRD-specific decoding of `ChunkKey.location`.
+message RrdChunkLocation {
+  // Where the chunk is stored (e.g. s3://bucket/file, file:///path/to/file).
+  optional string url = 1;
+
+  // Byte offset of the chunk within the data source.
+  optional uint64 offset = 2;
+
+  // Chunk length in bytes.
+  optional uint64 length = 3;
+}
+
+// `RrdManifestKey` points at an encoded `rerun.log_msg.v1alpha1.RrdFooter` payload in the object store.
+message RrdManifestKey {
+  // The canonical location of the footer payload (e.g. s3://bucket/file).
+  RrdChunkLocation location = 1;
+
+  // The segment layer whose manifest is stored in this footer.
+  optional string layer = 2;
+
+  // ETag of the source object (the layer's RRD file) as observed at registration time.
+  //
+  // Clients should pass this as an `If-Match` precondition when fetching, so that a concurrent
+  // re-registration results in a clean failure (HTTP 412) instead of decoding garbage from a
+  // mismatched byte range.
+  //
+  // Optional: legacy registrations and stores that do not return an ETag leave this unset.
+  optional string etag = 3;
+
+  // Presigned URL the client fetches the manifest's byte range from.
+  optional string direct_url = 4;
 }

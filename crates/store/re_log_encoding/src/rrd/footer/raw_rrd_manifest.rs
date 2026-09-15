@@ -4,16 +4,18 @@ use arrow::array::RecordBatch;
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::Field;
 use arrow::{
-    array::{BinaryArray, BooleanArray, FixedSizeBinaryArray, StringArray, UInt64Array},
+    array::{BooleanArray, UInt64Array},
     error::ArrowError,
 };
 use itertools::Itertools as _;
 use re_chunk::external::nohash_hasher::IntMap;
 use re_chunk::external::re_byte_size;
 use re_chunk::{ArchetypeName, ChunkError, ChunkId, ComponentIdentifier, ComponentType, Timeline};
-use re_log_types::external::re_tuid::Tuid;
-use re_log_types::{AbsoluteTimeRange, EntityPath, StoreId, TimeType};
-use re_types_core::ComponentDescriptor;
+use re_log_types::{AbsoluteTimeRange, EntityPath, StoreId, TimeType, TimelineName};
+use re_types_core::{
+    ComponentDescriptor, FIELD_METADATA_KEY_ARCHETYPE, FIELD_METADATA_KEY_COMPONENT,
+    FIELD_METADATA_KEY_COMPONENT_TYPE,
+};
 
 use crate::{CodecError, CodecResult, Decodable as _, StreamFooterEntry, ToApplication as _};
 
@@ -121,8 +123,10 @@ use crate::{CodecError, CodecResult, Decodable as _, StreamFooterEntry, ToApplic
 ///   compression enabled, these sizes are therefore compressed. For a backend that doesn't do any
 ///   kind of compression, such as the OSS server that stores everything already decoded in memory,
 ///   these sizes will correspond to heap memory usage.
-/// * `chunk_byte_size_uncompressed` always corresponds to the size on the heap that the data would
-///   require once fully decoded, regardless of the backend.
+/// * `chunk_byte_size_uncompressed` reports the chunk's uncompressed size, whose exact meaning
+///   depends on the writer: the length of the uncompressed Arrow IPC stream when written to an RRD
+///   file, and the decoded heap size when synthesized in memory
+///   (see [`RawRrdManifest::build_in_memory_from_chunks`]).
 /// * `chunk_key`, if specified, should always be used to fetch the associated data.
 ///
 /// ## A note on filtering
@@ -133,7 +137,7 @@ use crate::{CodecError, CodecResult, Decodable as _, StreamFooterEntry, ToApplic
 /// which in turn will affect the Sorbet schema of the recording too.
 ///
 /// Filtering RRD manifests is very non trivial and should only be performed with great care.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
 pub struct RawRrdManifest {
     /// The recording ID that was used to identify the original recording.
     ///
@@ -166,26 +170,11 @@ pub struct RawRrdManifest {
     pub data: arrow::array::RecordBatch,
 }
 
-impl re_byte_size::SizeBytes for RawRrdManifest {
-    fn heap_size_bytes(&self) -> u64 {
-        re_tracing::profile_function!();
-
-        let Self {
-            store_id,
-            sorbet_schema,
-            sorbet_schema_sha256: _,
-            data,
-        } = self;
-
-        store_id.heap_size_bytes() + sorbet_schema.heap_size_bytes() + data.heap_size_bytes()
-    }
-}
-
 /// A map based representation of the static data within an [`RawRrdManifest`].
 pub type RrdManifestStaticMap = IntMap<EntityPath, IntMap<ComponentIdentifier, ChunkId>>;
 
 /// The individual entries in an [`RrdManifestTemporalMap`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, re_byte_size::SizeBytes)]
 pub struct RrdManifestTemporalMapEntry {
     /// The time range covered by this entry.
     pub time_range: AbsoluteTimeRange,
@@ -195,17 +184,6 @@ pub struct RrdManifestTemporalMapEntry {
     /// At most, this is the same as the number of rows in the chunk as a whole. For a specific
     /// entry it might be less, since chunks allow sparse components.
     pub num_rows: u64,
-}
-
-impl re_byte_size::SizeBytes for RrdManifestTemporalMapEntry {
-    fn heap_size_bytes(&self) -> u64 {
-        0
-    }
-
-    #[inline]
-    fn is_pod() -> bool {
-        true
-    }
 }
 
 /// A map based representation of the temporal data within an [`RawRrdManifest`].
@@ -226,14 +204,20 @@ pub struct RrdManifestSha256(pub [u8; 32]);
 
 impl std::fmt::Display for RrdManifestSha256 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!(
-            "RrdManifest#{}",
-            self.0
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>(),
-        ))
+        write!(f, "RrdManifest#{}", sha256_to_hex(&self.0))
     }
+}
+
+/// Format a SHA256 hash as a lowercase hex string.
+pub fn sha256_to_hex(sha256: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    sha256
+        .iter()
+        .fold(String::with_capacity(2 * sha256.len()), |mut hex, byte| {
+            write!(hex, "{byte:02x}").ok();
+            hex
+        })
 }
 
 impl RawRrdManifest {
@@ -281,6 +265,100 @@ impl RawRrdManifest {
             sorbet_schema_sha256: first.sorbet_schema_sha256,
             data,
         })
+    }
+
+    /// Returns this manifest without the chunks logged under `__properties`.
+    ///
+    /// An asset joins the store of the segment that references it, where its own recording
+    /// properties would take the place of that segment's.
+    pub fn without_recording_properties(self) -> CodecResult<Self> {
+        re_tracing::profile_function!();
+
+        let keep: BooleanArray = self
+            .col_chunk_entity_path()?
+            .iter()
+            .map(|entity_path| Some(!EntityPath::parse_forgiving(entity_path).is_property()))
+            .collect();
+
+        if keep.true_count() == keep.len() {
+            return Ok(self);
+        }
+
+        let data = arrow::compute::filter_record_batch(&self.data, &keep)
+            .map_err(CodecError::ArrowDeserialization)?;
+
+        Ok(Self { data, ..self })
+    }
+
+    /// Merges multiple manifests into one, tolerating schema differences.
+    ///
+    /// Unlike [`Self::concat`] — which requires identical schemas and `store_id`s — this allows
+    /// each input to carry its own schema. Fields that exist in some manifests but not others are
+    /// padded with nulls during merging. Sorbet schemas are unified via
+    /// [`arrow::datatypes::Schema::try_merge`] and the hash is recomputed.
+    ///
+    /// The resulting manifest's `store_id` is set to the provided value — the individual inputs'
+    /// `store_id`s are ignored, since this method is designed for cases where the inputs come from
+    /// distinct recordings (e.g. per-layer manifests being merged into a segment-scoped one).
+    ///
+    /// The `:has_static_data` and `:num_rows` columns are non-nullable in the `RawRrdManifest`
+    /// contract: cross-layer null values are collapsed to the underlying buffer default
+    /// (`false` / `0`) so that clients get the same shape regardless of whether a column came
+    /// from one layer or many. This mirrors what `ExtendedRrdManifest::try_into_standard_manifest`
+    /// does on the commercial side.
+    pub fn merge(store_id: StoreId, manifests: Vec<Self>) -> CodecResult<Self> {
+        re_tracing::profile_function!();
+
+        if manifests.is_empty() {
+            return Err(CodecError::ArrowDeserialization(
+                ArrowError::InvalidArgumentError("cannot merge 0 manifests".to_owned()),
+            ));
+        }
+
+        let parts: Vec<_> = manifests
+            .into_iter()
+            .map(|m| (m.sorbet_schema, m.data))
+            .collect();
+
+        let (sorbet_schema, sorbet_schema_sha256, data) = Self::merge_polymorphic_parts(parts)?;
+
+        let data = strip_null_mask_on_default_columns(data)?;
+
+        Ok(Self {
+            store_id,
+            sorbet_schema,
+            sorbet_schema_sha256,
+            data,
+        })
+    }
+
+    /// Polymorphic-merge kernel: unify sorbet schemas and concatenate data batches.
+    ///
+    /// Takes one `(sorbet_schema, data_batch)` pair per logical input manifest, and returns
+    /// `(merged_sorbet_schema, merged_sha256, merged_data_batch)`.
+    pub fn merge_polymorphic_parts(
+        parts: Vec<(arrow::datatypes::Schema, RecordBatch)>,
+    ) -> CodecResult<(arrow::datatypes::Schema, [u8; 32], RecordBatch)> {
+        use re_arrow_util::{RecordBatchExt as _, concat_polymorphic_batches};
+
+        let (sorbet_schemas, data_batches): (Vec<_>, Vec<_>) = parts.into_iter().unzip();
+
+        let sorbet_schema = arrow::datatypes::Schema::try_merge(sorbet_schemas)
+            .map_err(CodecError::ArrowDeserialization)?;
+        let sorbet_schema_sha256 = Self::compute_sorbet_schema_sha256(&sorbet_schema)
+            .map_err(CodecError::ArrowSerialization)?;
+
+        // Make all fields nullable so `concat_polymorphic_batches` can backfill missing columns
+        // with nulls.
+        let nullable_batches: Vec<RecordBatch> = data_batches
+            .into_iter()
+            .map(|b| b.make_nullable())
+            .collect();
+
+        let data = concat_polymorphic_batches(&nullable_batches)
+            .map_err(CodecError::ArrowDeserialization)?;
+
+        Ok((sorbet_schema, sorbet_schema_sha256, data))
     }
 
     /// High-level helper to parse [`RawRrdManifest`]s from raw RRD bytes.
@@ -339,13 +417,12 @@ impl RawRrdManifest {
 
             let rrd_footer =
                 re_protos::log_msg::v1alpha1::RrdFooter::from_rrd_bytes(rrd_footer_bytes)?;
-            manifests.extend(
-                rrd_footer
-                    .manifests
-                    .iter()
-                    .map(|manifest| manifest.to_application(()))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            let new_manifests: Vec<_> = rrd_footer
+                .manifests
+                .iter()
+                .map(|manifest| manifest.to_application(()))
+                .try_collect()?;
+            manifests.extend(new_manifests);
         }
 
         Ok(manifests)
@@ -371,10 +448,8 @@ impl RawRrdManifest {
             use re_byte_size::SizeBytes as _;
             let byte_size_uncompressed = chunk.heap_size_bytes();
 
-            let uncompressed_byte_span = re_span::Span {
-                start: offset,
-                len: byte_size_uncompressed,
-            };
+            let uncompressed_byte_span =
+                re_span::Span::from_start_len(offset, byte_size_uncompressed);
 
             offset += byte_size_uncompressed;
 
@@ -425,25 +500,24 @@ impl RawRrdManifest {
 
         let mut per_entity: RrdManifestStaticMap = IntMap::default();
 
-        let chunk_ids = self.col_chunk_id()?;
-        let chunk_entity_paths = self.col_chunk_entity_path()?;
-        let chunk_is_static = self.col_chunk_is_static()?;
+        let chunk_ids = self.col_chunk_id_iter()?;
+        let chunk_entity_paths = self.col_chunk_entity_path_iter()?;
+        let chunk_is_static = self.col_chunk_is_static_iter()?;
 
-        let has_static_component_data =
-            itertools::izip!(self.data.schema_ref().fields().iter(), self.data.columns(),)
-                .filter(|(f, _c)| f.name().ends_with(":has_static_data"))
+        let has_static_component_data: Vec<_> =
+            itertools::izip!(self.data.schema_ref().fields(), self.data.columns(),)
+                .filter(|(f, _c)| Self::is_index_has_static_data(f))
                 .map(|(f, c)| {
-                    c.downcast_array_ref::<arrow::array::BooleanArray>()
-                        .ok_or_else(|| {
+                    c.try_downcast_array_ref::<arrow::array::BooleanArray>()
+                        .map_err(|err| {
                             CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                                "'{}' should be a BooleanArray, but it's a {} instead",
+                                "cannot downcast column '{}': {err}",
                                 f.name(),
-                                c.data_type(),
                             )))
                         })
                         .map(|c| (f, c))
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .try_collect()?;
 
         for (i, (chunk_id, is_static, entity_path)) in
             itertools::izip!(chunk_ids, chunk_is_static, chunk_entity_paths).enumerate()
@@ -458,7 +532,7 @@ impl RawRrdManifest {
                     continue;
                 }
 
-                let Some(component) = f.metadata().get("rerun:component") else {
+                let Some(component) = f.metadata().get(FIELD_METADATA_KEY_COMPONENT) else {
                     return Err(CodecError::from(ChunkError::Malformed {
                         reason: format!(
                             "column '{}' is missing rerun:component metadata",
@@ -466,7 +540,11 @@ impl RawRrdManifest {
                         ),
                     }));
                 };
-                let component = ComponentIdentifier::new(component);
+                let component = ComponentIdentifier::try_new(component).map_err(|err| {
+                    CodecError::from(ChunkError::Malformed {
+                        reason: err.to_string(),
+                    })
+                })?;
 
                 let per_component = per_entity.entry(entity_path.clone()).or_default();
 
@@ -494,17 +572,21 @@ impl RawRrdManifest {
             .iter()
             .filter_map(|f| {
                 f.metadata()
-                    .get("rerun:index")
-                    .and_then(|index| f.metadata().get("rerun:component").map(|c| (index, c, f)))
+                    .get(Self::FIELD_METADATA_KEY_INDEX)
+                    .and_then(|index| {
+                        f.metadata()
+                            .get(FIELD_METADATA_KEY_COMPONENT)
+                            .map(|c| (index, c, f))
+                    })
             })
-            .filter(|(_index, _component, field)| field.name().ends_with(":start"))
+            .filter(|(_index, _component, field)| Self::is_index_start(field))
             .collect_vec();
 
         let mut per_entity: RrdManifestTemporalMap = Default::default();
 
-        let chunk_ids = self.col_chunk_id()?;
-        let chunk_entity_paths = self.col_chunk_entity_path()?;
-        let chunk_is_static = self.col_chunk_is_static()?;
+        let chunk_ids = self.col_chunk_id_iter()?;
+        let chunk_entity_paths = self.col_chunk_entity_path_iter()?;
+        let chunk_is_static = self.col_chunk_is_static_iter()?;
 
         struct IndexColumns<'a> {
             index: &'a str,
@@ -520,62 +602,42 @@ impl RawRrdManifest {
             col_num_rows_raw: &'a [u64],
         }
 
-        let mut columns_per_index = HashMap::<String, IndexColumns<'_>>::new();
+        // Two descriptors that share a component identifier but differ in type or archetype get
+        // two sets of columns with the same names, so a column is matched to its `:start` field
+        // by its full metadata, never by name or by `rerun:component` alone.
+        let sibling = |field: &Field, marker: &str| {
+            itertools::izip!(fields, columns)
+                .find(|(f, _col)| {
+                    Self::has_index_marker(f, marker) && f.metadata() == field.metadata()
+                })
+                .ok_or_else(|| {
+                    CodecError::from(ChunkError::Malformed {
+                        reason: format!("{marker} index is missing for {}", field.name()),
+                    })
+                })
+        };
+
+        let mut columns_per_index = Vec::<IndexColumns<'_>>::new();
         for (index, component, field) in indexes {
             let index = index.as_str();
-            if index == "rerun:static" {
+            if index == Self::INDEX_NAME_STATIC {
                 continue;
             }
 
-            pub fn get_index_name(field: &arrow::datatypes::Field) -> Option<&str> {
-                field.metadata().get("rerun:index").map(|s| s.as_str())
-            }
-
-            pub fn is_specific_index(field: &arrow::datatypes::Field, index_name: &str) -> bool {
-                get_index_name(field) == Some(index_name)
-            }
-
-            let Some((_, col_start)) = itertools::izip!(fields, columns).find(|(f, _col)| {
-                is_specific_index(f, index)
-                    && f.name().ends_with(":start")
-                    && f.metadata().get("rerun:component") == Some(component)
-            }) else {
-                return Err(CodecError::from(ChunkError::Malformed {
-                    reason: format!("start index is missing for {component}"),
-                }));
-            };
-            let Some((_, col_end)) = itertools::izip!(fields, columns).find(|(f, _col)| {
-                is_specific_index(f, index)
-                    && f.name().ends_with(":end")
-                    && f.metadata().get("rerun:component") == Some(component)
-            }) else {
-                return Err(CodecError::from(ChunkError::Malformed {
-                    reason: format!("end index is missing for {component}"),
-                }));
-            };
-            let Some((field_num_rows, col_num_rows)) =
-                itertools::izip!(fields, columns).find(|(f, _col)| {
-                    is_specific_index(f, index)
-                        && f.name().ends_with(":num_rows")
-                        && f.metadata().get("rerun:component") == Some(component)
-                })
-            else {
-                return Err(CodecError::from(ChunkError::Malformed {
-                    reason: format!("num_rows index is missing for {component}"),
-                }));
-            };
+            let (_, col_start) = sibling(field, Self::INDEX_MARKER_START)?;
+            let (_, col_end) = sibling(field, Self::INDEX_MARKER_END)?;
+            let (field_num_rows, col_num_rows) = sibling(field, Self::INDEX_MARKER_NUM_ROWS)?;
 
             let (time_type, col_start_raw) =
                 TimeType::from_arrow_array(col_start).map_err(CodecError::ArrowDeserialization)?;
             let (_, col_end_raw) =
                 TimeType::from_arrow_array(col_end).map_err(CodecError::ArrowDeserialization)?;
             let col_num_rows_raw: &[u64] = col_num_rows
-                .downcast_array_ref::<UInt64Array>()
-                .ok_or_else(|| {
+                .try_downcast_array_ref::<UInt64Array>()
+                .map_err(|err| {
                     CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                        "'{}' should be a BooleanArray, but it's a {} instead",
+                        "cannot downcast column '{}': {err}",
                         field_num_rows.name(),
-                        col_num_rows.data_type(),
                     )))
                 })?
                 .values();
@@ -590,19 +652,16 @@ impl RawRrdManifest {
                 .cloned()
                 .unwrap_or_else(|| NullBuffer::new_valid(col_end.len()));
 
-            columns_per_index.insert(
-                field.name().to_owned(),
-                IndexColumns {
-                    index,
-                    component,
-                    time_type,
-                    col_start_nulls,
-                    col_start_raw,
-                    col_end_nulls,
-                    col_end_raw,
-                    col_num_rows_raw,
-                },
-            );
+            columns_per_index.push(IndexColumns {
+                index,
+                component,
+                time_type,
+                col_start_nulls,
+                col_start_raw,
+                col_end_nulls,
+                col_end_raw,
+                col_num_rows_raw,
+            });
         }
 
         for (i, (chunk_id, is_static, entity_path)) in
@@ -612,7 +671,7 @@ impl RawRrdManifest {
                 continue;
             }
 
-            for columns in columns_per_index.values() {
+            for columns in &columns_per_index {
                 let IndexColumns {
                     index,
                     component,
@@ -628,8 +687,12 @@ impl RawRrdManifest {
                     continue;
                 }
 
-                let component = ComponentIdentifier::new(component);
-                let timeline = Timeline::new(*index, *time_type);
+                let component = ComponentIdentifier::try_new(component).map_err(|err| {
+                    CodecError::from(ChunkError::Malformed {
+                        reason: err.to_string(),
+                    })
+                })?;
+                let timeline = Timeline::new(TimelineName::try_new(*index)?, *time_type);
 
                 let per_timeline = per_entity.entry(entity_path.clone()).or_default();
                 let per_component = per_timeline.entry(timeline).or_default();
@@ -678,6 +741,144 @@ impl PartialEq for RawRrdManifest {
                     .sorted_by_key(|f| f.name());
                 itertools::izip!(sorted_fields, other_sorted_fields).all(|(f1, f2)| f1 == f2)
             }
+    }
+}
+
+// Index-column helpers.
+//
+// Rerun index columns are tagged with `rerun:*` metadata keys that describe what kind of index
+// they represent (static vs temporal, sequence vs timestamp, per-component or global). The marker
+// (`start`, `end`, `num_rows`, …) is the last `:`-separated part of the column name. These
+// helpers centralize the conventions so downstream code doesn't reach into names or metadata.
+impl RawRrdManifest {
+    /// Field metadata key holding the index name an index column belongs to.
+    const FIELD_METADATA_KEY_INDEX: &str = "rerun:index";
+
+    /// Field metadata key holding the index kind (`"sequence"`, `"timestamp"`, `"duration"`).
+    const FIELD_METADATA_KEY_INDEX_KIND: &str = "rerun:index_kind";
+
+    /// Field metadata key holding the index marker in the Segment Manifest schema, where the RRD
+    /// manifest encodes it as the column name's last `:`-separated part instead.
+    const FIELD_METADATA_KEY_INDEX_MARKER: &str = "rerun:index_marker";
+
+    /// The `rerun:index` value of the static-data pseudo-index.
+    ///
+    /// The Segment Manifest schema tags the same columns with [`Self::INDEX_NAME_STATIC_SEGMENT_MANIFEST`] instead.
+    const INDEX_NAME_STATIC: &str = "rerun:static";
+
+    /// The Segment Manifest's `rerun:index` value of the static-data pseudo-index.
+    const INDEX_NAME_STATIC_SEGMENT_MANIFEST: &str = "static";
+
+    const INDEX_MARKER_START: &str = "start";
+    const INDEX_MARKER_END: &str = "end";
+    const INDEX_MARKER_NUM_ROWS: &str = "num_rows";
+    const INDEX_MARKER_HAS_DATA: &str = "has_data";
+    const INDEX_MARKER_HAS_STATIC_DATA: &str = "has_static_data";
+
+    /// The Segment Manifest's global chunk-length column; the RRD manifest has no such column.
+    const INDEX_MARKER_LEN: &str = "len";
+
+    /// `true` if the field is a Rerun index column (temporal or static).
+    pub fn is_index(field: &Field) -> bool {
+        field
+            .metadata()
+            .contains_key(Self::FIELD_METADATA_KEY_INDEX)
+    }
+
+    /// The component identifier of a per-component index column, if it is one.
+    pub fn get_component(field: &Field) -> Option<&str> {
+        field
+            .metadata()
+            .get(FIELD_METADATA_KEY_COMPONENT)
+            .map(|s| s.as_str())
+    }
+
+    /// The component type of a per-component index column, if its descriptor has one.
+    pub fn get_component_type(field: &Field) -> Option<&str> {
+        field
+            .metadata()
+            .get(FIELD_METADATA_KEY_COMPONENT_TYPE)
+            .map(|s| s.as_str())
+    }
+
+    /// `true` if the field is a per-component index column (as opposed to a global one).
+    pub fn is_index_per_component(field: &Field) -> bool {
+        field.metadata().contains_key(FIELD_METADATA_KEY_COMPONENT)
+    }
+
+    /// The index name (e.g. `"frame_nr"`, `"log_time"`, `"static"`) for a field, if any.
+    pub fn get_index_name(field: &Field) -> Option<&str> {
+        field
+            .metadata()
+            .get(Self::FIELD_METADATA_KEY_INDEX)
+            .map(|s| s.as_str())
+    }
+
+    /// The index kind (`"sequence"`, `"timestamp"`, `"duration"`) for a field, if any.
+    pub fn get_index_kind(field: &Field) -> Option<&str> {
+        field
+            .metadata()
+            .get(Self::FIELD_METADATA_KEY_INDEX_KIND)
+            .map(|s| s.as_str())
+    }
+
+    /// `true` if the field is a Rerun index column with the given name.
+    pub fn is_specific_index(field: &Field, index_name: &str) -> bool {
+        Self::get_index_name(field) == Some(index_name)
+    }
+
+    /// `true` if the field belongs to the static-data pseudo-index, in either the RRD manifest or
+    /// the Segment Manifest schema.
+    pub fn is_index_static(field: &Field) -> bool {
+        Self::get_index_name(field).is_some_and(|name| {
+            name == Self::INDEX_NAME_STATIC || name == Self::INDEX_NAME_STATIC_SEGMENT_MANIFEST
+        })
+    }
+
+    /// `true` if the field carries the given marker: a `rerun:index_marker` metadata entry, or
+    /// the name's last `:`-separated part. The manifest writer only sets the latter; the former
+    /// is what the cloud schema uses for the same columns.
+    pub fn has_index_marker(field: &Field, marker: &str) -> bool {
+        field
+            .metadata()
+            .get(Self::FIELD_METADATA_KEY_INDEX_MARKER)
+            .is_some_and(|m| m == marker)
+            || field
+                .name()
+                .rsplit_once(':')
+                .is_some_and(|(_, suffix)| suffix == marker)
+    }
+
+    /// `true` if the field is the `:start` column of an index.
+    pub fn is_index_start(field: &Field) -> bool {
+        Self::has_index_marker(field, Self::INDEX_MARKER_START)
+    }
+
+    /// `true` if the field is the `:end` column of an index.
+    pub fn is_index_end(field: &Field) -> bool {
+        Self::has_index_marker(field, Self::INDEX_MARKER_END)
+    }
+
+    /// `true` if the field is the `:num_rows` column of a per-component index.
+    pub fn is_index_num_rows(field: &Field) -> bool {
+        Self::has_index_marker(field, Self::INDEX_MARKER_NUM_ROWS)
+    }
+
+    /// `true` if the field is the `:len` column of a Segment Manifest global index.
+    pub fn is_index_length(field: &Field) -> bool {
+        Self::has_index_marker(field, Self::INDEX_MARKER_LEN)
+    }
+
+    /// `true` if the field is the `:has_static_data` column of a component.
+    pub fn is_index_has_static_data(field: &Field) -> bool {
+        Self::has_index_marker(field, Self::INDEX_MARKER_HAS_STATIC_DATA)
+    }
+
+    /// `true` if the field is a temporal index column (not static, not per-component).
+    pub fn is_index_global_temporal(field: &Field) -> bool {
+        Self::is_index(field)
+            && !Self::is_index_static(field)
+            && !Self::is_index_per_component(field)
     }
 }
 
@@ -826,14 +1027,20 @@ impl RawRrdManifest {
         if self
             .data
             .schema_ref()
-            .column_with_name(Self::FIELD_CHUNK_KEY)
+            .column_with_name(Self::COLUMN_CHUNK_KEY.name)
             .is_some()
         {
-            _ = self.col_chunk_key_raw()?;
+            _ = self.col_chunk_key()?;
         }
 
         Ok(())
     }
+
+    /// `rerun:kind` value of a Sorbet index column.
+    const SORBET_KIND_INDEX: &str = "index";
+
+    /// `rerun:kind` value of a Sorbet component-data column.
+    const SORBET_KIND_DATA: &str = "data";
 
     /// Cheap.
     fn check_index_columns_are_correct(&self) -> CodecResult<()> {
@@ -842,30 +1049,30 @@ impl RawRrdManifest {
             for field in self.data.schema().fields() {
                 if let Some((_, suffix)) = field.name().rsplit_once(':') {
                     match suffix {
-                        "start" | "end" => {
+                        Self::INDEX_MARKER_START | Self::INDEX_MARKER_END => {
                             // Checked in depth below
                         }
 
-                        "has_static_data" => {
-                            if field.data_type() != Self::field_chunk_is_static().data_type() {
+                        Self::INDEX_MARKER_HAS_STATIC_DATA => {
+                            if *field.data_type() != Self::COLUMN_CHUNK_IS_STATIC.data_type() {
                                 return Err(CodecError::from(ChunkError::Malformed {
                                     reason: format!(
                                         "field '{}' should be {} but is actually {}",
                                         field.name(),
-                                        Self::field_chunk_is_static().data_type(),
+                                        Self::COLUMN_CHUNK_IS_STATIC.data_type(),
                                         field.data_type(),
                                     ),
                                 }));
                             }
                         }
 
-                        "num_rows" => {
-                            if field.data_type() != Self::field_chunk_num_rows().data_type() {
+                        Self::INDEX_MARKER_NUM_ROWS => {
+                            if *field.data_type() != Self::COLUMN_CHUNK_NUM_ROWS.data_type() {
                                 return Err(CodecError::from(ChunkError::Malformed {
                                     reason: format!(
                                         "field '{}' should be {} but is actually {}",
                                         field.name(),
-                                        Self::field_chunk_num_rows().data_type(),
+                                        Self::COLUMN_CHUNK_NUM_ROWS.data_type(),
                                         field.data_type(),
                                     ),
                                 }));
@@ -884,14 +1091,7 @@ impl RawRrdManifest {
                 } else {
                     // Global column
                     match field.name().as_str() {
-                        Self::FIELD_CHUNK_ID
-                        | Self::FIELD_CHUNK_IS_STATIC
-                        | Self::FIELD_CHUNK_NUM_ROWS
-                        | Self::FIELD_CHUNK_BYTE_SIZE
-                        | Self::FIELD_CHUNK_BYTE_SIZE_UNCOMPRESSED
-                        | Self::FIELD_CHUNK_BYTE_OFFSET
-                        | Self::FIELD_CHUNK_KEY
-                        | Self::FIELD_CHUNK_ENTITY_PATH => {}
+                        name if Self::GLOBAL_COLUMN_NAMES.contains(&name) => {}
 
                         name if Self::COMMON_IMPL_SPECIFIC_FIELDS.contains(&name) => {}
 
@@ -998,7 +1198,7 @@ impl RawRrdManifest {
 
     /// Cheap.
     fn check_manifest_schema_matches_sorbet_schema(&self) -> CodecResult<()> {
-        let any_static_chunks = self.col_chunk_is_static()?.any(|b| b);
+        let any_static_chunks = self.col_chunk_is_static_iter()?.any(|b| b);
 
         let sorbet_indexes = self
             .sorbet_schema
@@ -1006,8 +1206,8 @@ impl RawRrdManifest {
             .iter()
             .filter_map(|f| {
                 let md = f.metadata();
-                (md.get("rerun:kind").map(|s| s.as_str()) == Some("index"))
-                    .then(|| md.contains_key("rerun:index_name").then_some(f))
+                (md.get(re_sorbet::RERUN_KIND).map(|s| s.as_str()) == Some(Self::SORBET_KIND_INDEX))
+                    .then(|| md.contains_key(re_sorbet::SORBET_INDEX_NAME).then_some(f))
                     .flatten()
             })
             .unique()
@@ -1017,7 +1217,10 @@ impl RawRrdManifest {
             .sorbet_schema
             .fields()
             .iter()
-            .filter(|f| f.metadata().get("rerun:kind").map(|s| s.as_str()) == Some("data"))
+            .filter(|f| {
+                f.metadata().get(re_sorbet::RERUN_KIND).map(|s| s.as_str())
+                    == Some(Self::SORBET_KIND_DATA)
+            })
             .unique()
             .collect_vec();
 
@@ -1025,7 +1228,7 @@ impl RawRrdManifest {
             // If there are any static chunks, then all components must have :has_static_data indexes.
             for column in &sorbet_columns {
                 let md = column.metadata();
-                let Some(component) = md.get("rerun:component") else {
+                let Some(component) = md.get(FIELD_METADATA_KEY_COMPONENT) else {
                     return Err(CodecError::from(ChunkError::Malformed {
                         reason: format!(
                             "column '{}' is missing rerun:component metadata",
@@ -1034,18 +1237,24 @@ impl RawRrdManifest {
                     }));
                 };
                 let descr = ComponentDescriptor {
-                    archetype: md.get("rerun:archetype").map(|s| ArchetypeName::new(s)),
-                    component: ComponentIdentifier::new(component),
+                    archetype: md
+                        .get(FIELD_METADATA_KEY_ARCHETYPE)
+                        .and_then(|s| ArchetypeName::try_new(s).ok()),
+                    component: ComponentIdentifier::try_new(component).map_err(|err| {
+                        CodecError::from(ChunkError::Malformed {
+                            reason: err.to_string(),
+                        })
+                    })?,
                     component_type: md
-                        .get("rerun:component_type")
-                        .map(|s| ComponentType::new(s)),
+                        .get(FIELD_METADATA_KEY_COMPONENT_TYPE)
+                        .and_then(|s| ComponentType::try_new(s).ok()),
                 };
                 let column_name = Self::compute_column_name(
                     None,
                     None,
                     Some(&descr),
                     None,
-                    Some("has_static_data"),
+                    Some(Self::INDEX_MARKER_HAS_STATIC_DATA),
                 );
 
                 self.data
@@ -1064,7 +1273,7 @@ impl RawRrdManifest {
             .schema_ref()
             .fields()
             .iter()
-            .filter(|f| f.name().ends_with(":start") || f.name().ends_with(":end"))
+            .filter(|f| Self::is_index_start(f) || Self::is_index_end(f))
             .map(|f| (f.name(), f))
             .collect();
 
@@ -1074,7 +1283,7 @@ impl RawRrdManifest {
                 Self::compute_column_name(None, None, None, Some(sorbet_index.name()), None);
 
             // All global indexes should have :start and :end columns of the right type.
-            for suffix in ["start", "end"] {
+            for suffix in [Self::INDEX_MARKER_START, Self::INDEX_MARKER_END] {
                 let field = rrd_manifest_fields.remove(&format!("{sorbet_index_name_normalized}:{suffix}"))
                     .ok_or_else(|| {
                         CodecError::from(ChunkError::Malformed {
@@ -1101,7 +1310,7 @@ impl RawRrdManifest {
             for sorbet_column in &sorbet_columns {
                 let md = sorbet_column.metadata();
 
-                let Some(component) = md.get("rerun:component") else {
+                let Some(component) = md.get(FIELD_METADATA_KEY_COMPONENT) else {
                     return Err(CodecError::from(ChunkError::Malformed {
                         reason: format!(
                             "column '{}' is missing rerun:component metadata",
@@ -1110,14 +1319,20 @@ impl RawRrdManifest {
                     }));
                 };
                 let descr = ComponentDescriptor {
-                    archetype: md.get("rerun:archetype").map(|s| ArchetypeName::new(s)),
-                    component: ComponentIdentifier::new(component),
+                    archetype: md
+                        .get(FIELD_METADATA_KEY_ARCHETYPE)
+                        .and_then(|s| ArchetypeName::try_new(s).ok()),
+                    component: ComponentIdentifier::try_new(component).map_err(|err| {
+                        CodecError::from(ChunkError::Malformed {
+                            reason: err.to_string(),
+                        })
+                    })?,
                     component_type: md
-                        .get("rerun:component_type")
-                        .map(|s| ComponentType::new(s)),
+                        .get(FIELD_METADATA_KEY_COMPONENT_TYPE)
+                        .and_then(|s| ComponentType::try_new(s).ok()),
                 };
 
-                for suffix in ["start", "end"] {
+                for suffix in [Self::INDEX_MARKER_START, Self::INDEX_MARKER_END] {
                     let column_name = Self::compute_column_name(
                         None,
                         None,
@@ -1126,7 +1341,7 @@ impl RawRrdManifest {
                         Some(suffix),
                     );
 
-                    if md.get("rerun:is_static").map(|s| s.as_str()) == Some("true") {
+                    if md.get(re_sorbet::SORBET_IS_STATIC).map(|s| s.as_str()) == Some("true") {
                         // Static columns don't have :start nor :end columns… unless they exist
                         // both temporally and statically, something which is legal in Rerun, and
                         // will end up with a final Sorbet schema that declares those column as
@@ -1177,14 +1392,8 @@ impl RawRrdManifest {
             return Err(CodecError::ArrowDeserialization(ArrowError::SchemaError(
                 format!(
                     "invalid schema hash: expected {} but got {}",
-                    expected_sorbet_schema_sha256
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>(),
-                    self.sorbet_schema_sha256
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>(),
+                    sha256_to_hex(&expected_sorbet_schema_sha256),
+                    sha256_to_hex(&self.sorbet_schema_sha256),
                 ),
             )));
         }
@@ -1194,16 +1403,60 @@ impl RawRrdManifest {
 
 // Fields
 impl RawRrdManifest {
-    pub const FIELD_CHUNK_ID: &str = "chunk_id";
-    pub const FIELD_CHUNK_IS_STATIC: &str = "chunk_is_static";
-    pub const FIELD_CHUNK_NUM_ROWS: &str = "chunk_num_rows";
-    pub const FIELD_CHUNK_ENTITY_PATH: &str = "chunk_entity_path";
-    pub const FIELD_CHUNK_BYTE_OFFSET: &str = "chunk_byte_offset";
-    pub const FIELD_CHUNK_BYTE_SIZE: &str = "chunk_byte_size";
-    pub const FIELD_CHUNK_BYTE_SIZE_UNCOMPRESSED: &str = "chunk_byte_size_uncompressed";
-    pub const FIELD_CHUNK_KEY: &str = "chunk_key";
+    /// The ID of the chunk. Every chunk has one.
+    pub const COLUMN_CHUNK_ID: quiver::ColumnDesc<ChunkId> =
+        quiver::ColumnDesc::new("RawRrdManifest", "chunk_id");
 
-    /// These fields might be returned by some implementations (such as Rerun Cloud) that do not
+    /// Does the chunk hold static data? Every chunk is either static or temporal.
+    pub const COLUMN_CHUNK_IS_STATIC: quiver::ColumnDesc<bool> =
+        quiver::ColumnDesc::new("RawRrdManifest", "chunk_is_static");
+
+    /// How many rows the chunk holds. Every chunk has a row count.
+    pub const COLUMN_CHUNK_NUM_ROWS: quiver::ColumnDesc<u64> =
+        quiver::ColumnDesc::new("RawRrdManifest", "chunk_num_rows");
+
+    /// The entity path of the chunk. Every chunk has one.
+    pub const COLUMN_CHUNK_ENTITY_PATH: quiver::ColumnDesc<EntityPath> =
+        quiver::ColumnDesc::new("RawRrdManifest", "chunk_entity_path");
+
+    /// Where the chunk's payload starts.
+    ///
+    /// See the `Understand size/offset columns` section of the [`RawRrdManifest`] documentation.
+    pub const COLUMN_CHUNK_BYTE_OFFSET: quiver::ColumnDesc<u64> =
+        quiver::ColumnDesc::new("RawRrdManifest", "chunk_byte_offset");
+
+    /// How long the chunk's payload is.
+    ///
+    /// See the `Understand size/offset columns` section of the [`RawRrdManifest`] documentation.
+    pub const COLUMN_CHUNK_BYTE_SIZE: quiver::ColumnDesc<u64> =
+        quiver::ColumnDesc::new("RawRrdManifest", "chunk_byte_size");
+
+    /// How long the chunk's payload would be, uncompressed.
+    ///
+    /// See the `Understand size/offset columns` section of the [`RawRrdManifest`] documentation.
+    pub const COLUMN_CHUNK_BYTE_SIZE_UNCOMPRESSED: quiver::ColumnDesc<u64> =
+        quiver::ColumnDesc::new("RawRrdManifest", "chunk_byte_size_uncompressed");
+
+    /// Opaque key encoding where to fetch the chunk. Every chunk has one.
+    pub const COLUMN_CHUNK_KEY: quiver::ColumnDesc<quiver::Binary> =
+        quiver::ColumnDesc::new("RawRrdManifest", "chunk_key");
+
+    /// The names of every global (i.e. non-index) column of an RRD manifest.
+    ///
+    /// Index columns are named after the timeline and component they describe,
+    /// so they cannot be listed here (see [`Self::compute_column_name`]).
+    pub const GLOBAL_COLUMN_NAMES: &[&str] = &[
+        Self::COLUMN_CHUNK_ID.name,
+        Self::COLUMN_CHUNK_IS_STATIC.name,
+        Self::COLUMN_CHUNK_NUM_ROWS.name,
+        Self::COLUMN_CHUNK_ENTITY_PATH.name,
+        Self::COLUMN_CHUNK_BYTE_OFFSET.name,
+        Self::COLUMN_CHUNK_BYTE_SIZE.name,
+        Self::COLUMN_CHUNK_BYTE_SIZE_UNCOMPRESSED.name,
+        Self::COLUMN_CHUNK_KEY.name,
+    ];
+
+    /// These fields might be returned by some implementations (such as Rerun Hub) that do not
     /// support fetching chunks with only a set of chunk-keys.
     /// We generally want to ignore them during tests and sanity checking, and just blindly forward
     /// them as-is otherwise.
@@ -1218,66 +1471,17 @@ impl RawRrdManifest {
         "rerun_segment_layer",
     ];
 
-    pub fn field_chunk_id() -> Field {
-        use re_log_types::external::re_types_core::Loggable as _;
-        let nullable = false; // every chunk has an ID
-        Field::new(Self::FIELD_CHUNK_ID, ChunkId::arrow_datatype(), nullable)
-    }
-
-    pub fn field_chunk_is_static() -> Field {
-        let nullable = false; // every chunk is either static or temporal
-        Field::new(
-            Self::FIELD_CHUNK_IS_STATIC,
-            arrow::datatypes::DataType::Boolean,
-            nullable,
-        )
-    }
-
-    pub fn field_chunk_num_rows() -> Field {
-        let nullable = false; // every chunk has a number of rows
-        Field::new(
-            Self::FIELD_CHUNK_NUM_ROWS,
-            arrow::datatypes::DataType::UInt64,
-            nullable,
-        )
-    }
-
-    pub fn field_chunk_entity_path() -> Field {
-        let nullable = false; // every chunk has an entity path
-        Field::new(
-            Self::FIELD_CHUNK_ENTITY_PATH,
-            arrow::datatypes::DataType::Utf8,
-            nullable,
-        )
-    }
-
-    pub fn field_chunk_byte_offset() -> Field {
-        Self::any_byte_field(Self::FIELD_CHUNK_BYTE_OFFSET)
-    }
-
-    pub fn field_chunk_byte_size() -> Field {
-        Self::any_byte_field(Self::FIELD_CHUNK_BYTE_SIZE)
-    }
-
-    pub fn field_chunk_byte_size_uncompressed() -> Field {
-        Self::any_byte_field(Self::FIELD_CHUNK_BYTE_SIZE_UNCOMPRESSED)
-    }
-
-    pub fn field_chunk_key() -> Field {
-        let nullable = false; // every chunk has a location key
-        Field::new(
-            Self::FIELD_CHUNK_KEY,
-            arrow::datatypes::DataType::Binary,
-            nullable,
-        )
-    }
-
     pub fn field_index_start(timeline: &Timeline, desc: Option<&ComponentDescriptor>) -> Field {
-        Self::any_index_field(timeline, timeline.datatype(), desc, "start")
+        Self::any_index_field(
+            timeline,
+            timeline.datatype(),
+            desc,
+            Self::INDEX_MARKER_START,
+        )
     }
 
     pub fn field_index_end(timeline: &Timeline, desc: Option<&ComponentDescriptor>) -> Field {
-        Self::any_index_field(timeline, timeline.datatype(), desc, "end")
+        Self::any_index_field(timeline, timeline.datatype(), desc, Self::INDEX_MARKER_END)
     }
 
     pub fn field_index_num_rows(timeline: &Timeline, desc: Option<&ComponentDescriptor>) -> Field {
@@ -1285,7 +1489,7 @@ impl RawRrdManifest {
             timeline,
             arrow::datatypes::DataType::UInt64,
             desc,
-            "num_rows",
+            Self::INDEX_MARKER_NUM_ROWS,
         )
     }
 
@@ -1294,28 +1498,42 @@ impl RawRrdManifest {
             timeline,
             arrow::datatypes::DataType::Boolean,
             Some(desc),
-            "has_data",
+            Self::INDEX_MARKER_HAS_DATA,
         )
     }
 
     pub fn field_has_static_data(desc: &ComponentDescriptor) -> Field {
-        let field_name =
-            Self::compute_column_name(None, None, Some(desc), None, Some("has_static_data"));
+        let field_name = Self::compute_column_name(
+            None,
+            None,
+            Some(desc),
+            None,
+            Some(Self::INDEX_MARKER_HAS_STATIC_DATA),
+        );
 
         let mut metadata = std::collections::HashMap::default();
         metadata.extend(
             [
-                Some(("rerun:index".to_owned(), "rerun:static".to_owned())), //
+                Some((
+                    Self::FIELD_METADATA_KEY_INDEX.to_owned(),
+                    Self::INDEX_NAME_STATIC.to_owned(),
+                )),
                 desc.component_type.map(|component_type| {
                     (
-                        "rerun:component_type".to_owned(),
+                        FIELD_METADATA_KEY_COMPONENT_TYPE.to_owned(),
                         component_type.full_name().to_owned(),
                     )
                 }),
-                desc.archetype
-                    .as_ref()
-                    .map(|name| ("rerun:archetype".to_owned(), name.full_name().to_owned())),
-                Some(("rerun:component".to_owned(), desc.component.to_string())),
+                desc.archetype.as_ref().map(|name| {
+                    (
+                        FIELD_METADATA_KEY_ARCHETYPE.to_owned(),
+                        name.full_name().to_owned(),
+                    )
+                }),
+                Some((
+                    FIELD_METADATA_KEY_COMPONENT.to_owned(),
+                    desc.component.to_string(),
+                )),
             ]
             .into_iter()
             .flatten(),
@@ -1340,20 +1558,29 @@ impl RawRrdManifest {
             Self::compute_column_name(None, None, desc, Some(index_name), Some(marker));
 
         let mut metadata = std::collections::HashMap::default();
-        metadata.extend([("rerun:index".to_owned(), timeline.name().to_string())]);
+        metadata.extend([(
+            Self::FIELD_METADATA_KEY_INDEX.to_owned(),
+            timeline.name().to_string(),
+        )]);
         if let Some(desc) = desc {
             metadata.extend(
                 [
                     desc.component_type.map(|component_type| {
                         (
-                            "rerun:component_type".to_owned(),
+                            FIELD_METADATA_KEY_COMPONENT_TYPE.to_owned(),
                             component_type.full_name().to_owned(),
                         )
                     }),
-                    desc.archetype
-                        .as_ref()
-                        .map(|name| ("rerun:archetype".to_owned(), name.full_name().to_owned())),
-                    Some(("rerun:component".to_owned(), desc.component.to_string())),
+                    desc.archetype.as_ref().map(|name| {
+                        (
+                            FIELD_METADATA_KEY_ARCHETYPE.to_owned(),
+                            name.full_name().to_owned(),
+                        )
+                    }),
+                    Some((
+                        FIELD_METADATA_KEY_COMPONENT.to_owned(),
+                        desc.component.to_string(),
+                    )),
                 ]
                 .into_iter()
                 .flatten(),
@@ -1363,182 +1590,77 @@ impl RawRrdManifest {
         let nullable = true; // A) static B) not all chunks belong to all timelines
         Field::new(field_name, datatype, nullable).with_metadata(metadata)
     }
-
-    fn any_byte_field(name: &str) -> Field {
-        let nullable = false; // every chunk has an offset and size
-        Field::new(name, arrow::datatypes::DataType::UInt64, nullable)
-    }
 }
 
 // Column accessors
 impl RawRrdManifest {
-    /// Returns the raw Arrow data for the entity path column.
-    pub fn col_chunk_entity_path_raw(&self) -> CodecResult<&StringArray> {
-        use re_arrow_util::ArrowArrayDowncastRef as _;
-        let name = Self::FIELD_CHUNK_ENTITY_PATH;
-        self.data
-            .column_by_name(name)
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot read column: '{name}' is missing from batch",
-                )))
-            })?
-            .downcast_array_ref::<StringArray>()
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot downcast column: '{name}' is not a StringArray",
-                )))
-            })
+    /// The entity path column.
+    pub fn col_chunk_entity_path(&self) -> CodecResult<quiver::Column<EntityPath>> {
+        Ok(Self::COLUMN_CHUNK_ENTITY_PATH.extract(&self.data)?)
     }
 
     /// Returns an iterator over the decoded Arrow data for the entity path column.
     ///
     /// This might incur interning costs, but is otherwise basically free.
-    pub fn col_chunk_entity_path(&self) -> CodecResult<impl Iterator<Item = EntityPath>> {
-        let col_raw = self.col_chunk_entity_path_raw()?;
-
-        Ok(col_raw.iter().flatten().map(EntityPath::parse_forgiving))
+    pub fn col_chunk_entity_path_iter(&self) -> CodecResult<impl Iterator<Item = EntityPath>> {
+        Ok(self.col_chunk_entity_path()?.into_iter_owned())
     }
 
-    /// Returns the raw Arrow data for the chunk ID column.
-    pub fn col_chunk_id_raw(&self) -> CodecResult<&FixedSizeBinaryArray> {
-        use re_arrow_util::ArrowArrayDowncastRef as _;
-        let name = Self::FIELD_CHUNK_ID;
-        self.data
-            .column_by_name(name)
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot read column: '{name}' is missing from batch",
-                )))
-            })?
-            .downcast_array_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot downcast column: '{name}' is not a FixedSizeBinaryArray",
-                )))
-            })
+    /// The chunk ID column.
+    pub fn col_chunk_id(&self) -> CodecResult<quiver::Column<ChunkId>> {
+        Ok(Self::COLUMN_CHUNK_ID.extract(&self.data)?)
     }
 
     /// Returns an iterator over the decoded Arrow data for the chunk ID column.
     ///
-    /// This incurs a very cheap copy, but is otherwise basically free.
-    pub fn col_chunk_id(&self) -> CodecResult<impl Iterator<Item = ChunkId>> {
-        Ok(self
-            .col_chunk_id_raw()?
-            .iter()
-            .flatten()
-            .filter_map(|bytes| {
-                let bytes: [u8; 16] = bytes
-                    .try_into()
-                    .inspect_err(|err| {
-                        tracing::error!(
-                            %err,
-                            ?bytes,
-                            "failed to parse chunk ID from fixed-size binary array"
-                        );
-                    })
-                    .ok()?;
-                Some(ChunkId::from_tuid(Tuid::from_bytes(bytes)))
-            }))
+    /// This is free.
+    pub fn col_chunk_id_iter(&self) -> CodecResult<impl Iterator<Item = ChunkId>> {
+        Ok(self.col_chunk_id()?.into_iter_owned())
     }
 
-    /// Returns the raw Arrow data for the is-static column.
-    pub fn col_chunk_is_static_raw(&self) -> CodecResult<&BooleanArray> {
-        use re_arrow_util::ArrowArrayDowncastRef as _;
-        let name = Self::FIELD_CHUNK_IS_STATIC;
-        self.data
-            .column_by_name(name)
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot read column: '{name}' is missing from batch",
-                )))
-            })?
-            .downcast_array_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot downcast column: '{name}' is not a BooleanArray",
-                )))
-            })
+    /// The is-static column.
+    pub fn col_chunk_is_static(&self) -> CodecResult<quiver::Column<bool>> {
+        Ok(Self::COLUMN_CHUNK_IS_STATIC.extract(&self.data)?)
     }
 
     /// Returns an iterator over the decoded Arrow data for the is-static column.
     ///
     /// This is free.
-    pub fn col_chunk_is_static(&self) -> CodecResult<impl Iterator<Item = bool>> {
-        Ok(self.col_chunk_is_static_raw()?.iter().flatten())
+    pub fn col_chunk_is_static_iter(&self) -> CodecResult<impl Iterator<Item = bool>> {
+        Ok(self.col_chunk_is_static()?.into_iter_owned())
     }
 
-    /// Returns the raw Arrow data for the num-rows column.
-    pub fn col_chunk_num_rows_raw(&self) -> CodecResult<&UInt64Array> {
-        use re_arrow_util::ArrowArrayDowncastRef as _;
-        let name = Self::FIELD_CHUNK_NUM_ROWS;
-        self.data
-            .column_by_name(name)
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot read column: '{name}' is missing from batch",
-                )))
-            })?
-            .downcast_array_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot downcast column: '{name}' is not a UInt64Array",
-                )))
-            })
+    /// The num-rows column.
+    pub fn col_chunk_num_rows(&self) -> CodecResult<quiver::Column<u64>> {
+        Ok(Self::COLUMN_CHUNK_NUM_ROWS.extract(&self.data)?)
     }
 
     /// Returns an iterator over the decoded Arrow data for the num-rows column.
     ///
     /// This is free.
-    pub fn col_chunk_num_rows(&self) -> CodecResult<impl Iterator<Item = u64>> {
-        Ok(self.col_chunk_num_rows_raw()?.iter().flatten())
+    pub fn col_chunk_num_rows_iter(&self) -> CodecResult<impl Iterator<Item = u64>> {
+        Ok(self.col_chunk_num_rows()?.into_iter_owned())
     }
 
-    /// Returns the raw Arrow data for the byte-offset column.
-    pub fn col_chunk_byte_offset_raw(&self) -> CodecResult<&UInt64Array> {
-        use re_arrow_util::ArrowArrayDowncastRef as _;
-        let name = Self::FIELD_CHUNK_BYTE_OFFSET;
-        self.data
-            .column_by_name(name)
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot read column: '{name}' is missing from batch",
-                )))
-            })?
-            .downcast_array_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot downcast column: '{name}' is not a UInt64Array",
-                )))
-            })
+    /// The byte-offset column.
+    ///
+    /// See also the `Understand size/offset columns` section of the [`RawRrdManifest`] documentation.
+    pub fn col_chunk_byte_offset(&self) -> CodecResult<quiver::Column<u64>> {
+        Ok(Self::COLUMN_CHUNK_BYTE_OFFSET.extract(&self.data)?)
     }
 
     /// Returns an iterator over the decoded Arrow data for the byte-offset column.
     ///
     /// This is free.
-    pub fn col_chunk_byte_offset(&self) -> CodecResult<impl Iterator<Item = u64>> {
-        Ok(self.col_chunk_byte_offset_raw()?.iter().flatten())
+    pub fn col_chunk_byte_offset_iter(&self) -> CodecResult<impl Iterator<Item = u64>> {
+        Ok(self.col_chunk_byte_offset()?.into_iter_owned())
     }
 
-    /// Returns the raw Arrow data for the byte-size column.
+    /// The byte-size column.
     ///
     /// See also the `Understand size/offset columns` section of the [`RawRrdManifest`] documentation.
-    pub fn col_chunk_byte_size_raw(&self) -> CodecResult<&UInt64Array> {
-        use re_arrow_util::ArrowArrayDowncastRef as _;
-        let name = Self::FIELD_CHUNK_BYTE_SIZE;
-        self.data
-            .column_by_name(name)
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot read column: '{name}' is missing from batch",
-                )))
-            })?
-            .downcast_array_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot downcast column: '{name}' is not a UInt64Array",
-                )))
-            })
+    pub fn col_chunk_byte_size(&self) -> CodecResult<quiver::Column<u64>> {
+        Ok(Self::COLUMN_CHUNK_BYTE_SIZE.extract(&self.data)?)
     }
 
     /// Returns an iterator over the decoded Arrow data for the byte-size column.
@@ -1546,29 +1668,15 @@ impl RawRrdManifest {
     /// See also the `Understand size/offset columns` section of the [`RawRrdManifest`] documentation.
     ///
     /// This is free.
-    pub fn col_chunk_byte_size(&self) -> CodecResult<impl Iterator<Item = u64>> {
-        Ok(self.col_chunk_byte_size_raw()?.iter().flatten())
+    pub fn col_chunk_byte_size_iter(&self) -> CodecResult<impl Iterator<Item = u64>> {
+        Ok(self.col_chunk_byte_size()?.into_iter_owned())
     }
 
-    /// Returns the raw Arrow data for the *uncompressed* byte-size column.
+    /// The *uncompressed* byte-size column.
     ///
     /// See also the `Understand size/offset columns` section of the [`RawRrdManifest`] documentation.
-    pub fn col_chunk_byte_size_uncompressed_raw(&self) -> CodecResult<&UInt64Array> {
-        use re_arrow_util::ArrowArrayDowncastRef as _;
-        let name = Self::FIELD_CHUNK_BYTE_SIZE_UNCOMPRESSED;
-        self.data
-            .column_by_name(name)
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot read column: '{name}' is missing from batch",
-                )))
-            })?
-            .downcast_array_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot downcast column: '{name}' is not a UInt64Array",
-                )))
-            })
+    pub fn col_chunk_byte_size_uncompressed(&self) -> CodecResult<quiver::Column<u64>> {
+        Ok(Self::COLUMN_CHUNK_BYTE_SIZE_UNCOMPRESSED.extract(&self.data)?)
     }
 
     /// Returns an iterator over the decoded Arrow data for the *uncompressed* byte-size column.
@@ -1576,29 +1684,73 @@ impl RawRrdManifest {
     /// See also the `Understand size/offset columns` section of the [`RawRrdManifest`] documentation.
     ///
     /// This is free.
-    pub fn col_chunk_byte_size_uncompressed(&self) -> CodecResult<impl Iterator<Item = u64>> {
-        Ok(self
-            .col_chunk_byte_size_uncompressed_raw()?
-            .iter()
-            .flatten())
+    pub fn col_chunk_byte_size_uncompressed_iter(&self) -> CodecResult<impl Iterator<Item = u64>> {
+        Ok(self.col_chunk_byte_size_uncompressed()?.into_iter_owned())
     }
 
-    /// Returns the raw Arrow data for chunk-key column, if present.
-    pub fn col_chunk_key_raw(&self) -> CodecResult<&BinaryArray> {
-        use re_arrow_util::ArrowArrayDowncastRef as _;
-        let name = Self::FIELD_CHUNK_KEY;
-        self.data
-            .column_by_name(name)
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot read column: '{name}' is missing from batch",
-                )))
-            })?
-            .downcast_array_ref::<BinaryArray>()
-            .ok_or_else(|| {
-                CodecError::ArrowDeserialization(ArrowError::SchemaError(format!(
-                    "cannot downcast column: '{name}' is not a BinaryArray"
-                )))
-            })
+    /// The chunk-key column, if present.
+    ///
+    /// Read as optional: a merged manifest can have nulls here, since concatenating a manifest
+    /// that has chunk keys with one that does not leaves the rows of the latter null (see
+    /// `RrdManifest::add_null_chunk_key_column`).
+    pub fn col_chunk_key(&self) -> CodecResult<quiver::Column<Option<quiver::Binary>>> {
+        Ok(Self::COLUMN_CHUNK_KEY.optional().extract(&self.data)?)
     }
+}
+
+/// Strip the null mask from columns that the [`RawRrdManifest`] contract says are non-nullable
+/// with a default value (`:has_static_data` → `false`, `:num_rows` → `0`).
+///
+/// After [`crate::RrdManifestBuilder`] emits a manifest for a single layer, these columns are
+/// fully populated. But once we merge multiple per-layer manifests via polymorphic concat, a
+/// component only known to one layer will have nulls in the rows from other layers. The contract
+/// — shared with commercial (see `ExtendedRrdManifest::try_into_standard_manifest`) — is that
+/// the output manifest has these columns non-nullable with the underlying buffer's zero bits
+/// (which Arrow zero-initializes when `new_null_array` is called).
+fn strip_null_mask_on_default_columns(data: RecordBatch) -> CodecResult<RecordBatch> {
+    use re_arrow_util::ArrowArrayDowncastRef as _;
+
+    let (schema, mut columns, num_rows) = data.into_parts();
+    let mut new_fields = schema.fields.to_vec();
+
+    for (field, column) in itertools::izip!(&mut new_fields, &mut columns) {
+        if column.null_count() == 0 {
+            continue;
+        }
+
+        let name = field.name().as_str();
+        if RawRrdManifest::is_index_has_static_data(field) {
+            let Some(c) = column.downcast_array_ref::<BooleanArray>() else {
+                return Err(CodecError::ArrowDeserialization(ArrowError::SchemaError(
+                    format!(
+                        "'{name}' should be a BooleanArray, got {}",
+                        column.data_type()
+                    ),
+                )));
+            };
+            let (bools, _nulls) = c.clone().into_parts();
+            *column = std::sync::Arc::new(BooleanArray::new(bools, None));
+            *field = std::sync::Arc::new((**field).clone().with_nullable(false));
+        } else if RawRrdManifest::is_index_num_rows(field) {
+            let Some(c) = column.downcast_array_ref::<UInt64Array>() else {
+                return Err(CodecError::ArrowDeserialization(ArrowError::SchemaError(
+                    format!(
+                        "'{name}' should be a UInt64Array, got {}",
+                        column.data_type()
+                    ),
+                )));
+            };
+            let (_dt, ints, _nulls) = c.clone().into_parts();
+            *column = std::sync::Arc::new(UInt64Array::new(ints, None));
+            *field = std::sync::Arc::new((**field).clone().with_nullable(false));
+        }
+    }
+
+    let schema = arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata.clone());
+    RecordBatch::try_new_with_options(
+        std::sync::Arc::new(schema),
+        columns,
+        &arrow::array::RecordBatchOptions::new().with_row_count(Some(num_rows)),
+    )
+    .map_err(CodecError::ArrowSerialization)
 }

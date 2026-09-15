@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 
-use arrow::datatypes::DataType as ArrowDatatype;
+use arrow::datatypes::DataType as ArrowDataType;
 use re_chunk::{ComponentIdentifier, LatestAtQuery, RangeQuery, TimelineName};
+use re_log::ResultExt as _;
 use re_log_types::{AbsoluteTimeRange, EntityPath, TimeInt, Timeline};
 use re_sorbet::{
     ChunkColumnDescriptors, ColumnSelector, ComponentColumnDescriptor, ComponentColumnSelector,
@@ -338,11 +339,11 @@ impl ChunkStore {
         // TODO(#7699) This currently interns every string ever queried which could be wasteful, especially
         // in long-running servers. In practice this probably doesn't matter.
         let mut result = ComponentColumnDescriptor {
-            store_datatype: ArrowDatatype::Null,
+            store_datatype: ArrowDataType::Null,
             component_type: None,
             entity_path: selector.entity_path.clone(),
             archetype: None,
-            component: selector.component.as_str().into(),
+            component: selector.component_identifier().ok_or_log_error_once()?,
             is_static: false,
             is_tombstone: false,
             is_semantically_empty: false,
@@ -353,7 +354,7 @@ impl ChunkStore {
             .per_column_metadata_for_entity(&selector.entity_path)?;
 
         // We perform a scan over all component descriptors in the queried entity path.
-        let entry = per_identifier.get(&selector.component.as_str().into())?;
+        let entry = per_identifier.get(&result.component)?;
 
         result.store_datatype = entry.datatype.clone();
         result.archetype = entry.descriptor.archetype;

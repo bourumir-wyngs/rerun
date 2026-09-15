@@ -5,6 +5,9 @@ use arrow::datatypes::Field as ArrowField;
 // The following constants are used as metadata keys. See also
 // [`re_types_core::component_descriptor`] for additional constants.
 
+/// The key used to identify the chunk ID in batch-level metadata.
+pub const RERUN_CHUNK_ID: &str = "rerun:id";
+
 /// The key used to identify the index name in field-level metadata.
 pub const SORBET_INDEX_NAME: &str = "rerun:index_name";
 
@@ -14,6 +17,11 @@ pub const SORBET_ENTITY_PATH: &str = "rerun:entity_path";
 /// The key used to identify the [`crate::column_kind::ColumnKind`] in
 /// field-level metadata.
 pub const RERUN_KIND: &str = "rerun:kind";
+
+/// The key flagging a component column as static in field-level metadata.
+///
+/// Present with the value `"true"` on static columns and absent otherwise.
+pub const SORBET_IS_STATIC: &str = "rerun:is_static";
 
 /// The key used to identify table columns in the Rerun server
 /// associated as a primary index.

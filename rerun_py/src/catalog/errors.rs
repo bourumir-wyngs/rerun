@@ -16,14 +16,11 @@
 //! - Error type (either built-in such as [`pyo3::exceptions::PyValueError`] or custom) can always
 //!   be used directly using, e.g. `PyValueError::new_err("message")`.
 
-use std::error::Error as _;
-use std::fmt::Write as _;
-
 use pyo3::PyErr;
 use pyo3::exceptions::{
     PyConnectionError, PyException, PyPermissionError, PyRuntimeError, PyTimeoutError, PyValueError,
 };
-use re_redap_client::ApiErrorKind;
+use re_redap_client::{ApiErrorKind, TonicStatusError};
 
 pyo3::create_exception!(
     rerun_bindings.rerun_bindings,
@@ -47,7 +44,7 @@ pyo3::create_exception!(
 #[expect(clippy::enum_variant_names)] // this is by design
 enum ExternalError {
     #[error("{0}")]
-    TonicStatusError(Box<tonic::Status>),
+    TonicStatusError(Box<TonicStatusError>),
 
     #[error("{0}")]
     TonicTransportError(Box<tonic::transport::Error>),
@@ -64,14 +61,16 @@ enum ExternalError {
     #[error("{0}")]
     ApiError(Box<re_redap_client::ApiError>),
 
+    /// A DataFusion error that isn't a server error, so it has no [`re_redap_client::ApiError`]
+    /// (which always names a server) to carry it.
+    #[error("{0}")]
+    DataFusionError(Box<datafusion::error::DataFusionError>, ApiErrorKind),
+
     #[error("{0}")]
     ArrowError(#[from] arrow::error::ArrowError),
 
     #[error("{0}")]
     UrlParseError(#[from] url::ParseError),
-
-    #[error("{0}")]
-    DatafusionError(Box<datafusion::error::DataFusionError>),
 
     #[error(transparent)]
     CodecError(#[from] re_log_encoding::rrd::CodecError),
@@ -90,6 +89,9 @@ enum ExternalError {
 
     #[error(transparent)]
     TokenError(#[from] re_auth::TokenError),
+
+    #[error(transparent)]
+    InvalidLayerNameError(#[from] re_types_core::InvalidLayerNameError),
 }
 
 const _: () = assert!(
@@ -111,29 +113,56 @@ impl_from_boxed!(re_chunk::ChunkError, ChunkError);
 impl_from_boxed!(re_chunk_store::ChunkStoreError, ChunkStoreError);
 impl_from_boxed!(re_redap_client::ApiError, ApiError);
 impl_from_boxed!(tonic::transport::Error, TonicTransportError);
-impl_from_boxed!(tonic::Status, TonicStatusError);
-impl_from_boxed!(datafusion::error::DataFusionError, DatafusionError);
+impl_from_boxed!(re_redap_client::TonicStatusError, TonicStatusError);
+
+impl From<tonic::Status> for ExternalError {
+    fn from(value: tonic::Status) -> Self {
+        Self::TonicStatusError(Box::new(TonicStatusError::from(value)))
+    }
+}
+
+/// Classify a [`DataFusionError`] into the closest [`ApiErrorKind`]
+fn apierror_kind_for_df_error(err: &datafusion::error::DataFusionError) -> ApiErrorKind {
+    use datafusion::error::DataFusionError as D;
+    match err {
+        // User-input / query-authoring errors.
+        D::Plan(_) | D::SchemaError(_, _) | D::SQL(_, _) | D::Configuration(_) => {
+            ApiErrorKind::InvalidArguments
+        }
+        D::NotImplemented(_) => ApiErrorKind::Unimplemented,
+        D::ResourcesExhausted(_) => ApiErrorKind::ResourcesExhausted,
+        // Everything else — including `DataFusionError::Execution` (DataFusion's
+        // grab-bag for invariant failures and data-shape issues, which is also
+        // what our own `exec_err!` uses)
+        _ => ApiErrorKind::Internal,
+    }
+}
+
+impl From<datafusion::error::DataFusionError> for ExternalError {
+    fn from(value: datafusion::error::DataFusionError) -> Self {
+        // Via `re_datafusion::errors`, `DataFusionError::External`
+        // can wrap an `ApiError`. Walk the source chain; if we find one,
+        // surface it directly. Otherwise synthesize a typed ApiError with a kind
+        // inferred from the DataFusionError variant
+        if let Some(api) = re_error::downcast_source::<re_redap_client::ApiError>(&value) {
+            return Self::ApiError(Box::new(api.clone()));
+        }
+        let kind = apierror_kind_for_df_error(&value);
+        Self::DataFusionError(Box::new(value), kind)
+    }
+}
+
 impl_from_boxed!(re_protos::TypeConversionError, TypeConversionError);
 
 impl From<ExternalError> for PyErr {
     fn from(err: ExternalError) -> Self {
         match err {
-            ExternalError::TonicStatusError(status) => {
+            ExternalError::TonicStatusError(err) => {
+                let status: &tonic::Status = (*err).as_ref();
                 if status.code() == tonic::Code::DeadlineExceeded {
                     PyTimeoutError::new_err("Deadline expired before operation could complete")
                 } else {
-                    let mut msg = format!(
-                        "tonic status error: {} (code: {}",
-                        status.message(),
-                        status.code()
-                    );
-                    if let Some(source) = status.source() {
-                        write!(msg, ", source: {source})").ok();
-                    } else {
-                        msg.push(')');
-                    }
-
-                    PyConnectionError::new_err(msg)
+                    PyConnectionError::new_err(err.to_string())
                 }
             }
 
@@ -160,19 +189,33 @@ impl From<ExternalError> for PyErr {
                 ApiErrorKind::NotFound => NotFoundError::new_err(err.to_string()),
                 ApiErrorKind::AlreadyExists => AlreadyExistsError::new_err(err.to_string()),
                 ApiErrorKind::Timeout => PyTimeoutError::new_err(err.to_string()),
-                ApiErrorKind::Unimplemented | ApiErrorKind::Internal => {
-                    PyRuntimeError::new_err(err.to_string())
-                }
+                ApiErrorKind::Unimplemented
+                | ApiErrorKind::Internal
+                | ApiErrorKind::FailedPrecondition => PyRuntimeError::new_err(err.to_string()),
             },
+
+            ExternalError::DataFusionError(err, kind) => {
+                let message = match kind {
+                    ApiErrorKind::InvalidArguments => format!("DataFusion query error: {err}"),
+                    ApiErrorKind::Unimplemented => {
+                        format!("DataFusion feature not implemented: {err}")
+                    }
+                    ApiErrorKind::ResourcesExhausted => {
+                        format!("DataFusion resources exhausted: {err}")
+                    }
+                    _ => format!("DataFusion error: {err}"),
+                };
+                match kind {
+                    ApiErrorKind::InvalidArguments => PyValueError::new_err(message),
+                    ApiErrorKind::ResourcesExhausted => PyConnectionError::new_err(message),
+                    _ => PyRuntimeError::new_err(message),
+                }
+            }
 
             ExternalError::ArrowError(err) => PyValueError::new_err(format!("Arrow error: {err}")),
 
             ExternalError::UrlParseError(err) => {
                 PyValueError::new_err(format!("Could not parse URL: {err}"))
-            }
-
-            ExternalError::DatafusionError(err) => {
-                PyValueError::new_err(format!("DataFusion error: {err}"))
             }
 
             ExternalError::CodecError(err) => PyValueError::new_err(format!("Codec error: {err}")),
@@ -194,6 +237,8 @@ impl From<ExternalError> for PyErr {
             ExternalError::TokenError(err) => {
                 PyPermissionError::new_err(format!("Invalid token: {err}"))
             }
+
+            ExternalError::InvalidLayerNameError(err) => PyValueError::new_err(err.to_string()),
         }
     }
 }
@@ -204,4 +249,67 @@ impl From<ExternalError> for PyErr {
 #[expect(private_bounds)] // this is by design
 pub fn to_py_err(err: impl Into<ExternalError>) -> PyErr {
     err.into().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::error::DataFusionError;
+    use re_redap_client::{ApiError, ApiErrorKind, TraceId};
+
+    /// A `DataFusionError::External` wrapping an `ApiError` must be recovered
+    /// as `ExternalError::ApiError`, with the trace-id and kind preserved.
+    #[test]
+    fn recovers_embedded_api_error_with_trace_id() {
+        let trace_id =
+            TraceId::from_hex("0123456789abcdef0123456789abcdef").expect("valid trace-id");
+        let arrow_err = arrow::error::ArrowError::SchemaError("rerun schema mismatch: boom".into());
+        let api = ApiError::with_kind_and_source(
+            &re_uri::Origin::test(),
+            ApiErrorKind::Internal,
+            Some(trace_id),
+            arrow_err,
+            "DataFusion schema mismatch error",
+        );
+        let df_err = DataFusionError::External(Box::new(api));
+
+        let external: ExternalError = df_err.into();
+        let ExternalError::ApiError(recovered) = external else {
+            panic!("expected ExternalError::ApiError, got something else");
+        };
+        assert_eq!(recovered.kind, ApiErrorKind::Internal);
+        let display = recovered.to_string();
+        assert!(
+            display.contains("DataFusion schema mismatch error"),
+            "message missing: {display}"
+        );
+        assert!(
+            display.contains(&trace_id.to_string()),
+            "trace-id missing: {display}"
+        );
+    }
+
+    /// `DataFusionError::Context` wraps another DataFusionError with a string.
+    /// The source-chain walk should still find an embedded `ApiError` through
+    /// the Context wrapper.
+    #[test]
+    fn recovers_api_error_through_context_wrapper() {
+        let api = ApiError::with_kind_and_source(
+            &re_uri::Origin::test(),
+            ApiErrorKind::NotFound,
+            None,
+            arrow::error::ArrowError::SchemaError("inner".into()),
+            "dataset not found",
+        );
+        let df_err = DataFusionError::Context(
+            "while scanning".into(),
+            Box::new(DataFusionError::External(Box::new(api))),
+        );
+
+        let external: ExternalError = df_err.into();
+        let ExternalError::ApiError(recovered) = external else {
+            panic!("expected ExternalError::ApiError");
+        };
+        assert_eq!(recovered.kind, ApiErrorKind::NotFound);
+    }
 }

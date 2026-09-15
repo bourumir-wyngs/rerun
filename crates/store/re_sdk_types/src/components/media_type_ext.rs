@@ -1,7 +1,7 @@
 use super::MediaType;
 use re_rvl::RosRvlMetadata;
 
-// TODO(#2388): come up with some DSL in our flatbuffers definitions so that we can declare these
+// TODO(#2388): come up with some DSL in `re_type_definitions` so that we can declare these
 // constants directly in there.
 impl MediaType {
     /// Plain text.
@@ -22,6 +22,11 @@ impl MediaType {
     ///
     /// <https://www.iana.org/assignments/media-types/image/png>
     pub const PNG: &'static str = "image/png";
+
+    /// [TIFF image](https://en.wikipedia.org/wiki/TIFF): `image/tiff`.
+    ///
+    /// <https://www.iana.org/assignments/media-types/image/tiff>
+    pub const TIFF: &'static str = "image/tiff";
 
     // -------------------------------------------------------
     // Meshes:
@@ -85,7 +90,7 @@ impl MediaType {
     pub const MCAP: &'static str = "application/x-mcap";
 
     // -------------------------------------------------------
-    // Point clouds:
+    // Geometry:
 
     /// [PLY (Polygon File Format)](https://en.wikipedia.org/wiki/PLY_(file_format)): `application/x-ply`.
     ///
@@ -120,6 +125,12 @@ impl MediaType {
     #[inline]
     pub fn png() -> Self {
         Self(Self::PNG.into())
+    }
+
+    /// `image/tiff`
+    #[inline]
+    pub fn tiff() -> Self {
+        Self(Self::TIFF.into())
     }
 
     // -------------------------------------------------------
@@ -195,7 +206,7 @@ impl MediaType {
     }
 
     // -------------------------------------------------------
-    // Point clouds:
+    // Geometry:
 
     /// `application/x-ply`
     ///
@@ -228,6 +239,10 @@ impl MediaType {
             // `mime_guess2` considers `.obj` to be a tgif… but really it's way more likely to be an obj.
             Some("obj") => {
                 return Some(Self::obj());
+            }
+            // `mime_guess2` doesn't know about PLY, but we use `application/x-ply`.
+            Some("ply") => {
+                return Some(Self::ply());
             }
             // `mime_guess2` considers `.stl` to be a `application/vnd.ms-pki.stl`.
             Some("stl") => {
@@ -401,8 +416,17 @@ fn test_media_type_extension() {
     assert_eq!(MediaType::markdown().file_extension(), Some("md"));
     assert_eq!(MediaType::plain_text().file_extension(), Some("txt"));
     assert_eq!(MediaType::png().file_extension(), Some("png"));
+    assert_eq!(MediaType::ply().file_extension(), Some("ply"));
     assert_eq!(MediaType::rvl().file_extension(), Some("rvl"));
     assert_eq!(MediaType::stl().file_extension(), Some("stl"));
+}
+
+#[test]
+fn test_guess_from_path_ply() {
+    assert_eq!(
+        MediaType::guess_from_path("mesh.ply"),
+        Some(MediaType::ply())
+    );
 }
 
 #[test]

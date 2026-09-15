@@ -1,19 +1,19 @@
-use arrow::datatypes::DataType as ArrowDatatype;
+use arrow::datatypes::DataType as ArrowDataType;
 use nohash_hasher::IntMap;
 use re_chunk::{Chunk, RangeQuery, RowId, TimePoint, Timeline, TimelineName};
 use re_log_types::AbsoluteTimeRange;
 use re_log_types::example_components::{MyColor, MyLabel, MyPoint, MyPoints};
-use re_types_core::{ComponentDescriptor, Loggable as _};
+use re_types_core::{ArrowDataType as _, ComponentDescriptor};
 
 // ---
 
 const ENTITY_PATH: &str = "my/entity";
 
-fn datatypes() -> IntMap<ComponentDescriptor, ArrowDatatype> {
+fn datatypes() -> IntMap<ComponentDescriptor, ArrowDataType> {
     [
-        (MyPoints::descriptor_points(), MyPoint::arrow_datatype()),
-        (MyPoints::descriptor_colors(), MyColor::arrow_datatype()),
-        (MyPoints::descriptor_labels(), MyLabel::arrow_datatype()),
+        (MyPoints::descriptor_points(), MyPoint::arrow_data_type()),
+        (MyPoints::descriptor_colors(), MyColor::arrow_data_type()),
+        (MyPoints::descriptor_labels(), MyLabel::arrow_data_type()),
     ]
     .into_iter()
     .collect()
@@ -76,7 +76,7 @@ fn temporal_sorted() -> anyhow::Result<()> {
 
     {
         let query =
-            RangeQuery::with_extras(TimelineName::new("frame"), AbsoluteTimeRange::EVERYTHING);
+            RangeQuery::with_extras(TimelineName::from("frame"), AbsoluteTimeRange::EVERYTHING);
 
         let expected = Chunk::builder_with_id(chunk.id(), ENTITY_PATH)
             .with_sparse_component_batches(
@@ -354,7 +354,7 @@ fn static_sorted() -> anyhow::Result<()> {
         .build()?;
 
     let queries = [
-        RangeQuery::with_extras(TimelineName::new("frame"), AbsoluteTimeRange::EVERYTHING),
+        RangeQuery::with_extras(TimelineName::from("frame"), AbsoluteTimeRange::EVERYTHING),
         RangeQuery::with_extras(TimelineName::log_time(), AbsoluteTimeRange::new(1020, 1050)),
     ];
 
@@ -447,7 +447,7 @@ fn static_unsorted() -> anyhow::Result<()> {
         .build()?;
 
     let queries = [
-        RangeQuery::with_extras(TimelineName::new("frame"), AbsoluteTimeRange::EVERYTHING),
+        RangeQuery::with_extras(TimelineName::from("frame"), AbsoluteTimeRange::EVERYTHING),
         RangeQuery::with_extras(TimelineName::log_time(), AbsoluteTimeRange::new(1020, 1050)),
     ];
 

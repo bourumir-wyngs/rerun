@@ -4,11 +4,11 @@ mod util;
 
 use std::sync::Arc;
 
-use arrow::array::{Array as _, ArrayRef, Float64Array, ListArray, StringArray};
+use arrow::array::{ArrayRef, Float64Array, ListArray, StringArray};
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field, Float64Type};
 
-use re_lenses_core::combinators::Error;
+use re_lenses_core::combinators::{Error, try_downcast};
 use re_lenses_core::function_registry::{FunctionRegistry, FunctionRegistryError};
 use re_lenses_core::{Literal, Runtime, Selector, SelectorError};
 use util::DisplayRB;
@@ -17,14 +17,7 @@ use util::DisplayRB;
 
 /// Doubles every float64 value.
 fn double_values(source: &ArrayRef) -> Result<Option<ArrayRef>, Error> {
-    let values = source
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .ok_or_else(|| Error::TypeMismatch {
-            expected: "Float64".into(),
-            actual: source.data_type().clone(),
-            context: "double_values".into(),
-        })?;
+    let values = try_downcast::<Float64Array>(source, "double_values")?;
 
     let doubled: Float64Array = values.iter().map(|v| v.map(|x| x * 2.0)).collect();
     Ok(Some(Arc::new(doubled)))
@@ -32,14 +25,7 @@ fn double_values(source: &ArrayRef) -> Result<Option<ArrayRef>, Error> {
 
 /// Repeats every float64 value 3 times, producing a list array.
 fn repeat3(source: &ArrayRef) -> Result<Option<ArrayRef>, Error> {
-    let values = source
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .ok_or_else(|| Error::TypeMismatch {
-            expected: "Float64".into(),
-            actual: source.data_type().clone(),
-            context: "repeat3".into(),
-        })?;
+    let values = try_downcast::<Float64Array>(source, "repeat3")?;
 
     let repeated: ListArray = ListArray::from_iter_primitive::<Float64Type, _, _>(
         values
@@ -52,14 +38,7 @@ fn repeat3(source: &ArrayRef) -> Result<Option<ArrayRef>, Error> {
 /// Prepends a prefix to every string value.
 fn prepend(prefix: String) -> impl Fn(&ArrayRef) -> Result<Option<ArrayRef>, Error> {
     move |source: &ArrayRef| {
-        let values = source
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::TypeMismatch {
-                expected: "Utf8".into(),
-                actual: source.data_type().clone(),
-                context: "prepend".into(),
-            })?;
+        let values = try_downcast::<StringArray>(source, "prepend")?;
 
         let prefixed: StringArray = values
             .iter()
@@ -71,14 +50,7 @@ fn prepend(prefix: String) -> impl Fn(&ArrayRef) -> Result<Option<ArrayRef>, Err
 
 /// Replaces Float64 values > 4.0 with `null`, passes others through.
 fn nullify_gt4(source: &ArrayRef) -> Result<Option<ArrayRef>, Error> {
-    let values = source
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .ok_or_else(|| Error::TypeMismatch {
-            expected: "Float64".into(),
-            actual: source.data_type().clone(),
-            context: "nullify_gt4".into(),
-        })?;
+    let values = try_downcast::<Float64Array>(source, "nullify_gt4")?;
 
     let result: Float64Array = values
         .iter()
@@ -131,9 +103,7 @@ fn test_runtime() -> Runtime {
     registry.register("prepend", prepend).unwrap();
     registry.register("nullify_gt4", || nullify_gt4).unwrap();
 
-    Runtime {
-        function_registry: Arc::new(registry),
-    }
+    Runtime::new(Arc::new(registry))
 }
 
 // -- Registry unit tests -----------------------------------------------------
@@ -142,7 +112,7 @@ fn test_runtime() -> Runtime {
 fn register_and_get_no_args() {
     let rt = test_runtime();
 
-    assert!(rt.function_registry.get("double", &[]).is_ok());
+    assert!(rt.function_registry().get("double", &[]).is_ok());
 }
 
 #[test]
@@ -150,7 +120,7 @@ fn register_and_get_with_args() {
     let rt = test_runtime();
 
     assert!(
-        rt.function_registry
+        rt.function_registry()
             .get("prepend", &[Literal::String("hello_".into())])
             .is_ok()
     );
@@ -160,6 +130,7 @@ fn register_and_get_with_args() {
 fn get_unknown_function() {
     let registry = FunctionRegistry::new();
     let result = registry.get("nonexistent", &[]);
+    // Not `assert_matches!`, because the `Ok` variant is not `Debug`.
     assert!(matches!(
         result,
         Err(FunctionRegistryError::UnknownFunction { .. })
@@ -173,7 +144,7 @@ fn get_no_arg_function_with_extra_args() {
     // The zero-arg constructor ignores extra arguments, so this still succeeds.
     // This test documents the current behavior.
     let result = rt
-        .function_registry
+        .function_registry()
         .get("double", &[Literal::String("unexpected".into())]);
     assert!(result.is_ok());
 }
@@ -182,7 +153,8 @@ fn get_no_arg_function_with_extra_args() {
 fn get_one_arg_function_with_no_args() {
     let rt = test_runtime();
 
-    let result = rt.function_registry.get("prepend", &[]);
+    let result = rt.function_registry().get("prepend", &[]);
+    // Not `assert_matches!`, because the `Ok` variant is not `Debug`.
     assert!(matches!(
         result,
         Err(FunctionRegistryError::WrongArguments { .. })
@@ -193,9 +165,9 @@ fn get_one_arg_function_with_no_args() {
 fn register_multiple_functions() {
     let rt = test_runtime();
 
-    assert!(rt.function_registry.get("double", &[]).is_ok());
+    assert!(rt.function_registry().get("double", &[]).is_ok());
     assert!(
-        rt.function_registry
+        rt.function_registry()
             .get("prepend", &[Literal::String("x_".into())])
             .is_ok()
     );

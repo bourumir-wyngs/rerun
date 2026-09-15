@@ -1,13 +1,14 @@
 ---
 title: Implement custom visualizations (Rust only)
 order: 200
-description: How to extend the Rerun Viewer UI using Rust and egui
+description: Extend the Rerun Viewer UI using Rust and egui
 ---
 
 There are three ways to extend the Rerun Viewer with custom Rust code, depending on how deep you need to go:
 embedding custom UI panels alongside the Viewer, adding a custom visualizer to a built-in view, or implementing an entirely new view class.
 
-**⚠️ Note that the interfaces for extending the Viewer are not yet stable.** Expect code implementing custom extensions to break with every release of Rerun.
+> [!WARNING]
+> The interfaces for extending the Viewer are not yet stable. Expect code implementing custom extensions to break with every release of Rerun.
 
 
 ## Embedding custom UI in the Viewer
@@ -18,7 +19,7 @@ In the above screenshot you see the example [`extend_viewer_ui`](https://github.
 
 ### How to build it
 
-The Rerun Viewer is defined by the crate [`re_viewer`](https://github.com/rerun-io/rerun/tree/main/crates/viewer/re_viewer). It uses the popular Rust GUI library [`egui`](https://github.com/emilk/egui) (written by our CTO) and its framework [`eframe`](https://github.com/emilk/egui/tree/master/crates/eframe). To extend the UI you need to create your own `eframe` application and embed `re_viewer` inside of it. You can then use `egui` to add custom panels and windows.
+The Rerun Viewer is defined by the crate [`re_viewer`](https://github.com/rerun-io/rerun/tree/main/crates/top/re_viewer?speculative-link). It uses the popular Rust GUI library [`egui`](https://github.com/emilk/egui) (written by our CTO) and its framework [`eframe`](https://github.com/emilk/egui/tree/master/crates/eframe). To extend the UI you need to create your own `eframe` application and embed `re_viewer` inside of it. You can then use `egui` to add custom panels and windows.
 
 The best way to get started is by reading [the source code of the `extend_viewer_ui` example](https://github.com/rerun-io/rerun/tree/main/examples/rust/extend_viewer_ui).
 

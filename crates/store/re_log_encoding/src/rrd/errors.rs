@@ -1,5 +1,6 @@
 use re_build_info::CrateVersion;
 use re_chunk::ChunkError;
+use re_protos::common::v1alpha1::ext;
 
 pub type CodecResult<T> = Result<T, CodecError>;
 
@@ -18,8 +19,8 @@ pub enum CodecError {
         "Data from Rerun version {file}, which is incompatible with the local Rerun version {local}"
     )]
     IncompatibleRerunVersion {
-        file: Box<CrateVersion>,
-        local: Box<CrateVersion>,
+        file: Box<CrateVersion<'static>>,
+        local: Box<CrateVersion<'static>>,
     },
 
     #[error("{0}")]
@@ -42,6 +43,13 @@ pub enum CodecError {
 
     #[error("Arrow IPC deserialization error: {0}")]
     ArrowDeserialization(::arrow::error::ArrowError),
+
+    #[error(transparent)]
+    GetColumn(#[from] re_arrow_util::GetColumnError),
+
+    /// A column was missing, had the wrong datatype, or had unexpected nulls.
+    #[error(transparent)]
+    Quiver(#[from] quiver::Error),
 
     #[error("Arrow IPC serialization error: {0}")]
     ArrowSerialization(::arrow::error::ArrowError),
@@ -81,6 +89,15 @@ pub enum CodecError {
 
     #[error("Integer overflow: {0}")]
     Overflow(#[from] std::num::TryFromIntError),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Chunk {chunk_id} not found in manifest")]
+    ChunkNotInManifest { chunk_id: re_chunk::ChunkId },
+
+    #[error("Invalid timeline name: {0}")]
+    InvalidTimelineName(#[from] re_log_types::InvalidTimelineNameError),
 }
 
 const _: () = assert!(
@@ -100,11 +117,22 @@ impl From<ChunkError> for CodecError {
     }
 }
 
-impl From<re_protos::common::v1alpha1::ext::StoreIdMissingApplicationIdError> for CodecError {
-    fn from(value: re_protos::common::v1alpha1::ext::StoreIdMissingApplicationIdError) -> Self {
+impl From<ext::StoreIdMissingApplicationIdError> for CodecError {
+    fn from(value: ext::StoreIdMissingApplicationIdError) -> Self {
         Self::StoreIdMissingApplicationId {
             store_kind: value.store_kind,
             recording_id: value.recording_id,
+        }
+    }
+}
+
+impl From<ext::StoreIdFromProtoError> for CodecError {
+    fn from(value: ext::StoreIdFromProtoError) -> Self {
+        match value {
+            ext::StoreIdFromProtoError::MissingApplicationId(err) => err.into(),
+            ext::StoreIdFromProtoError::InvalidApplicationId(err) => {
+                re_protos::TypeConversionError::from(err).into()
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Utilities to log arbitrary data to Rerun.
 
-use re_types_core::{AsComponents, ComponentType, DynamicArchetype, Loggable};
+use re_types_core::{AsComponents, ComponentIdentifier, ComponentType, DynamicArchetype, ToArrow};
 
 use crate::{Component, SerializedComponentBatch};
 
@@ -25,7 +25,7 @@ impl AnyValues {
     #[inline]
     pub fn with_component_from_data(
         self,
-        field: impl AsRef<str>,
+        field: impl Into<ComponentIdentifier>,
         array: arrow::array::ArrayRef,
     ) -> Self {
         Self {
@@ -37,7 +37,7 @@ impl AnyValues {
     #[inline]
     pub fn with_component<C: Component>(
         self,
-        field: impl AsRef<str>,
+        field: impl Into<ComponentIdentifier>,
         loggable: impl IntoIterator<Item = impl Into<C>>,
     ) -> Self {
         Self {
@@ -49,9 +49,9 @@ impl AnyValues {
     ///
     /// This method can be used to override the component type.
     #[inline]
-    pub fn with_component_override<L: Loggable>(
+    pub fn with_component_override<L: ToArrow>(
         self,
-        field: impl AsRef<str>,
+        field: impl Into<ComponentIdentifier>,
         component_type: impl Into<ComponentType>,
         loggable: impl IntoIterator<Item = impl Into<L>>,
     ) -> Self {
@@ -74,7 +74,7 @@ mod test {
 
     use std::collections::BTreeSet;
 
-    use re_types_core::datatypes::Utf8;
+    use re_types_core::encodings::Utf8;
 
     use super::*;
     use crate::{ComponentDescriptor, components};

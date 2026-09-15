@@ -5,8 +5,8 @@ title: "ImageFormat"
 
 The metadata describing the contents of a [`components.ImageBuffer`](https://rerun.io/docs/reference/types/components/image_buffer).
 
-## Rerun datatype
-[`ImageFormat`](../datatypes/image_format.md)
+## Rerun encoding
+[`ImageFormat`](../encodings/image_format.md)
 
 
 ## Arrow datatype
@@ -29,7 +29,7 @@ Struct(
 ## Used by
 
 * [`DepthImage`](../archetypes/depth_image.md)
-* [`GridMap`](../archetypes/grid_map.md?speculative-link)
+* [`GridMap`](../archetypes/grid_map.md)
 * [`Image`](../archetypes/image.md)
 * [`Mesh3D`](../archetypes/mesh3d.md)
 * [`SegmentationImage`](../archetypes/segmentation_image.md)

@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
 
+use re_byte_size::SizeBytes;
+
 use crate::{Error, Scheme};
 
 /// `scheme://hostname:port`
@@ -12,7 +14,41 @@ pub struct Origin {
     pub port: u16,
 }
 
+impl SizeBytes for Origin {
+    fn heap_size_bytes(&self) -> u64 {
+        let Self {
+            scheme: _,
+            host,
+            port: _,
+        } = self;
+
+        match host {
+            url::Host::Domain(s) => s.heap_size_bytes(),
+            url::Host::Ipv4(_) | url::Host::Ipv6(_) => 0,
+        }
+    }
+}
+
 impl Origin {
+    /// `rerun+http://127.0.0.1:{port}`
+    pub fn http_local_host(port: u16) -> Self {
+        Self::from_scheme_and_socket_addr(
+            Scheme::RerunHttp,
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        )
+    }
+
+    /// A dummy origin, for tests that need one but don't connect to anything.
+    ///
+    /// Should only be used in tests and examples.
+    pub fn test() -> Self {
+        Self {
+            scheme: Scheme::RerunHttps,
+            host: url::Host::Domain("example.com".to_owned()),
+            port: 443,
+        }
+    }
+
     pub fn from_scheme_and_socket_addr(scheme: Scheme, socket_addr: SocketAddr) -> Self {
         Self {
             scheme,
@@ -71,7 +107,7 @@ impl Origin {
                 (Scheme::RerunHttp, format!("http://{input}"))
             } else if input.contains("rerun.io") {
                 // Default to `rerun://` (gRPC over TLS)
-                (Scheme::Rerun, format!("https://{input}"))
+                (Scheme::RerunHttps, format!("https://{input}"))
             } else {
                 return Err(Error::InvalidScheme);
             }
@@ -170,16 +206,34 @@ fn is_host_localhost(host: &url::Host) -> bool {
     }
 }
 
-#[test]
-fn test_origin_format() {
-    assert_eq!(
-        Origin::from_scheme_and_socket_addr(Scheme::Rerun, "192.168.0.2:1234".parse().unwrap())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_origin_format() {
+        assert_eq!(
+            Origin::from_scheme_and_socket_addr(
+                Scheme::RerunHttps,
+                "192.168.0.2:1234".parse().unwrap()
+            )
             .to_string(),
-        "rerun://192.168.0.2:1234"
-    );
-    assert_eq!(
-        Origin::from_scheme_and_socket_addr(Scheme::Rerun, "0.0.0.0:1234".parse().unwrap())
+            "rerun://192.168.0.2:1234"
+        );
+        assert_eq!(
+            Origin::from_scheme_and_socket_addr(
+                Scheme::RerunHttps,
+                "0.0.0.0:1234".parse().unwrap()
+            )
             .to_string(),
-        "rerun://127.0.0.1:1234"
-    );
+            "rerun://127.0.0.1:1234"
+        );
+    }
+
+    #[test]
+    fn test_rerun_alias() {
+        let https = "rerun+https://some.url.io:443".parse::<Origin>().unwrap();
+        let rerun = "rerun://some.url.io:443".parse::<Origin>().unwrap();
+        assert_eq!(https, rerun);
+    }
 }

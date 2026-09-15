@@ -18,10 +18,10 @@ pub fn workspace_root() -> Utf8PathBuf {
 }
 
 pub fn default_build_dir() -> Utf8PathBuf {
-    // crates/viewer/re_web_viewer_server/web_viewer
+    // crates/top/re_web_viewer_server/web_viewer
     workspace_root()
         .join("crates")
-        .join("viewer")
+        .join("top")
         .join("re_web_viewer_server")
         .join("web_viewer")
 }
@@ -82,6 +82,7 @@ pub fn build(
     build_dir: &Utf8Path,
     no_default_features: bool,
     features: &String,
+    timings: bool,
 ) -> anyhow::Result<()> {
     std::env::set_current_dir(workspace_root())?;
 
@@ -92,7 +93,8 @@ pub fn build(
     // Where we tell cargo to build to.
     // We want this to be different from the default target folder
     // in order to support recursive cargo builds (calling `cargo` from within a `build.rs`).
-    let target_wasm_dir = Utf8PathBuf::from(format!("{}_wasm", target_directory()));
+    // Nesting it inside the target folder means `cargo clean` removes it too.
+    let target_wasm_dir = target_directory().join("wasm");
 
     // Workspace root
     let root_dir = workspace_root();
@@ -133,6 +135,9 @@ pub fn build(
         }
         if profile == Profile::WebRelease {
             cmd.arg("--profile=web-release");
+        }
+        if timings {
+            cmd.arg("--timings");
         }
 
         // Note that we can't use RUSTFLAGS here directly since having more than one flag on set via
@@ -196,9 +201,8 @@ pub fn build(
                 https://github.com/AlexEne/twiggy/blob/945e6241bf7b6d918fba17082d0b12eae1c56349/guide/src/usage/command-line-interface/paths.md
                 "
             );
-            } else {
-                return Err(err.context("Failed to run wasm-bindgen"));
             }
+            return Err(err.context("Failed to run wasm-bindgen"));
         }
 
         eprintln!(
@@ -220,6 +224,14 @@ pub fn build(
             "--output",
             wasm_path.as_str(),
             "--enable-reference-types",
+            // We compile with `-Ctarget-feature=+simd128,+bulk-memory,+nontrapping-fptoint,+multivalue`
+            // (see `.cargo/config.toml`). The JS loader feature-detects SIMD
+            // before loading the .wasm; every other feature here shipped strictly
+            // earlier in Chrome/Firefox/Safari, so the SIMD check covers them too.
+            "--enable-simd",
+            "--enable-bulk-memory",
+            "--enable-nontrapping-float-to-int",
+            "--enable-multivalue",
             "--vacuum",
         ];
         if debug_symbols {

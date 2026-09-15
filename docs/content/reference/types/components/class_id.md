@@ -5,8 +5,8 @@ title: "ClassId"
 
 A 16-bit ID representing a type of semantic class.
 
-## Rerun datatype
-[`ClassId`](../datatypes/class_id.md)
+## Rerun encoding
+[`ClassId`](../encodings/class_id.md)
 
 
 ## Arrow datatype
@@ -28,6 +28,7 @@ UInt16
 * [`Boxes3D`](../archetypes/boxes3d.md)
 * [`Capsules3D`](../archetypes/capsules3d.md)
 * [`Cylinders3D`](../archetypes/cylinders3d.md)
+* [`Ellipses2D`](../archetypes/ellipses2d.md)
 * [`Ellipsoids3D`](../archetypes/ellipsoids3d.md)
 * [`GeoPoints`](../archetypes/geo_points.md)
 * [`LineStrips2D`](../archetypes/line_strips2d.md)

@@ -71,11 +71,15 @@ export default class WebViewer extends React.Component {
     } else {
       // We only need to diff the recordings.
 
-      const prev = toArray(prevProps.rrd);
-      const current = toArray(this.props.rrd);
-      const { added, removed } = diff(prev, current);
-      this.#handle.open(added);
-      this.#handle.close(removed);
+      if (!this.#handle.ready) {
+        return;
+      }
+
+      syncRecordings(
+        this.#handle,
+        toArray(prevProps.rrd),
+        toArray(this.props.rrd),
+      );
     }
   }
 
@@ -120,17 +124,28 @@ function pascalToSnake(str) {
  */
 function startViewer(handle, parent, getProps) {
   const props = getProps();
-  handle.start(toArray(props.rrd), parent, {
-    manifest_url: props.manifest_url,
-    render_backend: props.render_backend,
-    hide_welcome_screen: props.hide_welcome_screen,
-    theme: props.theme,
+  const initial = toArray(props.rrd);
+  handle
+    .start(initial, parent, {
+      manifest_url: props.manifest_url,
+      render_backend: props.render_backend,
+      hide_welcome_screen: props.hide_welcome_screen,
+      theme: props.theme,
 
-    // NOTE: `width`, `height` intentionally ignored, they will
-    //       instead be used on the parent `div` element
-    width: "100%",
-    height: "100%",
-  });
+      // NOTE: `width`, `height` intentionally ignored, they will
+      //       instead be used on the parent `div` element
+      width: "100%",
+      height: "100%",
+    })
+    .then(() => {
+      if (!handle.ready) {
+        return;
+      }
+
+      const { rrd } = getProps();
+      syncRecordings(handle, initial, toArray(rrd));
+    })
+    .catch(() => {});
 
   for (const key of Object.keys(props)) {
     if (key.startsWith("on")) {
@@ -157,6 +172,24 @@ function diff(prev, current) {
     added: current.filter((v) => !prevSet.has(v)),
     removed: prev.filter((v) => !currentSet.has(v)),
   };
+}
+
+/**
+ * Reconcile the currently open recordings with the latest props.
+ *
+ * @param {rerun.WebViewer} handle
+ * @param {string[]} prev
+ * @param {string[]} current
+ */
+function syncRecordings(handle, prev, current) {
+  const { added, removed } = diff(prev, current);
+
+  if (removed.length > 0) {
+    handle.close(removed);
+  }
+  if (added.length > 0) {
+    handle.open(added);
+  }
 }
 
 /**

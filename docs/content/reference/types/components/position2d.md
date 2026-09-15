@@ -5,8 +5,8 @@ title: "Position2D"
 
 A position in 2D space.
 
-## Rerun datatype
-[`Vec2D`](../datatypes/vec2d.md)
+## Rerun encoding
+[`Vec2D`](../encodings/vec2d.md)
 
 
 ## Arrow datatype
@@ -24,5 +24,6 @@ FixedSizeList(2 x non-null Float32)
 
 * [`Arrows2D`](../archetypes/arrows2d.md)
 * [`Boxes2D`](../archetypes/boxes2d.md)
+* [`Ellipses2D`](../archetypes/ellipses2d.md)
 * [`GraphNodes`](../archetypes/graph_nodes.md)
 * [`Points2D`](../archetypes/points2d.md)

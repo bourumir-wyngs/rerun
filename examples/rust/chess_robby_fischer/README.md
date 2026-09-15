@@ -1,5 +1,6 @@
 <!--[metadata]
 title = "Robby fischer"
+description = "Robby Fischer is an autonomous chess-playing robot arm that detects human moves with per-square camera masks."
 tags = ["3D", "URDF", "Blueprint"]
 source = "https://github.com/02alexander/robby-fischer/tree/urdf-vis"
 thumbnail = "https://static.rerun.io/robby_thumbnail/71d2d57e9720e7a96e35a43467b5d2c45aa716d9/480w.png"
@@ -50,10 +51,10 @@ let _vision_handle = std::thread::spawn(move || {
 
 ### Robot arm
 
-Then, we install the official [URDF dataloader](https://github.com/rerun-io/rerun-loader-python-example-urdf) and use it to log the URDF model.
+Then, we install the official [URDF importer](https://github.com/rerun-io/rerun-loader-python-example-urdf) and use it to log the URDF model.
 
 ```rust
-// Rerun will find the dataloader in the `PATH` and use it to log `arm.urdf`.
+// Rerun will find the importer in the `PATH` and use it to log `arm.urdf`.
 rec.log_file_from_path("arm.urdf", None, false).unwrap();
 
 // Sets the position of the arm and rotates it 180 degrees.
