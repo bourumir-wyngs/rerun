@@ -4,6 +4,44 @@ import type { WebHandle, wasm_bindgen } from "./re_viewer";
 let get_wasm_bindgen: (() => typeof wasm_bindgen) | null = null;
 let _wasm_module: WebAssembly.Module | null = null;
 
+/**
+ * Feature-detect WebAssembly SIMD (`simd128`).
+ *
+ * The viewer .wasm is compiled with `-Ctarget-feature=+simd128`, so a browser
+ * without SIMD support will fail to instantiate the module with a cryptic
+ * `CompileError`. We probe up-front and surface a clear error instead.
+ *
+ * The probe is a minimal module that uses the `v128.any_true` instruction.
+ * Supported in: Chrome 91+, Firefox 89+, Safari 16.4+.
+ */
+function has_wasm_simd(): boolean {
+  try {
+    return WebAssembly.validate(new Uint8Array([
+      0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0,
+      10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11,
+    ]));
+  } catch {
+    return false;
+  }
+}
+
+const UNSUPPORTED_BROWSER_MESSAGE =
+  "Your browser is too old to run the Rerun Viewer. " +
+  "The Viewer requires WebAssembly SIMD support, available in " +
+  "Chrome 91+, Firefox 89+, Safari 16.4+, or any modern Chromium-based browser. " +
+  "Please update your browser and try again.";
+
+// The public export API uses streams so the private Wasm API can switch to incremental encoding
+// without requiring a breaking JavaScript API change.
+function export_stream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
 async function fetch_viewer_js(base_url?: string): Promise<(() => typeof wasm_bindgen)> {
   // @ts-ignore
   return (await import("./re_viewer")).default;
@@ -20,7 +58,7 @@ async function fetch_viewer_wasm(
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(
-      `Failed to fetch viewer WASM: ${response.status} ${response.statusText}`,
+      `Failed to fetch viewer Wasm: ${response.status} ${response.statusText}`,
     );
   }
   return wrap_fetch_with_progress(response, on_progress);
@@ -95,6 +133,10 @@ async function load(
   base_url?: string,
   on_progress?: (received: number, total: number | null) => void,
 ): Promise<typeof wasm_bindgen.WebHandle> {
+  if (!has_wasm_simd()) {
+    throw new Error(UNSUPPORTED_BROWSER_MESSAGE);
+  }
+
   // instantiate wbg globals+module for every invocation of `load`,
   // but don't load the JS/Wasm source every time
   if (!get_wasm_bindgen || !_wasm_module) {
@@ -153,6 +195,13 @@ export interface WebViewerOptions {
   hide_welcome_screen?: boolean;
 
   /**
+   * Override whether the viewer checks for newer Rerun releases on startup.
+   * Set to `false` to disable these checks.
+   * If not set, uses the saved user preference (enabled by default).
+   */
+  check_for_updates_on_startup?: boolean;
+
+  /**
    * Allow the viewer to handle fullscreen mode.
    * This option sets canvas style so is not recommended if you are doing anything custom,
    * or are embedding the viewer in an iframe.
@@ -199,8 +248,8 @@ export interface WebViewerOptions {
    * To use this:
    * 1. Host the `signed-in.html` and `signed-out.html` pages alongside your viewer.
    *    Templates can be found at:
-   *    - https://github.com/rerun-io/rerun/blob/main/crates/viewer/re_web_viewer_server/web_viewer/signed-in.html
-   *    - https://github.com/rerun-io/rerun/blob/main/crates/viewer/re_web_viewer_server/web_viewer/signed-out.html
+   *    - https://github.com/rerun-io/rerun/blob/main/crates/top/re_web_viewer_server/web_viewer/signed-in.html
+   *    - https://github.com/rerun-io/rerun/blob/main/crates/top/re_web_viewer_server/web_viewer/signed-out.html
    * 2. Set the URLs to those pages here.
    * 3. Contact your Rerun representative to have the redirect URLs
    *    and origin whitelisted in the OAuth configuration.
@@ -236,7 +285,7 @@ export interface AppOptions extends WebViewerOptions {
   fullscreen?: FullscreenOptions;
 }
 
-// Types are based on `crates/viewer/re_viewer/src/event.rs`.
+// Types are based on `crates/top/re_viewer/src/event.rs`.
 // Important: The event names defined here are `snake_case` versions
 // of their `PascalCase` counterparts on the Rust side.
 /** An event produced in the Viewer. */
@@ -421,7 +470,7 @@ function resolveAbsoluteUrl(url: string): string {
  * ```
  *
  * Data may be provided to the Viewer as:
- * - An HTTP file URL, e.g. `viewer.start("https://app.rerun.io/version/0.31.1/examples/dna.rrd")`
+ * - An HTTP file URL, e.g. `viewer.start("https://app.rerun.io/version/0.38.1/examples/dna.rrd")`
  * - A Rerun gRPC URL, e.g. `viewer.start("rerun+http://127.0.0.1:9876/proxy")`
  * - A stream of log messages, via {@link WebViewer.open_channel}.
  *
@@ -733,11 +782,8 @@ export class WebViewer {
    * The viewer must have been started via {@link WebViewer.start}.
    *
    * @param rrd URLs to `.rrd` files or gRPC connections to our SDK.
-   * @param options
-   *        - follow_if_http: Whether Rerun should open the resource in "Following" mode when streaming
-   *        from an HTTP url. Defaults to `false`. Ignored for non-HTTP URLs.
    */
-  open(rrd: string | string[], options: { follow_if_http?: boolean } = {}) {
+  open(rrd: string | string[]) {
     if (!this.#handle) {
       throw new Error(`attempted to open \`${rrd}\` in a stopped viewer`);
     }
@@ -745,7 +791,7 @@ export class WebViewer {
     const urls = Array.isArray(rrd) ? rrd : [rrd];
     for (const url of urls) {
       try {
-        this.#handle.add_receiver(url, options.follow_if_http);
+        this.#handle.add_receiver(url);
       } catch (e) {
         this.#fail("Failed to open recording", String(e));
         throw e;
@@ -774,6 +820,42 @@ export class WebViewer {
         throw e;
       }
     }
+  }
+
+  /**
+   * Save the active recording as an `.rrd` byte stream.
+   *
+   * The snapshot is selected when this method is called.
+   * Concatenate all stream byte sequences to obtain one valid file.
+   * An individual sequence is not independently accepted by {@link WebViewer.open_channel}.
+   *
+   * @throws If the viewer is stopped or has no active recording.
+   */
+  save_recording(): ReadableStream<Uint8Array> {
+    if (!this.#handle) {
+      throw new Error(`attempted to save recording in a stopped web viewer`);
+    }
+
+    const bytes = this.#handle.save_recording();
+    return export_stream(bytes);
+  }
+
+  /**
+   * Save the active blueprint as an `.rbl` byte stream.
+   *
+   * The snapshot is selected when this method is called.
+   * Concatenate all stream byte sequences to obtain one valid file.
+   * An individual sequence is not independently accepted by {@link WebViewer.open_channel}.
+   *
+   * @throws If the viewer is stopped or has no active blueprint.
+   */
+  save_blueprint(): ReadableStream<Uint8Array> {
+    if (!this.#handle) {
+      throw new Error(`attempted to save blueprint in a stopped web viewer`);
+    }
+
+    const bytes = this.#handle.save_blueprint();
+    return export_stream(bytes);
   }
 
   /**

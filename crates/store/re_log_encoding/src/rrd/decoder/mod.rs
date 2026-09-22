@@ -34,7 +34,7 @@ use crate::{ApplicationIdInjector, MessageKind, ToApplication as _};
 /// Implemented for top-level types that can kickoff decoding.
 ///
 /// There are only two of them in this crate:
-/// * [`re_log_types::LogMsg`]: application-level root message
+/// * [`re_log_msg::LogMsg`]: application-level root message
 /// * [`re_protos::log_msg::v1alpha1::log_msg::Msg`]: transport-level root message
 ///
 /// This can be used to generically instantiate transport- and/or application-level decoders.
@@ -47,17 +47,17 @@ pub trait DecoderEntrypoint: Sized {
         byte_span_excluding_headers: re_chunk::Span<u64>,
         message_kind: crate::rrd::MessageKind,
         app_id_injector: &mut impl ApplicationIdInjector,
-        patched_version: Option<CrateVersion>,
+        patched_version: Option<CrateVersion<'static>>,
     ) -> Result<Option<Self>, crate::rrd::CodecError>;
 }
 
-impl DecoderEntrypoint for re_log_types::LogMsg {
+impl DecoderEntrypoint for re_log_msg::LogMsg {
     fn decode(
         data_excluding_headers: bytes::Bytes,
         byte_span_excluding_headers: re_chunk::Span<u64>,
         message_kind: crate::rrd::MessageKind,
         app_id_injector: &mut impl ApplicationIdInjector,
-        patched_version: Option<CrateVersion>,
+        patched_version: Option<CrateVersion<'static>>,
     ) -> Result<Option<Self>, crate::rrd::CodecError> {
         let Some(log_msg) = re_protos::log_msg::v1alpha1::log_msg::Msg::decode(
             data_excluding_headers,
@@ -82,7 +82,7 @@ impl DecoderEntrypoint for re_protos::log_msg::v1alpha1::log_msg::Msg {
         _byte_span_excluding_headers: re_chunk::Span<u64>,
         message_kind: crate::rrd::MessageKind,
         _app_id_injector: &mut impl ApplicationIdInjector,
-        _patched_version: Option<CrateVersion>,
+        _patched_version: Option<CrateVersion<'static>>,
     ) -> Result<Option<Self>, crate::rrd::CodecError> {
         let data = &data_excluding_headers;
 

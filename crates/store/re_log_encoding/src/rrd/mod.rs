@@ -2,7 +2,7 @@
 //!
 //! ⚠️Make sure to familiarize yourself with the [crate-level docs](crate) first. ⚠️
 //!
-//! RRD streams are used everywhere gRPC isn't: files, standard I/O, HTTP fetches, data-loaders, etc.
+//! RRD streams are used everywhere gRPC isn't: files, standard I/O, HTTP fetches, importers, etc.
 //! This module is completely unrelated to the Rerun Data Protocol (Redap) gRPC API.
 //! This module is also completely unrelated to the legacy SDK comms gRPC API.
 //!
@@ -26,6 +26,22 @@ mod decoder;
 #[cfg(feature = "encoder")]
 mod encoder;
 
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod test_util;
+
+#[cfg(feature = "decoder")]
+mod chunk_reader;
+
+#[cfg(feature = "decoder")]
+mod fingerprint;
+
+#[cfg(feature = "decoder")]
+mod footer_reader;
+
+#[cfg(feature = "decoder")]
+mod rrd_chunk_provider;
+
 #[cfg(feature = "encoder")]
 #[cfg(not(target_arch = "wasm32"))]
 mod file_sink;
@@ -33,6 +49,8 @@ mod file_sink;
 #[cfg(feature = "stream_from_http")]
 pub mod stream_from_http;
 
+#[cfg(feature = "decoder")]
+pub use self::chunk_reader::read_chunks;
 #[cfg(feature = "decoder")]
 pub use self::decoder::{
     DecodeError, Decoder, DecoderApp, DecoderEntrypoint, DecoderIterator, DecoderStream,
@@ -43,15 +61,20 @@ pub use self::encoder::{EncodeError, Encoder};
 pub use self::errors::{CodecError, CodecResult, NotAnRrdError, OptionsError};
 #[cfg(feature = "encoder")]
 #[cfg(not(target_arch = "wasm32"))]
-pub use self::file_sink::{FileFlushError, FileSink, FileSinkError};
-pub use self::footer::{
-    RawRrdManifest, RrdFooter, RrdManifest, RrdManifestBuilder, RrdManifestSha256,
-    RrdManifestStaticMap, RrdManifestTemporalMap, RrdManifestTemporalMapEntry,
+pub use self::file_sink::{FileFlushError, FileSink, FileSinkError, FileSinkOptions};
+#[cfg(feature = "decoder")]
+pub use self::fingerprint::RrdFingerprint;
+pub use self::footer::{HubRrdManifest, RrdFooter, read_raw_rrd_manifests};
+#[cfg(feature = "decoder")]
+pub use self::footer_reader::{
+    RrdMetadata, enumerate_legacy_metadata, enumerate_rrd_stores, read_rrd_footer,
 };
 pub use self::frames::{
     Compression, CrateVersion, EncodingOptions, MessageHeader, MessageKind, Serializer,
     StreamFooter, StreamFooterEntry, StreamHeader,
 };
+#[cfg(feature = "decoder")]
+pub use self::rrd_chunk_provider::RrdChunkProvider;
 
 // ---
 
@@ -104,7 +127,7 @@ pub trait Encodable {
 /// * etc
 ///
 /// All it does is map RRD bytes to transport-level types. If you're interested into turning these
-/// transport-level types into higher-level objects (such as [`re_log_types::LogMsg`] with all kinds
+/// transport-level types into higher-level objects (such as [`re_log_msg::LogMsg`] with all kinds
 /// of application-level transformations applied (such as the one mentioned above), then have a look at the
 /// [`ToApplication`] trait.
 ///

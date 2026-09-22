@@ -1,3 +1,5 @@
+#![allow(clippy::iter_over_hash_type)]
+
 //! A chunk of Rerun data, encoded using Arrow. Used for logging, transport, storage and compute.
 //!
 //! ## Feature flags
@@ -6,13 +8,15 @@
 
 mod builder;
 mod chunk;
+mod earliest_at;
 mod iter;
 mod latest_at;
 mod merge;
 mod range;
 mod shuffle;
 mod slice;
-mod split;
+pub mod split_columns;
+mod split_rows;
 mod transport;
 mod unit_chunk;
 
@@ -37,12 +41,14 @@ pub use self::builder::{ChunkBuilder, TimeColumnBuilder};
 pub use self::chunk::{
     Chunk, ChunkComponents, ChunkError, ChunkResult, TimeColumn, TimeColumnError,
 };
+pub use self::earliest_at::EarliestAtQuery;
 pub use self::iter::{
-    ChunkComponentIter, ChunkComponentIterItem, ChunkComponentSlicer, ChunkIndicesIter,
+    BoolOptSliceIter, ChunkComponentIter, ChunkComponentIterItem, ChunkComponentSlicer,
+    ChunkIndicesIter, NativeOptSliceIter, StringOptSliceIter,
 };
 pub use self::latest_at::LatestAtQuery;
 pub use self::range::{RangeQuery, RangeQueryOptions};
-pub use self::split::ChunkSplitConfig;
+pub use self::split_rows::SplitRowsOptions;
 pub use self::unit_chunk::{ChunkShared, UnitChunkShared};
 
 pub mod external {

@@ -5,8 +5,8 @@ title: "Blob"
 
 A binary blob of data.
 
-## Rerun datatype
-[`Blob`](../datatypes/blob.md)
+## Rerun encoding
+[`Blob`](../encodings/blob.md)
 
 
 ## Arrow datatype
@@ -23,6 +23,7 @@ List(non-null UInt8)
 ## Used by
 
 * [`Asset3D`](../archetypes/asset3d.md)
+* [`AssetAudio`](../archetypes/asset_audio.md?speculative-link)
 * [`AssetVideo`](../archetypes/asset_video.md)
 * [`EncodedDepthImage`](../archetypes/encoded_depth_image.md)
 * [`EncodedImage`](../archetypes/encoded_image.md)

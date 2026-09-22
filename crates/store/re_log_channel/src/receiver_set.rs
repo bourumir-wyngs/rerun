@@ -225,7 +225,6 @@ fn test_receive_set() {
 
     let (tx_file, rx_file) = log_channel(LogSource::File {
         path: "path".into(),
-        follow: false,
     });
     let (tx_sdk, rx_sdk) = log_channel(LogSource::Sdk);
 
@@ -243,7 +242,6 @@ fn test_receive_set() {
         set.sources(),
         vec![Arc::new(LogSource::File {
             path: "path".into(),
-            follow: false
         })]
     );
 
@@ -256,15 +254,14 @@ fn test_receive_set() {
         vec![
             Arc::new(LogSource::File {
                 path: "path".into(),
-                follow: false
             }),
             Arc::new(LogSource::Sdk)
         ]
     );
 
     tx_sdk
-        .send(crate::DataSourceMessage::UiCommand(
-            crate::DataSourceUiCommand::SetUrlFragment {
+        .send(crate::DataSourceMessage::ViewerControl(
+            crate::ViewerControlCommand::SetUrlFragment {
                 store_id: StoreId::empty_recording(),
                 fragment: "#foo".into(),
             },
@@ -284,7 +281,6 @@ fn test_receive_set() {
         set.sources(),
         vec![Arc::new(LogSource::File {
             path: "path".into(),
-            follow: false
         })]
     );
 

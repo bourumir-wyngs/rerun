@@ -1,11 +1,11 @@
 use re_sdk_types::archetypes::DepthImage;
 use re_sdk_types::components::{DepthMeter, ImageBuffer, ImageFormat};
-use re_sdk_types::datatypes::{self, ChannelDatatype};
+use re_sdk_types::encodings::{self, ChannelDatatype};
 use re_sdk_types::{Archetype as _, AsComponents as _, ComponentBatch as _};
 
 #[test]
 fn depth_image_roundtrip() {
-    let format_expected = ImageFormat(datatypes::ImageFormat {
+    let format_expected = ImageFormat(encodings::ImageFormat {
         width: 3,
         height: 2,
         pixel_format: None,
@@ -33,7 +33,7 @@ fn depth_image_roundtrip() {
             .unwrap(),
     ];
 
-    for (expected, serialized) in all_expected.into_iter().zip(all_arch_serialized) {
+    for (expected, serialized) in std::iter::zip(all_expected, all_arch_serialized) {
         for (field, array) in &serialized {
             // NOTE: Keep those around please, very useful when debugging.
             // eprintln!("field = {field:#?}");

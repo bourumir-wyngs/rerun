@@ -24,7 +24,7 @@ pub struct HostMismatchError {
 }
 
 /// A JWT that is used to authenticate the client.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, re_byte_size::SizeBytes)]
 #[repr(transparent)]
 pub struct Jwt(pub(crate) String);
 
@@ -162,7 +162,7 @@ fn extract_allowed_hosts_from_jwt(jwt: &Jwt) -> Result<Vec<String>, JwtDecodeErr
 
 /// Check if a token's `allowed_hosts` claim permits the given host.
 ///
-/// Works for both Rerun Cloud tokens (RS256, from `WorkOS`) and Redap
+/// Works for both Rerun Hub tokens (RS256, from `WorkOS`) and Redap
 /// machine tokens (HS256, from `generate-token`).
 ///
 /// Returns `true` if:

@@ -1,9 +1,8 @@
-use anyhow::Context as _;
 use arrow::array::RecordBatch;
 use itertools::Itertools as _;
 use re_arrow_util::RecordBatchExt as _;
 use re_byte_size::SizeBytes as _;
-use re_log_types::{LogMsg, SetStoreInfo};
+use re_log_msg::{LogMsg, SetStoreInfo};
 use re_sdk::EntityPath;
 
 use crate::commands::read_rrd_streams_from_file_or_stdin;
@@ -98,10 +97,10 @@ impl PrintCommand {
         if migrate {
             println!("Showing data after migration to latest Rerun version");
         } else {
-            // TODO(#10343): implement this. Requires changing `ArrowMsg` to contain the unmigrated record batch
-            panic!(
-                "Not implemented - see https://github.com/rerun-io/rerun/issues/10343#issuecomment-3182422629"
-            );
+            // TODO(RR-5737): `ArrowMsg` only carries the migrated `ChunkBatch`, so the unmigrated
+            // data is gone by the time it reaches this command. Printing it means reading through
+            // the transport-level decoder instead.
+            panic!("`--migrate=false` is not implemented yet");
         }
 
         let (rx, rx_done) = read_rrd_streams_from_file_or_stdin(&path_to_input_rrds);
@@ -110,12 +109,7 @@ impl PrintCommand {
             let mut is_success = true;
 
             match res {
-                Ok(msg) => {
-                    if let Err(err) = print_msg(&options, msg) {
-                        re_log::error_once!("{}", re_error::format(err));
-                        is_success = false;
-                    }
-                }
+                Ok(msg) => print_msg(&options, msg),
 
                 Err(err) => {
                     re_log::error_once!("{}", re_error::format(err));
@@ -144,11 +138,7 @@ impl PrintCommand {
                     // Just to be nice: this will display the sorbet schema hash in the header.
                     rrd_manifest.data.schema_metadata_mut().insert(
                         "schema_sha_256".to_owned(),
-                        rrd_manifest
-                            .sorbet_schema_sha256
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>(),
+                        re_chunk_index::sha256_to_hex(&rrd_manifest.sorbet_schema_sha256),
                     );
 
                     let filter_lod_0 = |f: &arrow::datatypes::Field| f.name().starts_with("chunk_");
@@ -209,7 +199,7 @@ impl Options {
     }
 }
 
-fn print_msg(options: &Options, msg: LogMsg) -> anyhow::Result<()> {
+fn print_msg(options: &Options, msg: LogMsg) {
     match msg {
         LogMsg::SetStoreInfo(msg) => {
             let SetStoreInfo { row_id: _, info } = msg;
@@ -217,16 +207,15 @@ fn print_msg(options: &Options, msg: LogMsg) -> anyhow::Result<()> {
         }
 
         LogMsg::ArrowMsg(_store_id, arrow_msg) => {
-            let original_batch = &arrow_msg.batch;
+            let original_batch: &RecordBatch = &arrow_msg.batch;
 
             if options.migrate {
-                let migrared_chunk =
-                    re_sorbet::ChunkBatch::try_from(original_batch).context("corrupt chunk")?;
+                let migrared_chunk = &arrow_msg.batch;
 
                 if let Some(only_this_entity) = &options.entity
                     && migrared_chunk.entity_path() != only_this_entity
                 {
-                    return Ok(()); // not interested in this entity
+                    return; // not interested in this entity
                 }
 
                 print!(
@@ -251,10 +240,10 @@ fn print_msg(options: &Options, msg: LogMsg) -> anyhow::Result<()> {
                             .map(|(descr, _)| descr.to_string())
                             .collect_vec()
                             .join(" ");
-                        println!("data columns: [{column_descriptors}]",);
+                        println!("data columns: [{column_descriptors}]");
                     }
                     _ => {
-                        println!("\n{}\n", options.format_record_batch(&migrared_chunk));
+                        println!("\n{}\n", options.format_record_batch(migrared_chunk));
                     }
                 }
             } else {
@@ -265,7 +254,7 @@ fn print_msg(options: &Options, msg: LogMsg) -> anyhow::Result<()> {
                         .or_else(|| metadata.get("rerun.entity_path"))
                     && only_this_entity != &EntityPath::parse_forgiving(chunk_entity_path)
                 {
-                    return Ok(()); // not interested in this entity
+                    return; // not interested in this entity
                 }
 
                 print!(
@@ -291,7 +280,7 @@ fn print_msg(options: &Options, msg: LogMsg) -> anyhow::Result<()> {
             }
         }
 
-        LogMsg::BlueprintActivationCommand(re_log_types::BlueprintActivationCommand {
+        LogMsg::BlueprintActivationCommand(re_log_msg::BlueprintActivationCommand {
             blueprint_id,
             make_active,
             make_default,
@@ -301,6 +290,4 @@ fn print_msg(options: &Options, msg: LogMsg) -> anyhow::Result<()> {
             );
         }
     }
-
-    Ok(())
 }

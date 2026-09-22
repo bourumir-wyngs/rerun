@@ -16,9 +16,12 @@ use crate::CallSource;
 #[cfg(feature = "analytics")]
 use crate::commands::AnalyticsCommands;
 use crate::commands::DownloadCommand;
-#[cfg(feature = "data_loaders")]
+use crate::commands::DumpPuffinCommand;
+#[cfg(feature = "importers")]
 use crate::commands::McapCommands;
 use crate::commands::RrdCommands;
+
+use super::cli_data_source::local_recordings_for_assets;
 
 // ---
 
@@ -67,7 +70,7 @@ Examples:
     Host a Rerun gRPC server without spawning a Viewer:
         rerun --serve-grpc
 
-    Spawn a Viewer without also hosting a gRPC server:
+    Open a Viewer connected to the default message proxy, while hosting its Viewer server on a free port:
         rerun --connect
 
     Connect to a Rerun Server:
@@ -76,6 +79,8 @@ Examples:
     Listen for incoming gRPC connections from the logging SDK and stream the results to disk:
         rerun --save new_recording.rrd
 "#;
+
+const DEFAULT_VIEWER_SERVER_PORT: u16 = 9876;
 
 /// Port argument that accepts either a port number or `auto`.
 ///
@@ -90,7 +95,7 @@ impl PortArg {
     fn port(&self) -> u16 {
         match self {
             Self::Port(port) => *port,
-            Self::Auto => 9876,
+            Self::Auto => DEFAULT_VIEWER_SERVER_PORT,
         }
     }
 
@@ -136,6 +141,21 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
+    /// A path to a `.rrd` file to register as an asset of every dataset containing a specified local recording.
+    ///
+    /// Assets hold static data, such as a mesh or a robot model, that is shared by every recording
+    /// in the dataset. Can be specified multiple times. Every asset applies to all local `.rrd`
+    /// recordings on the command line, regardless of argument order, so
+    /// `rerun --asset mesh.rrd robot.rrd other.rrd --asset urdf.rrd` registers both assets with
+    /// the datasets of both recordings.
+    ///
+    /// See <https://www.rerun.io/docs/concepts/query-and-transform/catalog-object-model#assets>
+    ///
+    /// The files are then loaded through the Viewer catalog, which turns on the
+    /// "Load files via Viewer catalog" setting if it is off.
+    #[clap(long = "asset", value_name = "PATH")]
+    assets: Vec<std::path::PathBuf>,
+
     /// What bind address IP to use.
     ///
     /// `::` will listen on all interfaces, IPv6 and IPv4.
@@ -144,12 +164,12 @@ struct Args {
 
     #[clap(
         long,
-        default_value = "75%",
         long_help = r"An upper limit on how much memory the Rerun Viewer should use.
 When this limit is reached, Rerun will drop the oldest data.
-Example: `16GB` or `50%` (of system total)."
+Example: `16GB` or `50%` (of system total).
+You can also set this in the settings panel."
     )]
-    memory_limit: String,
+    memory_limit: Option<String>,
 
     #[clap(
         long,
@@ -190,12 +210,12 @@ When persisted, the state will be stored at the following locations:
     )]
     persist_state: bool,
 
-    /// What port do we listen to for SDKs to connect to over gRPC.
+    /// What port the local Viewer server listens on.
     ///
+    /// The default port is 9876 when not using `--connect`.
     /// Use `auto` to always start a new viewer with a free port if the default is taken.
-    // Default is `re_grpc_server::DEFAULT_SERVER_PORT`, can't use symbollically if `server` feature is disabled
-    #[clap(long, default_value_t = PortArg::Port(9876))]
-    port: PortArg,
+    #[clap(long)]
+    port: Option<PortArg>,
 
     /// Alias for `--port auto`. Always start a new viewer.
     ///
@@ -235,16 +255,20 @@ When persisted, the state will be stored at the following locations:
     #[clap(long)]
     serve_grpc: bool,
 
-    /// Do not attempt to start a new server, instead try to connect to an existing one.
+    /// Connect the Viewer to an existing message proxy.
     ///
-    /// Optionally accepts a URL to a gRPC server.
+    /// The native Viewer still starts its local Viewer server on a free port by default.
+    /// Use `--port` to select its port.
     ///
-    /// The scheme must be one of `rerun://`, `rerun+http://`, or `rerun+https://`,
-    /// and the pathname must be `/proxy`.
+    /// Optionally accepts a URL or port for the upstream message proxy.
+    ///
+    /// A port expands to `rerun+http://127.0.0.1:<PORT>/proxy`.
+    /// A URL's scheme must be one of `rerun://`, `rerun+http://`, or `rerun+https://`,
+    /// and its pathname must be `/proxy`.
     ///
     /// The default is `rerun+http://127.0.0.1:9876/proxy`.
-    #[clap(long)]
-    #[expect(clippy::option_option)] // Tri-state: none, --connect, --connect <url>.
+    #[clap(long, value_name = "url/port")]
+    #[expect(clippy::option_option)] // Tri-state: none, --connect, --connect <url/port>.
     connect: Option<Option<String>>,
 
     /// This is a hint that we expect a recording to stream in very soon.
@@ -256,14 +280,6 @@ When persisted, the state will be stored at the following locations:
     /// This ensures that it won't blink for a few frames before switching to the recording.
     #[clap(long)]
     expect_data_soon: bool,
-
-    /// Tail .rrd files, waiting for new data to be appended after reaching EOF.
-    ///
-    /// Without this flag, .rrd files are read once and the viewer stops loading when EOF is reached.
-    /// With this flag, the viewer will keep watching for new data, which is useful for live streaming
-    /// from a writer process.
-    #[clap(long)]
-    follow: bool,
 
     /// The number of compute threads to use.
     ///
@@ -283,7 +299,7 @@ When persisted, the state will be stored at the following locations:
 - A path to a Rerun .rrd recording
 - A path to a Rerun .rbl blueprint
 - An HTTP(S) URL to an .rrd or .rbl file to load
-- A path to an image or mesh, or any other file that Rerun can load (see https://www.rerun.io/docs/concepts/logging-and-ingestion/data-loaders/overview)
+- A path to an image or mesh, or any other file that Rerun can load (see https://www.rerun.io/docs/concepts/logging-and-ingestion/importers/overview)
 
 If no arguments are given, a server will be hosted which a Rerun SDK can connect to.")]
     url_or_paths: Vec<String>,
@@ -310,9 +326,37 @@ If no arguments are given, a server will be hosted which a Rerun SDK can connect
     #[clap(long)]
     hide_welcome_screen: bool,
 
-    /// Detach Rerun Viewer process from the application process.
+    /// Detach the native Rerun Viewer process from the invoking process.
+    ///
+    /// Ignored for any command that doesn't spawn a viewer.
     #[clap(long)]
     detach_process: bool,
+
+    /// Marks the relaunched child of a detached Rerun Viewer.
+    #[clap(long, hide = true)]
+    detached_process_child: bool,
+
+    /// Run the viewer in headless mode (no OS window).
+    ///
+    /// The viewer is driven by an offscreen `egui_kittest` harness, while the
+    /// gRPC server keeps running so SDK clients can still log data and request
+    /// screenshots via `save_screenshot`.
+    #[clap(long)]
+    headless: bool,
+
+    /// Run the viewer in the context of an integration test.
+    ///
+    /// This isolates the viewer from the developer's environment so tests are reproducible:
+    /// it does not read or write persisted viewer state (blueprints, panel layout, recent
+    /// servers), does not use stored redap credentials, and does not record analytics.
+    ///
+    /// Intended to be used together with `--headless` when driving the viewer over
+    /// `egui_inspection` from an integration test.
+    ///
+    /// Hidden from `--help` and the generated CLI manual: it's a testing-only flag, not part of
+    /// the public interface.
+    #[clap(long, hide = true)]
+    integration_test: bool,
 
     /// Set the screen resolution (in logical points), e.g. "1920x1080".
     /// Useful together with `--screenshot-to`.
@@ -452,16 +496,16 @@ impl Args {
                 return;
             }
 
-            let any_subcommands = cmd.get_subcommands().any(|cmd| cmd.get_name() != "help");
+            let any_subcommands = cmd
+                .get_subcommands()
+                .any(|cmd| cmd.get_name() != "help" && !cmd.is_hide_set());
             let any_positional_args = cmd.get_arguments().any(|arg| arg.is_positional());
             let any_floating_args = cmd.get_arguments().any(|arg| {
                 !arg.is_positional() && !arg.is_hide_set() && arg.get_long() != Some("help")
             });
 
-            let full_name = full_name
-                .into_iter()
-                .chain(std::iter::once(name.to_owned()))
-                .collect_vec();
+            let full_name =
+                std::iter::chain(full_name, std::iter::once(name.to_owned())).collect_vec();
 
             if !any_positional_args && !any_floating_args && !any_subcommands {
                 return;
@@ -504,7 +548,7 @@ impl Args {
             let commands = any_subcommands.then(|| {
                 let commands = cmd
                     .get_subcommands_mut()
-                    .filter(|cmd| cmd.get_name() != "help")
+                    .filter(|cmd| cmd.get_name() != "help" && !cmd.is_hide_set())
                     .map(|cmd| {
                         let name = cmd.get_name().to_owned();
                         let help = cmd.render_help().to_string();
@@ -528,7 +572,7 @@ impl Args {
             // > - A path to a Rerun .rrd recording
             // > - A path to a Rerun .rbl blueprint
             // > - An HTTP(S) URL to an .rrd or .rbl file to load
-            // > - A path to an image or mesh, or any other file that Rerun can load (see https://www.rerun.io/docs/concepts/logging-and-ingestion/data-loaders/overview)
+            // > - A path to an image or mesh, or any other file that Rerun can load (see https://www.rerun.io/docs/concepts/logging-and-ingestion/importers/overview)
             // >
             // > If no arguments are given, a server will be hosted which a Rerun SDK can connect to.
             // """
@@ -574,6 +618,9 @@ impl Args {
             *out += "\n\n";
 
             for cmd in cmd.get_subcommands_mut() {
+                if cmd.is_hide_set() {
+                    continue;
+                }
                 generate_markdown_manual(full_name.clone(), out, cmd);
             }
         }
@@ -599,8 +646,14 @@ enum Command {
 
     /// Download recordings and save them as .rrd files.
     ///
-    /// Supports downloading from Rerun Cloud as well as any other supported URI.
+    /// Supports downloading from Rerun Hub as well as any other supported URI.
     Download(DownloadCommand),
+
+    /// Dump a puffin profiler recording (`.puffin` file) as JSON.
+    ///
+    /// The output can be large; redirect it to a file and query it with e.g. `jq`.
+    #[command(name = "dump-puffin")]
+    DumpPuffin(DumpPuffinCommand),
 
     /// Generates the Rerun CLI manual (markdown).
     ///
@@ -608,9 +661,27 @@ enum Command {
     #[command(name = "man")]
     Manual,
 
-    #[cfg(feature = "data_loaders")]
+    #[cfg(feature = "importers")]
     #[command(subcommand)]
     Mcap(McapCommands),
+
+    /// Run an MCP server that controls a running Rerun Viewer.
+    ///
+    /// Register it with your agent using `claude mcp add rerun -- rerun viewer-mcp` or
+    /// `codex mcp add rerun -- rerun viewer-mcp`, or add an `mcp.json` entry with
+    /// `"command": "rerun"` and `"args": ["viewer-mcp"]`.
+    ///
+    /// See <https://rerun.io/docs/reference/viewer/mcp> for details.
+    #[cfg(feature = "native_viewer")]
+    #[command(name = "viewer-mcp")]
+    ViewerMcp {
+        /// gRPC endpoint of the viewer to connect to on startup, e.g. `http://127.0.0.1:9876`.
+        ///
+        /// Without it, the server starts unconnected and the agent picks a viewer with its
+        /// `connect` tool.
+        #[arg(long)]
+        endpoint: Option<url::Url>,
+    },
 
     /// Reset the memory of the Rerun Viewer.
     ///
@@ -677,10 +748,22 @@ where
         std::env::set_var("OTEL_SERVICE_NAME", "rerun");
     }
 
+    let raw_args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+
     use clap::Parser as _;
-    let mut args = Args::parse_from(args);
+    let mut args = Args::parse_from(raw_args.iter());
+    let asset_recordings = local_recordings_for_assets(&args.url_or_paths, &args.assets)?;
+
+    #[cfg(feature = "native_viewer")]
+    if should_relaunch_detached(&args) {
+        relaunch_detached(&raw_args)?;
+        return Ok(0);
+    }
+
     #[cfg(feature = "analytics")]
-    record_cli_command_analytics(&args);
+    if !args.integration_test {
+        record_cli_command_analytics(&args);
+    }
 
     initialize_thread_pool(args.threads);
 
@@ -690,10 +773,13 @@ where
 
     if args.version {
         println!("{build_info}");
+        #[cfg(feature = "video")]
         println!(
             "Video features: {}",
             re_video::enabled_features().iter().join(" ")
         );
+        #[cfg(not(feature = "video"))]
+        println!("Video features: (video support disabled in this build)");
         return Ok(0);
     }
 
@@ -716,6 +802,8 @@ where
 
             Command::Download(cmd) => cmd.run(tokio_runtime.handle()),
 
+            Command::DumpPuffin(cmd) => cmd.run(),
+
             Command::Manual => {
                 let man = Args::generate_markdown_manual();
                 let web_header = unindent::unindent(
@@ -723,15 +811,22 @@ where
                     ---
                     title: ⌨️ CLI manual
                     order: 1150
-                    ---\
+                    ---
+
+                    <!-- DO NOT EDIT! This file was auto-generated by `pixi run man`. -->\
                     ",
                 );
                 println!("{web_header}\n\n{man}");
                 Ok(())
             }
 
-            #[cfg(feature = "data_loaders")]
+            #[cfg(feature = "importers")]
             Command::Mcap(mcap) => mcap.run(),
+
+            #[cfg(feature = "native_viewer")]
+            Command::ViewerMcp { endpoint } => {
+                tokio_runtime.block_on(re_viewer_mcp::serve(endpoint))
+            }
 
             #[cfg(feature = "native_viewer")]
             Command::Reset => re_viewer::reset_viewer_persistence(),
@@ -779,6 +874,7 @@ where
             build_info,
             call_source,
             args,
+            asset_recordings,
             tokio_runtime.handle(),
             #[cfg(feature = "native_viewer")]
             profiler,
@@ -795,7 +891,7 @@ where
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::AddrInUse) =>
         {
-            re_log::warn!("{err}");
+            re_log::warn!("{err:#}");
             Ok(1)
         }
 
@@ -804,29 +900,157 @@ where
     }
 }
 
+#[cfg(feature = "native_viewer")]
+fn should_relaunch_detached(args: &Args) -> bool {
+    // Destructure to ensure we consider all fields when adding new ones.
+    let Args {
+        detach_process,
+        detached_process_child,
+        command,
+        serve_grpc,
+        serve_web,
+        web_viewer,
+        save,
+        test_receive,
+        version,
+
+        assets: _,
+        headless: _,
+        integration_test: _,
+        bind: _,
+        memory_limit: _,
+        server_memory_limit: _,
+        newest_first: _,
+        cors_allow_origin: _,
+        persist_state: _,
+        port: _,
+        new: _,
+        profile: _,
+        screenshot_to: _,
+        connect: _,
+        expect_data_soon: _,
+        threads: _,
+        url_or_paths: _,
+        web_viewer_port: _,
+        hide_welcome_screen: _,
+        window_size: _,
+        renderer: _,
+        video_decoder: _,
+    } = args;
+
+    *detach_process
+        && !detached_process_child
+        && command.is_none()
+        && !serve_grpc
+        && !serve_web
+        && !web_viewer
+        && save.is_none()
+        && !test_receive
+        && !version
+}
+
+#[cfg(feature = "native_viewer")]
+fn detached_child_args(raw_args: &[std::ffi::OsString]) -> Vec<&std::ffi::OsStr> {
+    let mut child_args = raw_args
+        .iter()
+        .skip(1)
+        .map(std::ffi::OsString::as_os_str)
+        .collect::<Vec<_>>();
+    let insertion_index = child_args
+        .iter()
+        .position(|arg| *arg == std::ffi::OsStr::new("--"))
+        .unwrap_or(child_args.len());
+    child_args.insert(
+        insertion_index,
+        std::ffi::OsStr::new("--detached-process-child"),
+    );
+    child_args
+}
+
+#[cfg(feature = "native_viewer")]
+fn relaunch_detached(raw_args: &[std::ffi::OsString]) -> anyhow::Result<()> {
+    let executable = std::env::current_exe()
+        .map_err(|err| anyhow::anyhow!("failed to locate the Rerun executable: {err}"))?;
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(detached_child_args(raw_args))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        // SAFETY: This runs in the forked child before exec and only calls the
+        // async-signal-safe `setsid`.
+        #[expect(unsafe_code)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt as _;
+
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(DETACHED_PROCESS);
+    }
+
+    command
+        .spawn()
+        .map_err(|err| anyhow::anyhow!("failed to launch the detached Rerun Viewer: {err}"))?;
+    Ok(())
+}
+
 fn run_impl(
     _main_thread_token: crate::MainThreadToken,
     _build_info: re_build_info::BuildInfo,
     _call_source: CallSource,
     args: Args,
+    _asset_recordings: Vec<std::path::PathBuf>,
     tokio_runtime_handle: &tokio::runtime::Handle,
     #[cfg(feature = "native_viewer")] profiler: re_tracing::Profiler,
 ) -> anyhow::Result<()> {
+    if !args.assets.is_empty() {
+        anyhow::ensure!(
+            !args.serve_grpc
+                && !args.serve_web
+                && args.save.is_none()
+                && !args.test_receive
+                && args.connect.is_none(),
+            "`--asset` only works when this command starts the Rerun Viewer itself"
+        );
+    }
+
     //TODO(#10068): populate token passed with `--token`
-    let connection_registry = re_redap_client::ConnectionRegistry::new_with_stored_credentials();
+    let connection_registry = if args.integration_test {
+        re_redap_client::ConnectionRegistry::new_without_stored_credentials()
+    } else {
+        re_redap_client::ConnectionRegistry::new_with_stored_credentials()
+    };
+    let async_runtime = re_async::AsyncRuntimeHandle::new_native(tokio_runtime_handle.clone());
 
-    let wants_new = args.new || args.port.is_auto();
-    let port = args.port.port();
+    let wants_new = args.new || args.port.as_ref().is_some_and(PortArg::is_auto);
+    let port = args
+        .port
+        .as_ref()
+        .map_or(DEFAULT_VIEWER_SERVER_PORT, PortArg::port);
 
-    let server_addr = if wants_new
+    let server_addr = if args.connect.is_some() && args.port.is_none() {
+        std::net::SocketAddr::new(args.bind, 0)
+    } else if wants_new
         && is_another_server_already_running(std::net::SocketAddr::new(args.bind, port))
     {
-        let default_port = port;
-        let free_port = find_free_port(args.bind)?;
-        re_log::info!(
-            "Default port {default_port} is already in use, using port {free_port} instead."
-        );
-        std::net::SocketAddr::new(args.bind, free_port)
+        re_log::info!("Default port {port} is already in use, using a free port instead.");
+        std::net::SocketAddr::new(args.bind, 0)
     } else {
         std::net::SocketAddr::new(args.bind, port)
     };
@@ -850,14 +1074,17 @@ fn run_impl(
     #[allow(clippy::allow_attributes, unused_mut)]
     let mut url_or_paths = args.url_or_paths.clone();
 
-    // Passing `--connect` accounts to adding a proxy URL to the list of URLs that we want to process.
+    // Treat `--connect` as another proxy URL to process.
     #[cfg(feature = "server")]
-    if let Some(url) = args.connect.clone() {
-        let url = url.unwrap_or_else(|| format!("rerun+http://{server_addr}/proxy"));
-        if let Err(err) = url.as_str().parse::<re_uri::RedapUri>() {
-            anyhow::bail!("expected `/proxy` endpoint: {err}");
+    if let Some(connect) = args.connect.clone() {
+        let uri = connect_proxy_uri(connect)?;
+        if args.port.is_some() && uri.origin().port == server_addr.port() {
+            re_log::warn!(
+                "The Viewer server and upstream message proxy are both configured to use port {}.",
+                server_addr.port()
+            );
         }
-        url_or_paths.push(url);
+        url_or_paths.push(uri.to_string());
     }
 
     // Now what do we do with the data?
@@ -866,8 +1093,8 @@ fn run_impl(
             url_or_paths,
             &UrlParamProcessingConfig::convert_everything_to_data_sources(),
             &connection_registry,
+            &async_runtime,
             None,
-            args.follow,
         )?;
         save_or_test_receive(
             args.save,
@@ -878,38 +1105,30 @@ fn run_impl(
             server_options,
         )
     } else if args.serve_grpc {
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "server")] {
+        cfg_select! {
+            feature = "server" => {
                 let receivers = ReceiversFromUrlParams::new(
                     url_or_paths,
                     &UrlParamProcessingConfig::convert_everything_to_data_sources(),
                     &connection_registry,
+                    &async_runtime,
                     None,
-                    args.follow,
                 )?;
-                serve_grpc(
-                    receivers,
-                    tokio_runtime_handle,
-                    server_addr,
-                    server_options,
-                )
-            } else {
-                Err(anyhow::anyhow!(
-                    "rerun-cli must be compiled with the 'server' feature enabled"
-                ))
+                serve_grpc(receivers, tokio_runtime_handle, server_addr, server_options)
             }
+            _ => Err(anyhow::anyhow!(
+                "rerun-cli must be compiled with the 'server' feature enabled"
+            )),
         }
     } else if args.serve_web {
-        cfg_if::cfg_if! {
-            if #[cfg(not(feature = "server"))] {
-                Err(anyhow::anyhow!(
-                    "Can't host server - rerun was not compiled with the 'server' feature"
-                ))
-            } else if #[cfg(not(feature = "web_viewer"))] {
-                Err(anyhow::anyhow!(
-                    "Can't host web-viewer - rerun was not compiled with the 'web_viewer' feature"
-                ))
-            } else {
+        cfg_select! {
+            not(feature = "server") => Err(anyhow::anyhow!(
+                "Can't host server - rerun was not compiled with the 'server' feature"
+            )),
+            not(feature = "web_viewer") => Err(anyhow::anyhow!(
+                "Can't host web-viewer - rerun was not compiled with the 'web_viewer' feature"
+            )),
+            _ => {
                 // We always host the web-viewer in case the users wants it,
                 // but we only open a browser automatically with the `--web-viewer` flag.
                 let open_browser = args.web_viewer;
@@ -918,8 +1137,8 @@ fn run_impl(
                     url_or_paths,
                     &UrlParamProcessingConfig::grpc_server_and_web_viewer(),
                     &connection_registry,
+                    &async_runtime,
                     None,
-                    args.follow,
                 )?;
                 #[cfg(all(feature = "server", feature = "web_viewer"))]
                 serve_web(
@@ -935,70 +1154,94 @@ fn run_impl(
         }
     } else if !wants_new && args.connect.is_none() && is_another_server_already_running(server_addr)
     {
+        if !args.assets.is_empty() {
+            re_log::warn!(
+                "`--asset` can't be passed on to an already open Viewer. Use `--port auto` to start a new one."
+            );
+        }
+
         let receivers = ReceiversFromUrlParams::new(
             url_or_paths,
             &UrlParamProcessingConfig::convert_everything_to_data_sources(),
             &connection_registry,
+            &async_runtime,
             None,
-            args.follow,
         )?;
         connect_to_existing_server(receivers, server_addr)
     } else {
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "native_viewer")] {
-                start_native_viewer(
-                    &args,
-                    url_or_paths,
-                    _main_thread_token,
-                    _build_info,
-                    _call_source,
-                    tokio_runtime_handle,
-                    profiler,
-                    connection_registry,
-                    #[cfg(feature = "server")]
-                    server_addr,
-                    #[cfg(feature = "server")]
-                    server_options,
-                )
-            } else {
-                Err(anyhow::anyhow!(
-                    "Can't start viewer - rerun was compiled without the 'native_viewer' feature"
-                ))
-            }
+        cfg_select! {
+            feature = "native_viewer" => start_native_viewer(
+                &args,
+                url_or_paths,
+                _asset_recordings,
+                _main_thread_token,
+                _build_info,
+                _call_source,
+                async_runtime,
+                profiler,
+                connection_registry,
+                #[cfg(feature = "server")]
+                server_addr,
+                #[cfg(feature = "server")]
+                server_options,
+            ),
+            _ => Err(anyhow::anyhow!(
+                "Can't start viewer - rerun was compiled without the 'native_viewer' feature"
+            )),
         }
     }
 }
 
 #[cfg(feature = "native_viewer")]
-#[expect(clippy::too_many_arguments)]
 #[allow(clippy::allow_attributes, unused_variables)]
 fn start_native_viewer(
     args: &Args,
     url_or_paths: Vec<String>,
+    asset_recordings: Vec<std::path::PathBuf>,
     _main_thread_token: re_viewer::MainThreadToken,
     _build_info: re_build_info::BuildInfo,
     call_source: CallSource,
-    tokio_runtime_handle: &tokio::runtime::Handle,
+    async_runtime: re_async::AsyncRuntimeHandle,
     profiler: re_tracing::Profiler,
     connection_registry: re_redap_client::ConnectionRegistryHandle,
     #[cfg(feature = "server")] server_addr: std::net::SocketAddr,
     #[cfg(feature = "server")] server_options: re_sdk::ServerOptions,
 ) -> anyhow::Result<()> {
-    use re_viewer::external::re_viewer_context;
+    use re_viewer::external::{eframe, re_viewer_context};
 
     use crate::external::re_ui::{UICommand, UICommandSender as _};
+    use re_viewer_context::SystemCommandSender as _;
+
+    use super::cli_data_source::take_asset_load_request;
 
     let startup_options = native_startup_options_from_args(args)?;
 
-    let connect = args.connect.is_some();
-    let follow = args.follow;
+    let integration_test = args.integration_test;
     let renderer = args.renderer.as_deref();
+    let assets = args.assets.clone();
+    let mut recordings = std::collections::HashSet::new();
+    for recording in asset_recordings {
+        let path = std::path::absolute(&recording).map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to resolve absolute path: {err}\nFile path: {}",
+                recording.display()
+            )
+        })?;
+        recordings.insert(path);
+    }
+    let memory_limit = args
+        .memory_limit
+        .as_ref()
+        .map(|memory_limit| {
+            re_log::debug!("Parsing --memory-limit (for Viewer)");
+            re_memory::MemoryLimit::parse(memory_limit)
+        })
+        .transpose()
+        .map_err(|err| anyhow::format_err!("Bad --memory-limit: {err}"))?;
 
     let (command_tx, command_rx) = re_viewer_context::command_channel();
 
     let auth_error_handler = re_viewer::App::auth_error_handler(command_tx.clone());
-
-    let tokio_runtime_handle = tokio_runtime_handle.clone();
 
     // Start catching `re_log::info/warn/error` messages
     // so we can show them in the notification panel.
@@ -1006,79 +1249,156 @@ fn start_native_viewer(
     // so we catch any warnings produced during startup.
     let text_log_rx = re_viewer::register_text_log_receiver();
 
-    re_viewer::run_native_app(
-        _main_thread_token,
-        Box::new(move |cc| {
-            {
-                let tx = command_tx.clone();
-                let egui_ctx = cc.egui_ctx.clone();
-                tokio::spawn(async move {
-                    // We catch ctrl-c commands so we can properly quit.
-                    // Without this, recent state changes might not be persisted.
-                    match tokio::signal::ctrl_c().await {
-                        Ok(()) => {
-                            re_log::info!("Caught Ctrl-C, quitting Rerun Viewer…");
-                            tx.send_ui(UICommand::Quit);
-                            egui_ctx.request_repaint();
-                        }
-                        Err(err) => {
-                            re_log::error!("Failed to listen for ctrl-c signal: {err}");
-                        }
+    // The in-process catalog connection must use the proxy's bound address because `server_addr`
+    // may contain port zero.
+    #[cfg(feature = "server")]
+    let (viewer_server_listener, internal_catalog, connection_registry) = {
+        let listener = re_grpc_server::ServerListener::bind(server_addr)?;
+        let internal_catalog = re_viewer::internal_catalog::build(listener.local_addr());
+        let connection_registry = connection_registry.with_internal(
+            internal_catalog.connection.clone(),
+            internal_catalog.storage_dir().to_owned(),
+        );
+        (listener, internal_catalog, connection_registry)
+    };
+
+    #[allow(clippy::allow_attributes, unused_mut)]
+    let ReceiversFromUrlParams {
+        mut log_receivers,
+        urls_to_pass_on_to_viewer,
+    } = ReceiversFromUrlParams::new(
+        url_or_paths,
+        &UrlParamProcessingConfig::native_viewer(),
+        &connection_registry,
+        &async_runtime,
+        Some(auth_error_handler),
+    )?;
+
+    #[cfg(feature = "server")]
+    let grpc_server_handle = {
+        let mut loopback_services = re_grpc_server::LoopbackServices::default();
+        loopback_services
+            .add_service(internal_catalog.grpc_service())
+            .add_http_route("/upload/{grant}", internal_catalog.write_upload_route());
+
+        let (log_receiver, handle) = re_grpc_server::spawn_with_recv_and_services(
+            viewer_server_listener,
+            server_options,
+            re_grpc_server::shutdown::never(),
+            loopback_services,
+        );
+        log_receivers.push(log_receiver);
+        handle
+    };
+
+    let create_app = move |cc: &eframe::CreationContext<'_>| -> re_viewer::App {
+        {
+            let tx = command_tx.clone();
+            let egui_ctx = cc.egui_ctx.clone();
+            async_runtime.spawn_future(async move {
+                // We catch ctrl-c commands so we can properly quit.
+                // Without this, recent state changes might not be persisted.
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => {
+                        re_log::info!("Caught Ctrl-C, quitting Rerun Viewer…");
+                        tx.send_ui(UICommand::Quit);
+                        egui_ctx.request_repaint();
                     }
-                });
-            }
-            let mut app = re_viewer::App::with_commands(
-                _main_thread_token,
-                _build_info,
-                call_source.app_env(),
-                startup_options,
-                cc,
-                Some(connection_registry.clone()),
-                re_viewer::AsyncRuntimeHandle::new_native(tokio_runtime_handle),
-                text_log_rx,
-                (command_tx, command_rx),
-            );
+                    Err(err) => {
+                        re_log::error!("Failed to listen for ctrl-c signal: {err}");
+                    }
+                }
+            });
+        }
+        let app_env = if integration_test {
+            re_viewer::AppEnvironment::Test
+        } else {
+            call_source.app_env()
+        };
+        let mut app = re_viewer::App::with_commands(
+            _main_thread_token,
+            _build_info,
+            app_env,
+            startup_options,
+            cc,
+            Some(connection_registry.clone()),
+            async_runtime,
+            text_log_rx,
+            (command_tx.clone(), command_rx),
+        );
 
-            #[allow(clippy::allow_attributes, unused_mut)]
-            let ReceiversFromUrlParams {
-                mut log_receivers,
-                urls_to_pass_on_to_viewer,
-            } = ReceiversFromUrlParams::new(
-                url_or_paths,
-                &UrlParamProcessingConfig::native_viewer(),
-                &connection_registry,
-                Some(auth_error_handler),
-                follow,
-            )?;
+        if let Some(memory_limit) = memory_limit {
+            app.app_options_mut().memory_limit = memory_limit;
+        }
 
-            // If we're **not** connecting to an existing server, we spawn a new one and add it to the list of receivers.
-            #[cfg(feature = "server")]
-            if !connect {
-                let log_receiver = re_grpc_server::spawn_with_recv(
-                    server_addr,
-                    server_options,
-                    re_grpc_server::shutdown::never(),
+        if !assets.is_empty() {
+            let app_options = app.app_options_mut();
+            if !app_options.use_viewer_catalog {
+                app_options.use_viewer_catalog = true;
+                re_log::warn!(
+                    "`--asset` needs the Viewer catalog, so \"Load files via Viewer catalog\" was turned on under Settings → Viewer catalog."
                 );
+            }
+        }
 
-                log_receivers.push(log_receiver);
+        #[cfg(feature = "server")]
+        {
+            struct ProxyHandleWrapper {
+                handle: re_grpc_server::MessageProxyHandle,
             }
 
-            app.set_profiler(profiler);
-            for rx in log_receivers {
-                app.add_log_receiver(rx);
+            impl re_viewer::ExternalMemoryUser for ProxyHandleWrapper {
+                fn capture(&mut self) -> Option<re_byte_size::NamedMemUsageTree> {
+                    self.handle
+                        .capture_memory()
+                        .map(|tree| re_byte_size::NamedMemUsageTree {
+                            name: "GRPC Server".to_owned(),
+                            value: tree,
+                        })
+                }
             }
-            for url in urls_to_pass_on_to_viewer {
+
+            app.add_external_memory_user(Box::new(ProxyHandleWrapper {
+                handle: grpc_server_handle,
+            }));
+        }
+
+        app.set_profiler(profiler);
+        for rx in log_receivers {
+            app.add_log_receiver(rx);
+        }
+        for url in urls_to_pass_on_to_viewer {
+            if let Some(request) = take_asset_load_request(&url, &mut recordings, &assets) {
+                command_tx.send_system(request);
+            } else {
                 app.open_url_or_file(&url);
             }
-            if let Ok(url) = std::env::var("EXAMPLES_MANIFEST_URL") {
-                app.set_examples_manifest_url(url);
-            }
+        }
+        if let Ok(url) = std::env::var("EXAMPLES_MANIFEST_URL") {
+            app.set_examples_manifest_url(url);
+        }
 
-            Ok(Box::new(app))
-        }),
-        renderer,
-    )
-    .map_err(|err| err.into())
+        app
+    };
+
+    if args.headless {
+        let window_size = args
+            .window_size
+            .as_deref()
+            .map(parse_size)
+            .transpose()?
+            .map(|[w, h]| re_viewer::external::egui::Vec2::new(w, h));
+
+        re_viewer::run_headless_app(Box::new(create_app), renderer, window_size)
+            .map_err(|err| err.into())
+    } else {
+        re_viewer::run_native_app(
+            _main_thread_token,
+            Box::new(move |cc| Ok(Box::new(create_app(cc)))),
+            renderer,
+        )
+        .map_err(|err| err.into())
+    }
 }
 
 #[cfg(feature = "native_viewer")]
@@ -1096,12 +1416,7 @@ fn native_startup_options_from_args(args: &Args) -> anyhow::Result<re_viewer::St
     Ok(re_viewer::StartupOptions {
         hide_welcome_screen: args.hide_welcome_screen,
         detach_process: args.detach_process,
-        memory_limit: {
-            re_log::debug!("Parsing --memory-limit (for Viewer)");
-            re_memory::MemoryLimit::parse(&args.memory_limit)
-                .map_err(|err| anyhow::format_err!("Bad --memory-limit: {err}"))?
-        },
-        persist_state: args.persist_state,
+        persist_state: args.persist_state && !args.integration_test,
         is_in_notebook: false,
         screenshot_to_path_then_quit: args.screenshot_to.clone(),
 
@@ -1181,28 +1496,33 @@ fn serve_web(
     // Don't spawn a server if there's only a bunch of URIs that we want to view directly.
     let spawn_server = !log_receivers.is_empty() || urls_to_pass_on_to_viewer.is_empty();
     if spawn_server {
-        if server_addr.port() == web_viewer_port {
+        // The proxy URL must use the bound address because `server_addr` may contain port zero.
+        let listener = re_grpc_server::ServerListener::bind(server_addr)?;
+        let local_addr = listener.local_addr();
+
+        if local_addr.port() == web_viewer_port {
             anyhow::bail!(
                 "Trying to spawn a Web Viewer server on {}, but this port is \
                     already used by the server we're connecting to. Please specify a different port.",
-                server_addr.port()
+                local_addr.port()
             );
         }
 
         // Spawn a server which the Web Viewer can connect to.
         // All `rxs` are consumed by the server.
-        re_grpc_server::spawn_from_rx_set(
-            server_addr,
+        // We don't render a dev panel here so we don't need to keep the handle.
+        let _ = re_grpc_server::spawn_from_rx_set(
+            listener,
             server_options,
             re_grpc_server::shutdown::never(),
             LogReceiverSet::new(log_receivers),
         );
 
         // Add the proxy URL to the url parameters.
-        let proxy_url = if server_addr.ip().is_unspecified() || server_addr.ip().is_loopback() {
-            format!("rerun+http://localhost:{}/proxy", server_addr.port())
+        let proxy_url = if local_addr.ip().is_unspecified() || local_addr.ip().is_loopback() {
+            format!("rerun+http://localhost:{}/proxy", local_addr.port())
         } else {
-            format!("rerun+http://{server_addr}/proxy")
+            format!("rerun+http://{local_addr}/proxy")
         };
 
         re_log::debug_assert!(
@@ -1221,6 +1541,7 @@ fn serve_web(
         force_wgpu_backend,
         video_decoder,
         open_browser,
+        assets_archive_path: None,
     }
     .host_web_viewer()?
     .block();
@@ -1241,10 +1562,13 @@ fn serve_grpc(
 
     receivers.error_on_unhandled_urls("--serve-grpc")?;
 
+    let listener = re_grpc_server::ServerListener::bind(server_addr)?;
+
     let (signal, shutdown) = re_grpc_server::shutdown::shutdown();
     // Spawn a server which the Web Viewer can connect to.
-    re_grpc_server::spawn_from_rx_set(
-        server_addr,
+    // No dev panel in this mode, so we drop the handle.
+    let _ = re_grpc_server::spawn_from_rx_set(
+        listener,
         server_options,
         shutdown,
         LogReceiverSet::new(receivers.log_receivers),
@@ -1275,8 +1599,8 @@ fn save_or_test_receive(
 
     #[cfg(feature = "server")]
     {
-        let log_rx = re_grpc_server::spawn_with_recv(
-            server_addr,
+        let (log_rx, _handle) = re_grpc_server::spawn_with_recv(
+            re_grpc_server::ServerListener::bind(server_addr)?,
             server_options,
             re_grpc_server::shutdown::never(),
         );
@@ -1293,9 +1617,18 @@ fn save_or_test_receive(
     }
 }
 
-fn find_free_port(bind: std::net::IpAddr) -> anyhow::Result<u16> {
-    let listener = std::net::TcpListener::bind(std::net::SocketAddr::new(bind, 0))?;
-    Ok(listener.local_addr()?.port())
+#[cfg(feature = "server")]
+fn connect_proxy_uri(connect: Option<String>) -> anyhow::Result<re_uri::RedapUri> {
+    let url = match connect {
+        None => "rerun+http://127.0.0.1:9876/proxy".to_owned(),
+        Some(port_or_url) => match port_or_url.parse::<u16>() {
+            Ok(port) => format!("rerun+http://127.0.0.1:{port}/proxy"),
+            Err(_) => port_or_url,
+        },
+    };
+
+    url.parse()
+        .map_err(|err| anyhow::format_err!("expected a port or `/proxy` endpoint: {err}"))
 }
 
 fn is_another_server_already_running(server_addr: std::net::SocketAddr) -> bool {
@@ -1334,7 +1667,7 @@ fn assert_receive_into_entity_db(rx: &LogReceiverSet) -> anyhow::Result<re_entit
             match msg.payload {
                 SmartMessagePayload::Msg(msg) => {
                     match msg {
-                        DataSourceMessage::RrdManifest(store_id, rrd_manifest) => {
+                        DataSourceMessage::RrdManifest(store_id, manifest) => {
                             let mut_db = match store_id.kind() {
                                 re_log_types::StoreKind::Recording => {
                                     rec.get_or_insert_with(|| {
@@ -1346,7 +1679,7 @@ fn assert_receive_into_entity_db(rx: &LogReceiverSet) -> anyhow::Result<re_entit
                                 }),
                             };
 
-                            mut_db.add_rrd_manifest_message(rrd_manifest);
+                            mut_db.add_rrd_manifest_message(manifest);
                         }
 
                         DataSourceMessage::RrdManifestComplete(store_id) => {
@@ -1379,15 +1712,21 @@ fn assert_receive_into_entity_db(rx: &LogReceiverSet) -> anyhow::Result<re_entit
                             mut_db.add_log_msg(&msg)?;
                         }
 
+                        DataSourceMessage::DefaultBlueprintRegistration(_) => {
+                            anyhow::bail!(
+                                "Received a blueprint registration which can't be stored in an EntityDb"
+                            );
+                        }
+
                         DataSourceMessage::TableMsg(_) => {
                             anyhow::bail!(
                                 "Received a TableMsg which can't be stored in an EntityDb"
                             );
                         }
 
-                        DataSourceMessage::UiCommand(ui_command) => {
+                        DataSourceMessage::ViewerControl(command) => {
                             anyhow::bail!(
-                                "Received a UI command which can't be stored in an EntityDb: {ui_command:?}"
+                                "Received a viewer-control command which can't be stored in an EntityDb: {command:?}"
                             );
                         }
                     }
@@ -1406,9 +1745,8 @@ fn assert_receive_into_entity_db(rx: &LogReceiverSet) -> anyhow::Result<re_entit
                         anyhow::ensure!(0 < num_messages, "No messages received");
                         re_log::info!("Successfully ingested {num_messages} messages.");
                         return Ok(db);
-                    } else {
-                        anyhow::bail!("EntityDb never initialized");
                     }
+                    anyhow::bail!("EntityDb never initialized");
                 }
             }
         } else {
@@ -1468,7 +1806,7 @@ fn initialize_tokio_runtime(threads_args: i32) -> std::io::Result<Runtime> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Name the tokio threads for the benefit of debuggers and profilers:
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    let mut builder = tokio::runtime::Builder::new_multi_thread(); // NOLINT: the CLI process owns this configurable runtime
     builder.thread_name_fn(|| {
         static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
         let nr = ATOMIC_ID.fetch_add(1, Ordering::Relaxed);
@@ -1476,15 +1814,19 @@ fn initialize_tokio_runtime(threads_args: i32) -> std::io::Result<Runtime> {
     });
     builder.enable_all();
 
-    if threads_args < 0 {
-        if let Ok(cores) = std::thread::available_parallelism() {
-            let threads = cores.get().saturating_sub((-threads_args) as _).max(1);
-            builder.worker_threads(threads);
+    match threads_args.cmp(&0) {
+        std::cmp::Ordering::Less => {
+            if let Ok(cores) = std::thread::available_parallelism() {
+                let threads = cores.get().saturating_sub((-threads_args) as _).max(1);
+                builder.worker_threads(threads);
+            }
         }
-    } else if 0 < threads_args {
-        builder.worker_threads(threads_args as usize);
-    } else {
-        // 0 means "use default" (typically num CPUs)
+        std::cmp::Ordering::Equal => {
+            // 0 means "use default" (typically num CPUs)
+        }
+        std::cmp::Ordering::Greater => {
+            builder.worker_threads(threads_args as usize);
+        }
     }
 
     builder.build()
@@ -1623,18 +1965,17 @@ impl ReceiversFromUrlParams {
         input_urls: Vec<String>,
         config: &UrlParamProcessingConfig,
         connection_registry: &re_redap_client::ConnectionRegistryHandle,
+        async_runtime: &re_async::AsyncRuntimeHandle,
         auth_error_handler: Option<AuthErrorHandler>,
-        follow: bool,
     ) -> anyhow::Result<Self> {
         let mut data_sources = Vec::new();
         let mut urls_to_pass_on_to_viewer = Vec::new();
 
         for url in input_urls {
             if let Some(data_source) = LogDataSource::from_uri(
-                re_log_types::FileSource::Cli,
+                re_log_msg::FileSource::Cli,
                 &url,
                 &re_data_source::FromUriOptions {
-                    follow,
                     accept_extensionless_http: true,
                 },
             ) {
@@ -1655,7 +1996,7 @@ impl ReceiversFromUrlParams {
                         }
                     }
 
-                    LogDataSource::FilePath { .. } => {
+                    LogDataSource::File { .. } => {
                         if config.data_source_from_filepaths {
                             data_sources.push(data_source);
                         } else {
@@ -1663,7 +2004,7 @@ impl ReceiversFromUrlParams {
                         }
                     }
 
-                    LogDataSource::FileContents(..) | LogDataSource::Stdin => {
+                    LogDataSource::Stdin => {
                         data_sources.push(data_source);
                     }
                 }
@@ -1681,7 +2022,13 @@ impl ReceiversFromUrlParams {
 
         let log_receivers = data_sources
             .into_iter()
-            .map(|data_source| data_source.stream(auth_error_handler.clone(), connection_registry))
+            .map(|data_source| {
+                data_source.stream(
+                    async_runtime,
+                    auth_error_handler.clone(),
+                    connection_registry,
+                )
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok(Self {
@@ -1726,7 +2073,8 @@ fn record_cli_command_analytics(args: &Args) {
         detach_process,
 
         // Not logged
-        follow: _,
+        assets: _,
+        detached_process_child: _,
         threads: _,
         url_or_paths: _,
         version: _,
@@ -1741,6 +2089,8 @@ fn record_cli_command_analytics(args: &Args) {
         cors_allow_origin: _,
         port: _,
         new: _,
+        headless: _,
+        integration_test: _,
     } = args;
 
     let (command, subcommand) = match command {
@@ -1770,13 +2120,18 @@ fn record_cli_command_analytics(args: &Args) {
 
         Some(Command::Manual) => ("man", None),
 
-        #[cfg(feature = "data_loaders")]
+        #[cfg(feature = "importers")]
         Some(Command::Mcap(_cmd)) => {
             // TODO(RR-4073): Re-enable analytics for MCAP commands.
             return;
         }
 
+        #[cfg(feature = "native_viewer")]
+        Some(Command::ViewerMcp { .. }) => ("viewer-mcp", None),
+
         Some(Command::Download(_)) => ("download", None),
+
+        Some(Command::DumpPuffin(_)) => ("dump-puffin", None),
 
         #[cfg(feature = "native_viewer")]
         Some(Command::Reset) => ("reset", None),
@@ -1809,4 +2164,248 @@ fn record_cli_command_analytics(args: &Args) {
         detach_process: *detach_process,
         test_receive: *test_receive,
     });
+}
+
+#[cfg(test)]
+mod cli_data_source_tests {
+    use std::path::PathBuf;
+
+    use clap::Parser as _;
+
+    use super::*;
+
+    fn parse(args: &[&str]) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let args = Args::try_parse_from(args)?;
+        let recordings = local_recordings_for_assets(&args.url_or_paths, &args.assets)?;
+        Ok((recordings, args.assets))
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn connect_and_viewer_server_ports_are_independent() {
+        let args = Args::try_parse_from(["rerun", "--connect", "--port", "1234"]).unwrap();
+        assert!(matches!(args.port, Some(PortArg::Port(1234))));
+        assert_eq!(
+            connect_proxy_uri(None).unwrap().to_string(),
+            "rerun+http://127.0.0.1:9876/proxy"
+        );
+
+        let args = Args::try_parse_from(["rerun", "--connect"]).unwrap();
+        assert!(args.port.is_none());
+        assert_eq!(
+            connect_proxy_uri(None).unwrap().to_string(),
+            "rerun+http://127.0.0.1:9876/proxy"
+        );
+
+        let args = Args::try_parse_from(["rerun", "--port", "auto"]).unwrap();
+        assert!(matches!(args.port, Some(PortArg::Auto)));
+
+        let args = Args::try_parse_from(["rerun", "--connect", "4321", "--port", "1234"]).unwrap();
+        assert!(matches!(args.port, Some(PortArg::Port(1234))));
+        assert_eq!(
+            connect_proxy_uri(Some("4321".to_owned()))
+                .unwrap()
+                .to_string(),
+            "rerun+http://127.0.0.1:4321/proxy"
+        );
+    }
+
+    #[test]
+    fn assets_apply_to_all_recordings() {
+        for args in [
+            vec![
+                "rerun", "rec0.rrd", "--asset", "a.rrd", "rec1.rrd", "--asset", "b.rrd",
+            ],
+            vec![
+                "rerun",
+                "rec0.rrd",
+                "--asset",
+                "a.rrd",
+                "--asset=b.rrd",
+                "rec1.rrd",
+            ],
+        ] {
+            let (recordings, assets) = parse(&args).unwrap();
+            assert_eq!(
+                recordings,
+                [PathBuf::from("rec0.rrd"), PathBuf::from("rec1.rrd")]
+            );
+            assert_eq!(assets, [PathBuf::from("a.rrd"), PathBuf::from("b.rrd")]);
+        }
+    }
+
+    #[test]
+    fn asset_order_does_not_matter() {
+        let sources = parse(&["rerun", "--asset", "mesh.rrd", "rec.rrd"]).unwrap();
+        assert_eq!(
+            sources,
+            parse(&["rerun", "rec.rrd", "--asset", "mesh.rrd"]).unwrap()
+        );
+        assert_eq!(sources.1, [PathBuf::from("mesh.rrd")]);
+    }
+
+    #[test]
+    fn assets_only_apply_to_local_recordings() {
+        let sources = parse(&[
+            "rerun",
+            "rec.rrd",
+            "blueprint.rbl",
+            "https://example.com/rec.rrd",
+            "--asset",
+            "mesh.rrd",
+        ])
+        .unwrap();
+        assert_eq!(sources.0, [PathBuf::from("rec.rrd")]);
+        assert_eq!(sources.1, [PathBuf::from("mesh.rrd")]);
+    }
+
+    #[test]
+    fn assets_require_a_local_recording() {
+        let err = parse(&["rerun", "--asset", "mesh.rrd"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`--asset` needs at least one local `.rrd` recording on the command line"
+        );
+        for source in [
+            "rerun+http://localhost:9877/dataset",
+            "https://example.com/rec.rrd",
+            "example.com/rec.rrd",
+            "file:///does/not/exist.rrd",
+            "blueprint.rbl",
+            "mesh.obj",
+            "-",
+        ] {
+            let err = parse(&["rerun", source, "--asset", "mesh.rrd"]).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "`--asset` needs at least one local `.rrd` recording on the command line"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "native_viewer"))]
+mod tests {
+    use super::*;
+
+    use clap::Parser as _;
+
+    #[test]
+    fn detach_relaunches_a_native_viewer_exactly_once() {
+        for cli_args in [
+            &["rerun", "--detach-process"][..],
+            &["rerun", "--detach-process", "recording.rrd"],
+            &["rerun", "--detach-process", "--headless"],
+            &[
+                "rerun",
+                "--detach-process",
+                "--screenshot-to",
+                "screenshot.png",
+            ],
+        ] {
+            let raw_args = cli_args
+                .iter()
+                .copied()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            let parent = Args::try_parse_from(raw_args.iter()).unwrap();
+            assert!(
+                should_relaunch_detached(&parent),
+                "expected relaunch for {cli_args:?}"
+            );
+
+            let child_args = detached_child_args(&raw_args);
+            let child = Args::try_parse_from(std::iter::chain(
+                std::iter::once(std::ffi::OsStr::new("rerun")),
+                child_args,
+            ))
+            .unwrap();
+            assert!(child.detached_process_child);
+            assert!(
+                !should_relaunch_detached(&child),
+                "unexpected second relaunch for {cli_args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detach_preserves_assets_for_all_recordings() {
+        let raw_args = [
+            "rerun",
+            "rec0.rrd",
+            "--asset",
+            "a.rrd",
+            "--detach-process",
+            "--asset=b.rrd",
+            "rec1.rrd",
+            "--asset",
+            "c.rrd",
+            "--",
+            "rec2.rrd",
+        ]
+        .map(std::ffi::OsString::from);
+        let parent = Args::try_parse_from(&raw_args).unwrap();
+        let parent_recordings =
+            local_recordings_for_assets(&parent.url_or_paths, &parent.assets).unwrap();
+        let child = Args::try_parse_from(std::iter::chain(
+            std::iter::once(std::ffi::OsStr::new("rerun")),
+            detached_child_args(&raw_args),
+        ))
+        .unwrap();
+        assert_eq!(
+            local_recordings_for_assets(&child.url_or_paths, &child.assets).unwrap(),
+            parent_recordings
+        );
+        assert_eq!(parent_recordings.len(), 3);
+        assert_eq!(child.assets, parent.assets);
+        assert_eq!(child.assets.len(), 3);
+    }
+
+    #[test]
+    fn detach_child_marker_precedes_end_of_options_separator() {
+        let raw_args =
+            ["rerun", "--detach-process", "--", "recording.rrd"].map(std::ffi::OsString::from);
+        let parent = Args::try_parse_from(raw_args.iter()).unwrap();
+        assert!(should_relaunch_detached(&parent));
+
+        let child_args = detached_child_args(&raw_args);
+
+        assert_eq!(
+            child_args,
+            [
+                std::ffi::OsStr::new("--detach-process"),
+                std::ffi::OsStr::new("--detached-process-child"),
+                std::ffi::OsStr::new("--"),
+                std::ffi::OsStr::new("recording.rrd"),
+            ]
+        );
+
+        let child = Args::try_parse_from(std::iter::chain(
+            std::iter::once(std::ffi::OsStr::new("rerun")),
+            child_args,
+        ))
+        .unwrap();
+        assert!(child.detached_process_child);
+        assert!(!should_relaunch_detached(&child));
+        assert_eq!(child.url_or_paths, ["recording.rrd"]);
+    }
+
+    #[test]
+    fn detach_does_not_relaunch_non_viewer_modes() {
+        for cli_args in [
+            &["rerun", "--detach-process", "--serve-grpc"][..],
+            &["rerun", "--detach-process", "--serve-web"],
+            &["rerun", "--detach-process", "--web-viewer"],
+            &["rerun", "--detach-process", "--save", "output.rrd"],
+            &["rerun", "--detach-process", "--test-receive"],
+            &["rerun", "--detach-process", "--version"],
+            &["rerun", "--detach-process", "reset"],
+        ] {
+            let args = Args::try_parse_from(cli_args).unwrap();
+            assert!(
+                !should_relaunch_detached(&args),
+                "unexpected relaunch for {cli_args:?}"
+            );
+        }
+    }
 }

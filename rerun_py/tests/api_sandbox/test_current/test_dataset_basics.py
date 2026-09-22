@@ -17,16 +17,16 @@ def test_dataset_basics(complex_dataset_prefix: Path) -> None:
 
         ds = client.create_dataset("basic_dataset")
 
-        ds.register_prefix(complex_dataset_prefix.as_uri())
+        ds.register_prefix(complex_dataset_prefix.as_uri()).wait()
 
         partition_df = ds.segment_table()
 
         assert partition_df.schema().to_string(show_field_metadata=False) == inline_snapshot("""\
 rerun_segment_id: string not null
-rerun_layer_names: list<rerun_layer_names: string not null> not null
-  child 0, rerun_layer_names: string not null
-rerun_storage_urls: list<rerun_storage_urls: string not null> not null
-  child 0, rerun_storage_urls: string not null
+rerun_layer_names: list<item: string not null> not null
+  child 0, item: string not null
+rerun_storage_urls: list<item: string not null> not null
+  child 0, item: string not null
 rerun_last_updated_at: timestamp[ns] not null
 rerun_num_chunks: uint64 not null
 rerun_size_bytes: uint64 not null
@@ -39,34 +39,37 @@ sorbet:version: '0.1.3'\
 """)
 
         assert str(
-            partition_df.drop("rerun_storage_urls", "rerun_last_updated_at", "property:RecordingInfo:start_time").sort(
-                "rerun_segment_id"
-            )
+            partition_df.drop(
+                "rerun_storage_urls",
+                "rerun_last_updated_at",
+                "property:RecordingInfo:start_time",
+                "rerun_size_bytes",
+            ).sort("rerun_segment_id")
         ) == inline_snapshot("""\
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ METADATA:                                                                                                                                                                                │
-│ * version: 0.1.3                                                                                                                                                                         │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ ┌─────────────────────┬────────────────────────────────────────────────────────────────┬───────────────────────┬───────────────────────┬───────────────────────┬───────────────────────┐ │
-│ │ rerun_segment_id    ┆ rerun_layer_names                                              ┆ rerun_num_chunks      ┆ rerun_size_bytes      ┆ timeline:end          ┆ timeline:start        │ │
-│ │ ---                 ┆ ---                                                            ┆ ---                   ┆ ---                   ┆ ---                   ┆ ---                   │ │
-│ │ type: non-null Utf8 ┆ type: non-null List(non-null Utf8, field: 'rerun_layer_names') ┆ type: non-null UInt64 ┆ type: non-null UInt64 ┆ type: Timestamp(ns)   ┆ type: Timestamp(ns)   │ │
-│ │                     ┆                                                                ┆                       ┆                       ┆ index: timeline       ┆ index: timeline       │ │
-│ │                     ┆                                                                ┆                       ┆                       ┆ index_kind: timestamp ┆ index_kind: timestamp │ │
-│ │                     ┆                                                                ┆                       ┆                       ┆ index_marker: end     ┆ index_marker: start   │ │
-│ │                     ┆                                                                ┆                       ┆                       ┆ kind: index           ┆ kind: index           │ │
-│ ╞═════════════════════╪════════════════════════════════════════════════════════════════╪═══════════════════════╪═══════════════════════╪═══════════════════════╪═══════════════════════╡ │
-│ │ complex_recording_0 ┆ [base]                                                         ┆ 3                     ┆ 4226                  ┆ 2000-01-01T00:00:02   ┆ 2000-01-01T00:00:00   │ │
-│ ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤ │
-│ │ complex_recording_1 ┆ [base]                                                         ┆ 3                     ┆ 4226                  ┆ 2000-01-01T00:00:03   ┆ 2000-01-01T00:00:01   │ │
-│ ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤ │
-│ │ complex_recording_2 ┆ [base]                                                         ┆ 3                     ┆ 4226                  ┆ 2000-01-01T00:00:04   ┆ 2000-01-01T00:00:02   │ │
-│ ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤ │
-│ │ complex_recording_3 ┆ [base]                                                         ┆ 3                     ┆ 4226                  ┆ 2000-01-01T00:00:05   ┆ 2000-01-01T00:00:03   │ │
-│ ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤ │
-│ │ complex_recording_4 ┆ [base]                                                         ┆ 3                     ┆ 4226                  ┆ 2000-01-01T00:00:06   ┆ 2000-01-01T00:00:04   │ │
-│ └─────────────────────┴────────────────────────────────────────────────────────────────┴───────────────────────┴───────────────────────┴───────────────────────┴───────────────────────┘ │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ METADATA:                                                                                                                            │
+│ * version: 0.1.3                                                                                                                     │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ ┌─────────────────────┬────────────────────────────────────┬───────────────────────┬───────────────────────┬───────────────────────┐ │
+│ │ rerun_segment_id    ┆ rerun_layer_names                  ┆ rerun_num_chunks      ┆ timeline:end          ┆ timeline:start        │ │
+│ │ ---                 ┆ ---                                ┆ ---                   ┆ ---                   ┆ ---                   │ │
+│ │ type: non-null Utf8 ┆ type: non-null List(non-null Utf8) ┆ type: non-null UInt64 ┆ type: Timestamp(ns)   ┆ type: Timestamp(ns)   │ │
+│ │                     ┆                                    ┆                       ┆ index: timeline       ┆ index: timeline       │ │
+│ │                     ┆                                    ┆                       ┆ index_kind: timestamp ┆ index_kind: timestamp │ │
+│ │                     ┆                                    ┆                       ┆ index_marker: end     ┆ index_marker: start   │ │
+│ │                     ┆                                    ┆                       ┆ kind: index           ┆ kind: index           │ │
+│ ╞═════════════════════╪════════════════════════════════════╪═══════════════════════╪═══════════════════════╪═══════════════════════╡ │
+│ │ complex_recording_0 ┆ [base]                             ┆ 3                     ┆ 2000-01-01T00:00:02   ┆ 2000-01-01T00:00:00   │ │
+│ ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤ │
+│ │ complex_recording_1 ┆ [base]                             ┆ 3                     ┆ 2000-01-01T00:00:03   ┆ 2000-01-01T00:00:01   │ │
+│ ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤ │
+│ │ complex_recording_2 ┆ [base]                             ┆ 3                     ┆ 2000-01-01T00:00:04   ┆ 2000-01-01T00:00:02   │ │
+│ ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤ │
+│ │ complex_recording_3 ┆ [base]                             ┆ 3                     ┆ 2000-01-01T00:00:05   ┆ 2000-01-01T00:00:03   │ │
+│ ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤ │
+│ │ complex_recording_4 ┆ [base]                             ┆ 3                     ┆ 2000-01-01T00:00:06   ┆ 2000-01-01T00:00:04   │ │
+│ └─────────────────────┴────────────────────────────────────┴───────────────────────┴───────────────────────┴───────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\
 """)
 
 
@@ -74,7 +77,7 @@ def test_dataset_schema(complex_dataset_prefix: Path) -> None:
     with rr.server.Server() as server:
         client = server.client()
         ds = client.create_dataset("complex_dataset")
-        ds.register_prefix(complex_dataset_prefix.as_uri())
+        ds.register_prefix(complex_dataset_prefix.as_uri()).wait()
 
         assert str(ds.schema()) == inline_snapshot("""\
 Index(timeline:timeline)
@@ -107,7 +110,7 @@ def test_dataset_metadata(complex_dataset_prefix: Path, tmp_path: Path) -> None:
         client = server.client()
 
         ds = client.create_dataset("basic_dataset")
-        ds.register_prefix(complex_dataset_prefix.as_uri())
+        ds.register_prefix(complex_dataset_prefix.as_uri()).wait()
 
         # TODO(jleibs): Consider attaching this metadata table directly to the dataset
         # and automatically joining it by default
@@ -150,7 +153,7 @@ def test_schema_column_for_selector(complex_dataset_prefix: Path) -> None:
     with rr.server.Server() as server:
         client = server.client()
         ds = client.create_dataset("test_dataset")
-        ds.register_prefix(complex_dataset_prefix.as_uri())
+        ds.register_prefix(complex_dataset_prefix.as_uri()).wait()
 
         schema = ds.schema()
 

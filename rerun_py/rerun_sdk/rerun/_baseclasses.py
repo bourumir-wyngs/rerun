@@ -236,7 +236,7 @@ class BaseBatch(Generic[T]):
 
         Subclasses must provide an implementation of this method (via an override) if they are to be used as either
         an archetype's field (which should be the case for all components), or a (delegating) component's field (for
-        datatypes). Datatypes which are used only within other datatypes may omit implementing this method, provided
+        encodings). Encodings which are used only within other encodings may omit implementing this method, provided
         that the top-level datatype implements it.
 
         A hand-coded override must be provided for the code generator to implement this method. The override must be
@@ -338,10 +338,10 @@ class ComponentColumn:
         lengths:
             The lengths of each partition. Must sum to the total length of the component batch.
             If left unspecified, it will default to unit-length batches.
-            Mutually exclusive with ``offsets``.
+            Mutually exclusive with `offsets`.
         offsets:
             Pre-computed int32 offsets array (including the leading 0).
-            Mutually exclusive with ``lengths``.
+            Mutually exclusive with `lengths`.
 
         """
         if isinstance(descriptor, str):
@@ -409,7 +409,7 @@ class ComponentColumn:
 
 class ComponentColumnList(Iterable[ComponentColumn]):
     """
-    A collection of [ComponentColumn][]s.
+    A collection of [`ComponentColumn`][rerun.ComponentColumn]s.
 
     Useful to partition and log multiple columns at once.
     """

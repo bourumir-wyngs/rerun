@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock};
 
@@ -14,12 +13,13 @@ use datafusion_ffi::udf::FFI_ScalarUDF;
 use pyo3::types::PyCapsule;
 use pyo3::{Bound, PyResult, Python, pyclass, pymethods};
 
+use re_log::ResultExt as _;
 use re_log_types::{
     AbsoluteTimeRange, DataPath, NonMinI64, TimeCell, TimeType, Timeline, TimelineName,
 };
 use re_tuid::Tuid;
-use re_types_core::Loggable as _;
-use re_uri::{DatasetSegmentUri, Fragment, Origin, TimeSelection};
+use re_types_core::{FromArrow as _, SegmentId};
+use re_uri::{DatasetUri, Fragment, Origin, TimeSelection};
 
 #[derive(Debug)]
 struct SegmentUrlUdf {
@@ -61,10 +61,6 @@ impl SegmentUrlUdf {
 }
 
 impl ScalarUDFImpl for SegmentUrlUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "segment_url"
     }
@@ -269,7 +265,7 @@ impl ScalarUDFImpl for SegmentUrlUdf {
                 continue;
             }
 
-            let segment_id = segment_ids.value(row).to_owned();
+            let segment_id = SegmentId::from(segment_ids.value(row).to_owned());
 
             let when = time_info.as_ref().and_then(|(time_type, ts_array)| {
                 if ts_array.is_null(row) {
@@ -280,7 +276,8 @@ impl ScalarUDFImpl for SegmentUrlUdf {
                     .value(row);
                 let time_cell = TimeCell::new(*time_type, NonMinI64::try_from(i64_val).ok()?);
                 let tl_name = timeline_name.as_deref()?;
-                Some((TimelineName::new(tl_name), time_cell))
+                let tl_name = TimelineName::try_new(tl_name).ok_or_log_error_once()?;
+                Some((tl_name, time_cell))
             });
 
             let time_selection =
@@ -299,6 +296,7 @@ impl ScalarUDFImpl for SegmentUrlUdf {
                         let start = NonMinI64::try_from(start_val).ok()?;
                         let end = NonMinI64::try_from(end_val).ok()?;
                         let tl_name = timeline_name.as_deref()?;
+                        let tl_name = TimelineName::try_new(tl_name).ok_or_log_error_once()?;
                         let timeline = Timeline::new(tl_name, *time_type);
                         let range = AbsoluteTimeRange::new(start, end);
                         Some(TimeSelection { timeline, range })
@@ -322,10 +320,11 @@ impl ScalarUDFImpl for SegmentUrlUdf {
 
             // TODO(ab): this is an unfortunate lot of cloning just to format a URL string, but
             // chances are we'll run in other problems by the time this becomes a performance issue.
-            let uri = DatasetSegmentUri {
+            let uri = DatasetUri {
                 origin: origin.clone(),
                 dataset_id,
-                segment_id,
+                resource: re_uri::DatasetResource::Segments,
+                segment_id: Some(segment_id),
                 fragment: Fragment {
                     selection,
                     when,

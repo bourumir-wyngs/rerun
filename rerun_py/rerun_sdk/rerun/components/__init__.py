@@ -52,6 +52,7 @@ from .interpolation_mode import (
     InterpolationModeBatch,
     InterpolationModeLike,
 )
+from .is_keyframe import IsKeyframe, IsKeyframeBatch
 from .key_value_pairs import KeyValuePairs, KeyValuePairsArrayLike, KeyValuePairsBatch, KeyValuePairsLike
 from .keypoint_id import KeypointId, KeypointIdBatch
 from .lat_lon import LatLon, LatLonBatch
@@ -76,8 +77,10 @@ from .mesh_face_rendering import (
 )
 from .name import Name, NameBatch
 from .opacity import Opacity, OpacityBatch
+from .optical_density import OpticalDensity, OpticalDensityBatch
 from .pinhole_projection import PinholeProjection, PinholeProjectionBatch
 from .plane3d import Plane3D, Plane3DBatch
+from .point_shading import PointShading, PointShadingArrayLike, PointShadingBatch, PointShadingLike
 from .position2d import Position2D, Position2DBatch
 from .position3d import Position3D, Position3DBatch
 from .radius import Radius, RadiusBatch
@@ -89,6 +92,8 @@ from .scalar import Scalar, ScalarBatch
 from .scale3d import Scale3D, Scale3DBatch
 from .schema_id import SchemaId, SchemaIdBatch
 from .show_labels import ShowLabels, ShowLabelsBatch
+from .spherical_harmonics3rgb import SphericalHarmonics3Rgb, SphericalHarmonics3RgbBatch
+from .spherical_harmonics_degree import SphericalHarmonicsDegree, SphericalHarmonicsDegreeBatch
 from .stroke_width import StrokeWidth, StrokeWidthBatch
 from .tensor_data import TensorData, TensorDataBatch
 from .tensor_dimension_index_selection import TensorDimensionIndexSelection, TensorDimensionIndexSelectionBatch
@@ -108,7 +113,9 @@ from .transform_relation import (
 )
 from .translation3d import Translation3D, Translation3DBatch
 from .triangle_indices import TriangleIndices, TriangleIndicesBatch
+from .unit import Unit, UnitBatch
 from .value_range import ValueRange, ValueRangeBatch
+from .variance import Variance, VarianceBatch
 from .vector2d import Vector2D, Vector2DBatch
 from .vector3d import Vector3D, Vector3DBatch
 from .video_codec import VideoCodec, VideoCodecArrayLike, VideoCodecBatch, VideoCodecLike
@@ -116,6 +123,9 @@ from .video_sample import VideoSample, VideoSampleBatch
 from .video_timestamp import VideoTimestamp, VideoTimestampBatch
 from .view_coordinates import ViewCoordinates, ViewCoordinatesBatch
 from .visible import Visible, VisibleBatch
+from .voxel_index import VoxelIndex, VoxelIndexBatch
+from .voxel_size import VoxelSize, VoxelSizeBatch
+from .voxel_value import VoxelValue, VoxelValueBatch
 
 __all__ = [
     "AggregationPolicy",
@@ -194,6 +204,8 @@ __all__ = [
     "InterpolationModeArrayLike",
     "InterpolationModeBatch",
     "InterpolationModeLike",
+    "IsKeyframe",
+    "IsKeyframeBatch",
     "KeyValuePairs",
     "KeyValuePairsArrayLike",
     "KeyValuePairsBatch",
@@ -234,10 +246,16 @@ __all__ = [
     "NameBatch",
     "Opacity",
     "OpacityBatch",
+    "OpticalDensity",
+    "OpticalDensityBatch",
     "PinholeProjection",
     "PinholeProjectionBatch",
     "Plane3D",
     "Plane3DBatch",
+    "PointShading",
+    "PointShadingArrayLike",
+    "PointShadingBatch",
+    "PointShadingLike",
     "Position2D",
     "Position2DBatch",
     "Position3D",
@@ -260,6 +278,10 @@ __all__ = [
     "SchemaIdBatch",
     "ShowLabels",
     "ShowLabelsBatch",
+    "SphericalHarmonics3Rgb",
+    "SphericalHarmonics3RgbBatch",
+    "SphericalHarmonicsDegree",
+    "SphericalHarmonicsDegreeBatch",
     "StrokeWidth",
     "StrokeWidthBatch",
     "TensorData",
@@ -290,8 +312,12 @@ __all__ = [
     "Translation3DBatch",
     "TriangleIndices",
     "TriangleIndicesBatch",
+    "Unit",
+    "UnitBatch",
     "ValueRange",
     "ValueRangeBatch",
+    "Variance",
+    "VarianceBatch",
     "Vector2D",
     "Vector2DBatch",
     "Vector3D",
@@ -308,4 +334,10 @@ __all__ = [
     "ViewCoordinatesBatch",
     "Visible",
     "VisibleBatch",
+    "VoxelIndex",
+    "VoxelIndexBatch",
+    "VoxelSize",
+    "VoxelSizeBatch",
+    "VoxelValue",
+    "VoxelValueBatch",
 ]

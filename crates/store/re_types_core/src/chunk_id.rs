@@ -1,8 +1,3 @@
-use arrow::array::Array as _;
-use re_arrow_util::WrongDatatypeError;
-
-use crate::Loggable as _;
-
 /// A unique ID for a `Chunk`.
 ///
 /// `Chunk`s are the atomic unit of ingestion, transport, storage, events and GC in Rerun.
@@ -37,9 +32,19 @@ use crate::Loggable as _;
 /// think carefully about your `RowId`s in these cases.
 #[repr(C, align(1))]
 #[derive(
-    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::AnyBitPattern, bytemuck::NoUninit,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    bytemuck::AnyBitPattern,
+    bytemuck::NoUninit,
+    re_byte_size::SizeBytes,
+    serde::Deserialize,
+    serde::Serialize,
 )]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct ChunkId(pub(crate) re_tuid::Tuid);
 
 impl std::fmt::Debug for ChunkId {
@@ -122,34 +127,24 @@ impl ChunkId {
     pub fn arrow_from_slice(slice: &[Self]) -> arrow::array::FixedSizeBinaryArray {
         crate::tuids_to_arrow(bytemuck::cast_slice(slice))
     }
+}
 
-    /// None if it is the wrong datatype
-    pub fn try_slice_from_arrow(
-        array: &arrow::array::FixedSizeBinaryArray,
-    ) -> Result<&[Self], WrongDatatypeError> {
-        if array.data_type() == &Self::arrow_datatype() {
-            Ok(bytemuck::cast_slice(array.value_data()))
-        } else {
-            Err(WrongDatatypeError {
-                column_name: None,
-                expected: Self::arrow_datatype().into(),
-                actual: array.data_type().clone().into(),
-            })
-        }
+impl From<[u8; 16]> for ChunkId {
+    #[inline]
+    fn from(bytes: [u8; 16]) -> Self {
+        Self(re_tuid::Tuid::from_bytes(bytes))
     }
 }
 
-impl re_byte_size::SizeBytes for ChunkId {
+impl From<ChunkId> for [u8; 16] {
     #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        0
-    }
-
-    #[inline]
-    fn is_pod() -> bool {
-        true
+    fn from(id: ChunkId) -> Self {
+        id.0.as_bytes()
     }
 }
+
+// Make `quiver::Column<ChunkId>` work (backed by a big-endian `FixedSizeBinary(16)` column):
+quiver::newtype_data_type!(ChunkId, quiver::FixedSizeBinary<16>, primitive);
 
 impl std::ops::Deref for ChunkId {
     type Target = re_tuid::Tuid;
@@ -167,4 +162,4 @@ impl std::ops::DerefMut for ChunkId {
     }
 }
 
-crate::delegate_arrow_tuid!(ChunkId as "rerun.controls.ChunkId"); // Used in the Data Platform
+crate::delegate_arrow_tuid!(ChunkId as "rerun.controls.ChunkId"); // Used in the catalog server

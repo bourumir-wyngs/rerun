@@ -22,9 +22,6 @@ all-features = true
 [features]
 default = []
 
-## Enable (de)serialization using serde.
-serde = ["re_log_types/serde", "re_tuid/serde", "re_types_core/serde"]
-
 
 [dependencies]
 
@@ -33,13 +30,13 @@ re_arrow_util.workspace = true
 re_byte_size.workspace = true
 re_error.workspace = true
 re_format.workspace = true
+re_log_msg.workspace = true
 re_log_types.workspace = true
 re_log.workspace = true
 re_quota_channel.workspace = true
 re_sorbet.workspace = true
 re_span.workspace = true
 re_tracing.workspace = true
-re_tuid.workspace = true
 re_types_core.workspace = true
 
 # External
@@ -53,7 +50,6 @@ itertools.workspace = true
 nohash-hasher.workspace = true
 rand = { workspace = true, features = ["std_rng"] }
 thiserror.workspace = true
-tracing.workspace = true
 
 # Native dependencies:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -62,6 +58,17 @@ crossbeam.workspace = true
 
 [dev-dependencies]
 re_log = { workspace = true, features = ["setup"] }
+re_sdk_types.workspace = true
 
+criterion.workspace = true
 insta = { workspace = true, features = ["filters", "redactions"] }
 similar-asserts.workspace = true
+
+
+[lib]
+bench = false
+
+
+[[bench]]
+name = "at_queries"
+harness = false

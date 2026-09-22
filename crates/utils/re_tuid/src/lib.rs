@@ -31,9 +31,6 @@
 //!
 //! When storing the TUID in e.g. an Arrow column, use 16 bytes for each id.
 //!
-//! ## Feature flags
-#![doc = document_features::document_features!()]
-//!
 
 /// TUID: Time-based Unique Identifier.
 ///
@@ -42,10 +39,17 @@
 /// The raw bytes of the `Tuid` sorts in time order as the `Tuid` itself,
 /// and the `Tuid` is byte-aligned so you can just transmute between `Tuid` and raw bytes.
 #[repr(C, align(1))]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
-#[cfg_attr(
-    feature = "bytemuck",
-    derive(bytemuck::AnyBitPattern, bytemuck::NoUninit)
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Ord,
+    PartialOrd,
+    re_byte_size::SizeBytes,
+    bytemuck::AnyBitPattern,
+    bytemuck::NoUninit,
 )]
 pub struct Tuid {
     /// Approximate nanoseconds since epoch.
@@ -68,6 +72,12 @@ impl Tuid {
     /// We give an actual name to [`Tuid`], and inject that name into the Arrow datatype extensions,
     /// as a hack so that we can compactly format them when printing Arrow data to the terminal.
     /// Check out `re_arrow_util::format` for context.
+    ///
+    /// NOTE: this says `datatypes`, not `encodings`. It is a wire-format identifier written into
+    /// every recording, and [`Tuid`] is not one of the code-generated encodings anyway, so renaming
+    /// it needs a Sorbet migration to keep existing data readable.
+    ///
+    /// TODO(RR-5430): rename to `rerun.encodings.TUID`, accepting this spelling on read.
     pub const ARROW_EXTENSION_NAME: &'static str = "rerun.datatypes.TUID";
 }
 
@@ -83,11 +93,34 @@ impl std::fmt::Display for Tuid {
     }
 }
 
+/// Error from parsing a [`Tuid`] out of its string form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ParseTuidError {
+    #[error("expected exactly 32 hex characters, got {found_len} bytes")]
+    InvalidLength { found_len: usize },
+
+    #[error("expected 32 hex characters (0-9A-Fa-f), found a non-hex character")]
+    InvalidCharacter,
+}
+
 impl std::str::FromStr for Tuid {
-    type Err = std::num::ParseIntError;
+    type Err = ParseTuidError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        u128::from_str_radix(s, 16).map(Self::from_u128)
+        // Only the canonical width parses: exactly 32 hex chars, any case. Anything
+        // shorter would zero-extend into a *different* valid id, so a truncated or
+        // sign-prefixed input (both accepted by `from_str_radix` alone) must fail
+        // loudly rather than silently alias another id.
+        if s.len() != 32 {
+            return Err(ParseTuidError::InvalidLength { found_len: s.len() });
+        }
+        if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ParseTuidError::InvalidCharacter);
+        }
+        let Ok(value) = u128::from_str_radix(s, 16) else {
+            return Err(ParseTuidError::InvalidCharacter);
+        };
+        Ok(Self::from_u128(value))
     }
 }
 
@@ -96,6 +129,23 @@ impl std::fmt::Debug for Tuid {
         write!(f, "{self}")
     }
 }
+
+impl From<[u8; 16]> for Tuid {
+    #[inline]
+    fn from(bytes: [u8; 16]) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
+
+impl From<Tuid> for [u8; 16] {
+    #[inline]
+    fn from(tuid: Tuid) -> Self {
+        tuid.as_bytes()
+    }
+}
+
+// Make `quiver::Column<Tuid>` work (backed by a big-endian `FixedSizeBinary(16)` column):
+quiver::newtype_data_type!(Tuid, quiver::FixedSizeBinary<16>, primitive);
 
 impl From<Tuid> for std::borrow::Cow<'_, Tuid> {
     #[inline]
@@ -170,7 +220,6 @@ impl Tuid {
         Self::from_nanos_and_inc((id >> 64) as u64, (id & (!0 >> 64)) as u64)
     }
 
-    #[cfg(feature = "bytemuck")]
     #[inline]
     pub fn slice_from_bytes(bytes: &[u8]) -> Result<&[Self], bytemuck::PodCastError> {
         bytemuck::try_cast_slice(bytes)
@@ -291,18 +340,6 @@ fn random_u64() -> u64 {
     u64::from_be_bytes(bytes)
 }
 
-impl re_byte_size::SizeBytes for Tuid {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        0
-    }
-
-    #[inline]
-    fn is_pod() -> bool {
-        true
-    }
-}
-
 #[test]
 fn test_tuid() {
     use std::collections::{BTreeSet, HashSet};
@@ -311,7 +348,7 @@ fn test_tuid() {
     where
         T: Ord,
     {
-        data.windows(2).all(|w| w[0] <= w[1])
+        data.array_windows().all(|[a, b]| a <= b)
     }
 
     let num = 100_000;
@@ -353,17 +390,60 @@ fn test_tuid_formatting() {
     );
 }
 
+#[test]
+fn test_tuid_parsing_ok() {
+    let id = Tuid::from_u128(0x182342300c5f8c327a7b4a6e5a379ac4);
+
+    // The `Display` form roundtrips, in any case combination (`Display` itself mixes
+    // upper and lower case).
+    assert_eq!("182342300C5F8C327a7b4a6e5a379ac4".parse(), Ok(id));
+    assert_eq!("182342300c5f8c327a7b4a6e5a379ac4".parse(), Ok(id));
+    assert_eq!("182342300C5F8C327A7B4A6E5A379AC4".parse(), Ok(id));
+}
+
+#[test]
+fn test_tuid_parsing_errors() {
+    // Anything that is not exactly 32 hex chars must fail: short hex would
+    // zero-extend into a different valid id, and `from_str_radix` alone would also
+    // accept a sign prefix.
+    for bad in [
+        "",
+        "182342300C5F8C32",                  // truncated
+        "182342300C5F8C327a7b4a6e5a379ac",   // 31 chars
+        "182342300C5F8C327a7b4a6e5a379ac44", // 33 chars
+    ] {
+        assert_eq!(
+            bad.parse::<Tuid>(),
+            Err(ParseTuidError::InvalidLength {
+                found_len: bad.len(),
+            }),
+            "{bad:?} must not parse as a Tuid"
+        );
+    }
+
+    for bad in [
+        "+82342300C5F8C327a7b4a6e5a379ac4", // sign prefix, len 32
+        "0x2342300C5F8C327a7b4a6e5a379ac4", // 0x prefix, len 32
+        "182342300C5F8C327a7b4a6e5a379agz", // non-hex chars, len 32
+        "αααααααααααααααα",                 // non-ASCII, but exactly 32 *bytes*
+    ] {
+        assert_eq!(
+            bad.parse::<Tuid>(),
+            Err(ParseTuidError::InvalidCharacter),
+            "{bad:?} must not parse as a Tuid"
+        );
+    }
+}
+
 // -------------------------------------------------------------------------------
 
 // For backwards compatibility with our MsgPack encoder/decoder
-#[cfg(feature = "serde")]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[derive(serde::Deserialize, serde::Serialize)]
 struct LegacyTuid {
     time_nanos: u64,
     inc: u64,
 }
 
-#[cfg(feature = "serde")]
 impl serde::Serialize for Tuid {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -377,7 +457,6 @@ impl serde::Serialize for Tuid {
     }
 }
 
-#[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Tuid {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

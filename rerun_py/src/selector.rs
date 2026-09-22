@@ -4,6 +4,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
+use re_arrow_util::ArrowArrayDowncastRef as _;
 use re_lenses_core::{DynExpr, Selector};
 
 /// Register the selector class.
@@ -70,9 +71,8 @@ impl PySelectorInternal {
     /// Execute this selector against a pyarrow array.
     fn execute(&self, py: Python<'_>, source: PyArrowType<ArrayData>) -> PyResult<Py<PyAny>> {
         let array: ArrayRef = make_array(source.0);
-        let result = self
-            .selector
-            .execute(array)
+        let result = re_lenses::default_runtime()
+            .execute(&self.selector, array)
             .map_err(|err| PyRuntimeError::new_err(format!("Selector execution failed: {err}")))?;
         match result {
             Some(arr) => arr.to_data().to_pyarrow(py).map(|obj| obj.unbind()),
@@ -89,12 +89,11 @@ impl PySelectorInternal {
         source: PyArrowType<ArrayData>,
     ) -> PyResult<Py<PyAny>> {
         let array: ArrayRef = make_array(source.0);
-        let list_array = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-            PyTypeError::new_err(format!("expected a ListArray, got {:?}", array.data_type()))
-        })?;
-        let result = self
-            .selector
-            .execute_per_row(list_array)
+        let list_array = array
+            .try_downcast_array_ref::<ListArray>()
+            .map_err(|err| PyTypeError::new_err(err.to_string()))?;
+        let result = re_lenses::default_runtime()
+            .execute_per_row(&self.selector, list_array)
             .map_err(|err| PyRuntimeError::new_err(format!("Selector execution failed: {err}")))?;
         match result {
             Some(arr) => arr.to_data().to_pyarrow(py).map(|obj| obj.unbind()),
@@ -132,5 +131,11 @@ impl PySelectorInternal {
 
     fn __str__(&self) -> String {
         self.selector.to_string_lossy()
+    }
+
+    /// Render this selector as a query string, or `None` if it contains
+    /// a Python callable from `.pipe()` (which cannot be serialized).
+    fn try_to_string(&self) -> Option<String> {
+        self.selector.try_to_string()
     }
 }

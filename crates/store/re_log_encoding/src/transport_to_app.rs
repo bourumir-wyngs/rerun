@@ -9,8 +9,10 @@
 //! To go from a freshly decoded transport-level type to its application-level equivalent, use [`ToApplication`].
 //! To prepare an application-level type for encoding, use [`ToTransport`].
 
+use itertools::Itertools as _;
 use re_build_info::CrateVersion;
-use re_log_types::{BlueprintActivationCommand, SetStoreInfo};
+use re_chunk_index::RawRrdManifest;
+use re_log_msg::{BlueprintActivationCommand, SetStoreInfo};
 
 use crate::ApplicationIdInjector;
 use crate::rrd::CodecError;
@@ -18,7 +20,7 @@ use crate::rrd::CodecError;
 // TODO(cmc): I'd really like a nice centralized way of communicating this.
 //
 // pub type LogMsgTransport = re_protos::log_msg::v1alpha1::log_msg::Msg;
-// pub type LogMsgApp = re_log_types::LogMsg;
+// pub type LogMsgApp = re_log_msg::LogMsg;
 
 // ---
 
@@ -30,7 +32,7 @@ pub trait ToTransport {
     fn to_transport(&self, context: Self::Context<'_>) -> Result<Self::Output, CodecError>;
 }
 
-impl ToTransport for re_log_types::LogMsg {
+impl ToTransport for re_log_msg::LogMsg {
     type Output = re_protos::log_msg::v1alpha1::log_msg::Msg;
     type Context<'a> = crate::rrd::Compression;
 
@@ -39,7 +41,7 @@ impl ToTransport for re_log_types::LogMsg {
     }
 }
 
-impl ToTransport for re_log_types::ArrowMsg {
+impl ToTransport for re_log_msg::ArrowMsg {
     type Output = re_protos::log_msg::v1alpha1::ArrowMsg;
     type Context<'a> = (re_log_types::StoreId, crate::rrd::Compression);
 
@@ -56,19 +58,17 @@ impl ToTransport for crate::RrdFooter {
     type Context<'a> = ();
 
     fn to_transport(&self, (): Self::Context<'_>) -> Result<Self::Output, CodecError> {
-        let manifests: Result<Vec<_>, _> = self
+        let manifests: Vec<_> = self
             .manifests
             .values()
             .map(|manifest| manifest.to_transport(()))
-            .collect();
+            .try_collect()?;
 
-        Ok(Self::Output {
-            manifests: manifests?,
-        })
+        Ok(Self::Output { manifests })
     }
 }
 
-impl ToTransport for crate::RawRrdManifest {
+impl ToTransport for RawRrdManifest {
     type Output = re_protos::log_msg::v1alpha1::RrdManifest;
     type Context<'a> = ();
 
@@ -102,8 +102,11 @@ pub trait ToApplication {
 }
 
 impl ToApplication for re_protos::log_msg::v1alpha1::log_msg::Msg {
-    type Output = re_log_types::LogMsg;
-    type Context<'a> = (&'a mut dyn ApplicationIdInjector, Option<CrateVersion>);
+    type Output = re_log_msg::LogMsg;
+    type Context<'a> = (
+        &'a mut dyn ApplicationIdInjector,
+        Option<CrateVersion<'static>>,
+    );
 
     fn to_application(
         &self,
@@ -112,7 +115,7 @@ impl ToApplication for re_protos::log_msg::v1alpha1::log_msg::Msg {
         let mut log_msg = log_msg_transport_to_app(app_id_injector, self)?;
 
         if let Some(patched_version) = patched_version
-            && let re_log_types::LogMsg::SetStoreInfo(msg) = &mut log_msg
+            && let re_log_msg::LogMsg::SetStoreInfo(msg) = &mut log_msg
         {
             // In the context of a native RRD stream (files, stdio, etc), this is used to patch the
             // version advertised by the application-level object so that it matches the one advertised
@@ -126,8 +129,11 @@ impl ToApplication for re_protos::log_msg::v1alpha1::log_msg::Msg {
 }
 
 impl ToApplication for re_protos::log_msg::v1alpha1::LogMsg {
-    type Output = re_log_types::LogMsg;
-    type Context<'a> = (&'a mut dyn ApplicationIdInjector, Option<CrateVersion>);
+    type Output = re_log_msg::LogMsg;
+    type Context<'a> = (
+        &'a mut dyn ApplicationIdInjector,
+        Option<CrateVersion<'static>>,
+    );
 
     fn to_application(
         &self,
@@ -142,7 +148,7 @@ impl ToApplication for re_protos::log_msg::v1alpha1::LogMsg {
 }
 
 impl ToApplication for re_protos::log_msg::v1alpha1::ArrowMsg {
-    type Output = re_log_types::ArrowMsg;
+    type Output = re_log_msg::ArrowMsg;
     type Context<'a> = ();
 
     fn to_application(&self, _context: Self::Context<'_>) -> Result<Self::Output, CodecError> {
@@ -171,7 +177,7 @@ impl ToApplication for re_protos::log_msg::v1alpha1::RrdFooter {
 }
 
 impl ToApplication for re_protos::log_msg::v1alpha1::RrdManifest {
-    type Output = crate::RawRrdManifest;
+    type Output = RawRrdManifest;
     type Context<'a> = ();
 
     fn to_application(&self, _context: Self::Context<'_>) -> Result<Self::Output, CodecError> {
@@ -228,13 +234,14 @@ impl ToApplication for re_protos::log_msg::v1alpha1::RrdManifest {
 /// `SetStoreInfo` message.
 ///
 /// The provided [`ApplicationIdInjector`] must be shared across all calls for the same stream.
-#[tracing::instrument(level = "trace", skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 fn log_msg_transport_to_app<I: ApplicationIdInjector + ?Sized>(
     app_id_injector: &mut I,
     message: &re_protos::log_msg::v1alpha1::log_msg::Msg,
-) -> Result<re_log_types::LogMsg, CodecError> {
+) -> Result<re_log_msg::LogMsg, CodecError> {
     re_tracing::profile_function!();
 
+    use re_protos::common::v1alpha1::ext::StoreIdFromProtoError;
     use re_protos::log_msg::v1alpha1::log_msg::Msg;
     use re_protos::missing_field;
 
@@ -242,7 +249,7 @@ fn log_msg_transport_to_app<I: ApplicationIdInjector + ?Sized>(
         Msg::SetStoreInfo(set_store_info) => {
             let set_store_info: SetStoreInfo = set_store_info.clone().try_into()?;
             app_id_injector.store_info_received(&set_store_info.info);
-            Ok(re_log_types::LogMsg::SetStoreInfo(set_store_info))
+            Ok(re_log_msg::LogMsg::SetStoreInfo(set_store_info))
         }
 
         Msg::ArrowMsg(arrow_msg) => {
@@ -257,16 +264,19 @@ fn log_msg_transport_to_app<I: ApplicationIdInjector + ?Sized>(
                 .try_into()
             {
                 Ok(store_id) => store_id,
-                Err(err) => {
+                // A *missing* app id can be recovered from an earlier `SetStoreInfo`; a *present
+                // but invalid* one is a hard error.
+                Err(StoreIdFromProtoError::MissingApplicationId(err)) => {
                     let Some(store_id) = app_id_injector.recover_store_id(err.clone()) else {
                         return Err(err.into());
                     };
 
                     store_id
                 }
+                Err(err @ StoreIdFromProtoError::InvalidApplicationId(_)) => return Err(err.into()),
             };
 
-            Ok(re_log_types::LogMsg::ArrowMsg(store_id, encoded))
+            Ok(re_log_msg::LogMsg::ArrowMsg(store_id, encoded))
         }
 
         Msg::BlueprintActivationCommand(blueprint_activation_command) => {
@@ -284,16 +294,19 @@ fn log_msg_transport_to_app<I: ApplicationIdInjector + ?Sized>(
                 .try_into()
             {
                 Ok(store_id) => store_id,
-                Err(err) => {
+                // A *missing* app id can be recovered from an earlier `SetStoreInfo`; a *present
+                // but invalid* one is a hard error.
+                Err(StoreIdFromProtoError::MissingApplicationId(err)) => {
                     let Some(store_id) = app_id_injector.recover_store_id(err.clone()) else {
                         return Err(err.into());
                     };
 
                     store_id
                 }
+                Err(err @ StoreIdFromProtoError::InvalidApplicationId(_)) => return Err(err.into()),
             };
 
-            Ok(re_log_types::LogMsg::BlueprintActivationCommand(
+            Ok(re_log_msg::LogMsg::BlueprintActivationCommand(
                 BlueprintActivationCommand {
                     blueprint_id,
                     make_active: blueprint_activation_command.make_active,
@@ -305,10 +318,10 @@ fn log_msg_transport_to_app<I: ApplicationIdInjector + ?Sized>(
 }
 
 /// Converts a transport-level `ArrowMsg` to its application-level counterpart.
-#[tracing::instrument(level = "trace", skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 fn arrow_msg_transport_to_app(
     arrow_msg: &re_protos::log_msg::v1alpha1::ArrowMsg,
-) -> Result<re_log_types::ArrowMsg, CodecError> {
+) -> Result<re_log_msg::ArrowMsg, CodecError> {
     re_tracing::profile_function!();
 
     use re_protos::log_msg::v1alpha1::Encoding;
@@ -317,34 +330,22 @@ fn arrow_msg_transport_to_app(
         return Err(CodecError::UnsupportedEncoding);
     }
 
+    // NOTE: Don't use the prost accessor `arrow_msg.compression()` here: it silently maps
+    // unknown enum values (e.g. a new codec from a future writer) to the default, which would
+    // then fail with a confusing Arrow-IPC parse error further down the line.
+    let compression = re_protos::common::v1alpha1::Compression::try_from(arrow_msg.compression)
+        .map_err(re_protos::TypeConversionError::from)?;
+
     let batch = decode_arrow(
         &arrow_msg.payload,
         arrow_msg.uncompressed_size as usize,
-        arrow_msg.compression().into(),
+        compression.into(),
     )?;
 
-    let chunk_id = re_sorbet::chunk_id_of_schema(batch.schema_ref())?.as_tuid();
+    let batch = re_sorbet::ChunkBatch::try_from(&batch)?;
 
-    // TODO(grtlr): In the future, we should be able to rely on the `chunk_id` to be present in the
-    // protobuf definitions. For now we have to extract it from the `batch`.
-    //
-    // let chunk_id = arrow_msg
-    //     .chunk_id
-    //     .ok_or_else(|| missing_field!(re_protos::log_msg::v1alpha1::ArrowMsg, "chunk_id"))?
-    //     .try_from()?;
-
-    // This also ensures that we perform all required migrations from `re_sorbet`.
-    // TODO(#10343): Would it make sense to change `re_types_core::ArrowMsg` to contain the
-    // `ChunkBatch` directly?
-    let chunk_batch = re_sorbet::ChunkBatch::try_from(&batch)?;
-
-    // TODO(emilk): it would actually be nicer if we could postpone the migration,
-    // so that there is some way to get the original (unmigrated) data out of an .rrd,
-    // which would be very useful for debugging, e.g. using the `print` command.
-
-    Ok(re_log_types::ArrowMsg {
-        chunk_id,
-        batch: chunk_batch.into(),
+    Ok(re_log_msg::ArrowMsg {
+        batch: std::sync::Arc::new(batch),
         on_release: None,
     })
 }
@@ -352,22 +353,22 @@ fn arrow_msg_transport_to_app(
 /// Converts an application-level `LogMsg` to its transport-level counterpart.
 #[tracing::instrument(level = "trace", skip_all)]
 fn log_msg_app_to_transport(
-    message: &re_log_types::LogMsg,
+    message: &re_log_msg::LogMsg,
     compression: crate::rrd::Compression,
 ) -> Result<re_protos::log_msg::v1alpha1::log_msg::Msg, CodecError> {
     re_tracing::profile_function!();
 
     let proto_msg = match message {
-        re_log_types::LogMsg::SetStoreInfo(set_store_info) => {
+        re_log_msg::LogMsg::SetStoreInfo(set_store_info) => {
             re_protos::log_msg::v1alpha1::log_msg::Msg::SetStoreInfo(set_store_info.clone().into())
         }
 
-        re_log_types::LogMsg::ArrowMsg(store_id, arrow_msg) => {
+        re_log_msg::LogMsg::ArrowMsg(store_id, arrow_msg) => {
             let arrow_msg = arrow_msg_app_to_transport(arrow_msg, store_id.clone(), compression)?;
             re_protos::log_msg::v1alpha1::log_msg::Msg::ArrowMsg(arrow_msg)
         }
 
-        re_log_types::LogMsg::BlueprintActivationCommand(blueprint_activation_command) => {
+        re_log_msg::LogMsg::BlueprintActivationCommand(blueprint_activation_command) => {
             re_protos::log_msg::v1alpha1::log_msg::Msg::BlueprintActivationCommand(
                 blueprint_activation_command.clone().into(),
             )
@@ -380,14 +381,13 @@ fn log_msg_app_to_transport(
 /// Converts an application-level `ArrowMsg` to its transport-level counterpart.
 #[tracing::instrument(level = "trace", skip_all)]
 fn arrow_msg_app_to_transport(
-    arrow_msg: &re_log_types::ArrowMsg,
+    arrow_msg: &re_log_msg::ArrowMsg,
     store_id: re_log_types::StoreId,
     compression: crate::rrd::Compression,
 ) -> Result<re_protos::log_msg::v1alpha1::ArrowMsg, CodecError> {
     re_tracing::profile_function!();
 
-    let re_log_types::ArrowMsg {
-        chunk_id,
+    let re_log_msg::ArrowMsg {
         batch,
         on_release: _,
     } = arrow_msg;
@@ -396,12 +396,12 @@ fn arrow_msg_app_to_transport(
 
     Ok(re_protos::log_msg::v1alpha1::ArrowMsg {
         store_id: Some(store_id.into()),
-        chunk_id: Some((*chunk_id).into()),
+        chunk_id: Some(batch.chunk_id().as_tuid().into()),
         compression: re_protos::common::v1alpha1::Compression::from(compression) as i32,
         uncompressed_size: payload.uncompressed_size,
         encoding: re_protos::log_msg::v1alpha1::Encoding::ArrowIpc as i32,
         payload: payload.data.into(),
-        is_static: re_sorbet::is_static_chunk(batch),
+        is_static: Some(batch.is_static()),
     })
 }
 
@@ -491,4 +491,38 @@ fn decode_arrow(
         .next()
         .ok_or(CodecError::MissingRecordBatch)?
         .map_err(CodecError::ArrowDeserialization)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CodecError;
+
+    fn arrow_msg_with_compression(compression: i32) -> re_protos::log_msg::v1alpha1::ArrowMsg {
+        re_protos::log_msg::v1alpha1::ArrowMsg {
+            store_id: None,
+            chunk_id: None,
+            compression,
+            uncompressed_size: 0,
+            encoding: re_protos::log_msg::v1alpha1::Encoding::ArrowIpc as i32,
+            payload: Default::default(),
+            is_static: None,
+        }
+    }
+
+    #[test]
+    fn arrow_msg_unknown_compression_errors() {
+        let arrow_msg = arrow_msg_with_compression(99);
+        let result = super::arrow_msg_transport_to_app(&arrow_msg);
+        assert!(matches!(result, Err(CodecError::TypeConversion(_))));
+    }
+
+    #[test]
+    fn arrow_msg_unspecified_compression_is_accepted() {
+        // `COMPRESSION_UNSPECIFIED` is documented to mean no compression, so it must not be
+        // rejected as an unknown enum value (the empty payload fails later, during Arrow-IPC
+        // decoding).
+        let arrow_msg = arrow_msg_with_compression(0);
+        let result = super::arrow_msg_transport_to_app(&arrow_msg);
+        assert!(!matches!(result, Err(CodecError::TypeConversion(_))));
+    }
 }

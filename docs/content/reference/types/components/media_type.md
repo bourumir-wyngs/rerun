@@ -8,8 +8,8 @@ A standardized media type (RFC2046, formerly known as MIME types), encoded as a 
 The complete reference of officially registered media types is maintained by the IANA and can be
 consulted at <https://www.iana.org/assignments/media-types/media-types.xhtml>.
 
-## Rerun datatype
-[`Utf8`](../datatypes/utf8.md)
+## Rerun encoding
+[`Utf8`](../encodings/utf8.md)
 
 
 ## Arrow datatype
@@ -26,6 +26,7 @@ Utf8
 ## Used by
 
 * [`Asset3D`](../archetypes/asset3d.md)
+* [`AssetAudio`](../archetypes/asset_audio.md?speculative-link)
 * [`AssetVideo`](../archetypes/asset_video.md)
 * [`EncodedDepthImage`](../archetypes/encoded_depth_image.md)
 * [`EncodedImage`](../archetypes/encoded_image.md)

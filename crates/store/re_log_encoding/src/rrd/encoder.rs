@@ -3,14 +3,18 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 
+use itertools::Itertools as _;
 use re_build_info::CrateVersion;
 use re_chunk::{ChunkError, ChunkResult};
-use re_log_types::{LogMsg, StoreId};
+use re_chunk_index::{ChunkIndexError, RawRrdManifest, RrdManifestBuilder};
+use re_log_msg::LogMsg;
+use re_log_types::StoreId;
 use re_sorbet::SorbetError;
+use re_span::Span;
 
 use crate::{
     CodecError, Compression, Encodable as _, EncodingOptions, MessageHeader, MessageKind,
-    RrdManifestBuilder, Serializer, StreamFooter, StreamHeader, ToTransport as _,
+    Serializer, StreamFooter, StreamHeader, ToTransport as _,
 };
 
 // ----------------------------------------------------------------------------
@@ -45,6 +49,12 @@ const _: () = assert!(
 impl From<CodecError> for EncodeError {
     fn from(err: CodecError) -> Self {
         Self::Codec(Box::new(err))
+    }
+}
+
+impl From<ChunkIndexError> for EncodeError {
+    fn from(err: ChunkIndexError) -> Self {
+        Self::Codec(Box::new(err.into()))
     }
 }
 
@@ -85,7 +95,7 @@ pub struct Encoder<W: std::io::Write> {
     ///
     /// If set to `None`, the footer will not be computed.
     ///
-    /// Calling [`Self::append_transport`] will automatically disable footers.
+    /// Calling [`Self::append_transport_without_footer`] will automatically disable footers.
     footer_state: Option<FooterState>,
 
     /// Tracks whether the end-of-stream marker, and optionally the associated footer, have been
@@ -98,26 +108,12 @@ pub struct Encoder<W: std::io::Write> {
 /// This is automatically updated when calling [`Encoder::append`].
 #[derive(Default)]
 struct FooterState {
-    /// What is the currently active recording ID according to the state of the encoder, if any?
-    ///
-    /// Put another way: was there a `SetStoreInfo` message earlier in the stream? If so, we will
-    /// want to override the recording ID of each chunk with that one (because that's the existing
-    /// behavior, certainly not because it's nice).
-    recording_id_scope: Option<re_log_types::StoreId>,
-
     manifests: HashMap<re_log_types::StoreId, ManifestState>,
 }
 
 /// The accumulated state for a specific RRD manifest.
 #[derive(Default)]
 struct ManifestState {
-    /// The accumulated recording IDs of each individual chunk, extracted from their `LogMsg`.
-    ///
-    /// In most normal scenarios, this will just be the same value repeated N times.
-    ///
-    /// This will only be used if [`FooterState::recording_id_scope`] is empty.
-    recording_ids: Vec<re_log_types::StoreId>,
-
     /// The state of the RRD manifest currently being built.
     manifest: RrdManifestBuilder,
 }
@@ -125,59 +121,34 @@ struct ManifestState {
 impl FooterState {
     fn append(
         &mut self,
-        msg: &re_log_types::LogMsg,
-        byte_span_excluding_header: re_span::Span<u64>,
+        msg: &re_log_msg::LogMsg,
+        byte_span_excluding_header: Span<u64>,
         byte_size_uncompressed: u64,
     ) -> Result<(), EncodeError> {
         match msg {
-            LogMsg::SetStoreInfo(msg) => {
-                self.recording_id_scope = Some(msg.info.store_id.clone());
-            }
-
             LogMsg::ArrowMsg(store_id, msg) => {
-                // NOTE(1): The fact that this parses the `RecordBatch` back into an actual `Chunk`
-                // is a bit unfortunate, but really it's nowhere near as bad as one might think:
-                // the real costly work is to parse the IPC payload into a `RecordBatch` in the
-                // first place, but thankfully we don't have to repay that cost here.
-                // Not only that: keep in mind that this entire codepath is only taken when writing
-                // actual RRD files, so performance is generally IO bound anyway.
-                //
-                // NOTE(2): The fact that we also perform a Sorbet migration in the process is a
-                // bit weirder on the other hand, but then again this is generally not a new a
-                // problem: we tend to perform Sorbet migrations a bit too aggressively all over
-                // the place. We really need a layer that sits between the transport and
-                // application layer where one can accessed the parsed, unmigrated data.
-                let chunk_batch = re_sorbet::ChunkBatch::try_from(&msg.batch)?;
-
-                // See `self.recording_id_scope` for some explanations.
-                let recording_id = self
-                    .recording_id_scope
-                    .clone()
-                    .unwrap_or_else(|| store_id.clone());
+                let chunk_batch = &msg.batch;
 
                 // This line is important: it implies that if a recording doesn't have any data
                 // chunks at all, we do not even reserve an RRD manifest for it in the footer.
-                let ManifestState {
-                    recording_ids,
-                    manifest,
-                } = self.manifests.entry(recording_id.clone()).or_default();
+                let ManifestState { manifest } =
+                    self.manifests.entry(store_id.clone()).or_default();
 
-                recording_ids.push(recording_id);
                 manifest.append(
-                    &chunk_batch,
+                    chunk_batch,
                     byte_span_excluding_header,
                     byte_size_uncompressed,
                 )?;
             }
 
-            LogMsg::BlueprintActivationCommand(_) => {}
+            LogMsg::SetStoreInfo(_) | LogMsg::BlueprintActivationCommand(_) => {}
         }
 
         Ok(())
     }
 
     fn finish(self) -> Result<crate::RrdFooter, EncodeError> {
-        let manifests: Result<HashMap<StoreId, crate::RawRrdManifest>, _> = self
+        let manifests: HashMap<StoreId, RawRrdManifest> = self
             .manifests
             .into_iter()
             .map(|(store_id, state)| {
@@ -186,11 +157,9 @@ impl FooterState {
                     .build(store_id.clone())
                     .map(|m| (store_id, m))
             })
-            .collect();
+            .try_collect()?;
 
-        Ok(crate::RrdFooter {
-            manifests: manifests?,
-        })
+        Ok(crate::RrdFooter { manifests })
     }
 }
 
@@ -213,9 +182,7 @@ impl Encoder<Vec<u8>> {
     ) -> Result<Vec<u8>, EncodeError> {
         re_tracing::profile_function!();
         let mut encoder = Self::local()?;
-        for message in messages {
-            encoder.append(message?.borrow())?;
-        }
+        encoder.extend(messages)?;
         encoder.finish()?;
         encoder.into_inner()
     }
@@ -229,7 +196,7 @@ impl<W: std::io::Write> Encoder<W> {
     ///
     /// There is no `_lazy` version. Make one if you need one.
     pub fn new_eager(
-        version: CrateVersion,
+        version: CrateVersion<'static>,
         options: EncodingOptions,
         mut write: W,
     ) -> Result<Self, EncodeError> {
@@ -257,41 +224,12 @@ impl<W: std::io::Write> Encoder<W> {
     }
 
     /// Returns the size in bytes of the encoded data.
-    pub fn append(&mut self, message: &re_log_types::LogMsg) -> Result<u64, EncodeError> {
-        if self.is_finished {
-            return Err(EncodeError::AlreadyFinished);
-        }
-
-        let Some(w) = self.write.as_mut() else {
-            return Err(EncodeError::AlreadyUnwrapped);
-        };
-
+    pub fn append(&mut self, message: &re_log_msg::LogMsg) -> Result<u64, EncodeError> {
         re_tracing::profile_function!();
 
         let transport = message.to_transport(self.compression)?;
 
-        let byte_offset_excluding_header =
-            self.num_written + crate::MessageHeader::ENCODED_SIZE_BYTES as u64;
-
-        self.scratch.clear();
-        let n = match self.serializer {
-            Serializer::Protobuf => {
-                transport.to_rrd_bytes(&mut self.scratch)?;
-                let n = w
-                    .write_all(&self.scratch)
-                    .map(|()| self.scratch.len() as u64)
-                    .map_err(EncodeError::Write)?;
-                self.num_written += n;
-                n
-            }
-        };
-
-        let byte_size_excluding_header = n - crate::MessageHeader::ENCODED_SIZE_BYTES as u64;
-
-        let byte_span_excluding_header = re_span::Span {
-            start: byte_offset_excluding_header,
-            len: byte_size_excluding_header,
-        };
+        let (n, byte_span_excluding_header) = self.write_encodable(&transport)?;
 
         if let Some(footer_state) = self.footer_state.as_mut() {
             footer_state.append(
@@ -302,6 +240,21 @@ impl<W: std::io::Write> Encoder<W> {
         }
 
         Ok(n)
+    }
+
+    /// Returns the size in bytes of the encoded data.
+    pub fn extend(
+        &mut self,
+        messages: impl IntoIterator<Item = ChunkResult<impl Borrow<LogMsg>>>,
+    ) -> Result<u64, EncodeError> {
+        re_tracing::profile_function!();
+
+        let mut size_bytes = 0;
+        // TODO(emilk): call `.to_transport` in parallel.
+        for message in messages {
+            size_bytes += self.append(message?.borrow())?;
+        }
+        Ok(size_bytes)
     }
 
     /// Instructs the encoder to _not_ emit a footer at the end of the stream.
@@ -320,20 +273,30 @@ impl<W: std::io::Write> Encoder<W> {
     /// `message` must respect the global settings of the encoder (e.g. the compression used),
     /// otherwise the resulting RRD stream will be corrupt and unreadable.
     #[expect(unsafe_code)]
-    pub unsafe fn append_transport(
+    pub unsafe fn append_transport_without_footer(
         &mut self,
         message: &re_protos::log_msg::v1alpha1::log_msg::Msg,
-    ) -> Result<(re_span::Span<u64>, u64), EncodeError> {
-        if self.is_finished {
-            return Err(EncodeError::AlreadyFinished);
-        }
-
-        re_tracing::profile_function!();
-
+    ) -> Result<(Span<u64>, u64), EncodeError> {
         // We cannot update the RRD manifest without decoding the message, which would defeat the
         // entire purposes of using this method in the first place.
         // Therefore, we disable footers if and when this method is used.
         self.do_not_emit_footer();
+
+        let (_, byte_span_excluding_header) = self.write_encodable(message)?;
+
+        Ok((byte_span_excluding_header, message.byte_size_uncompressed()))
+    }
+
+    /// Encode and write a message, returning `(total_bytes_written, byte_span_excluding_header)`.
+    fn write_encodable(
+        &mut self,
+        encodable: &dyn crate::Encodable,
+    ) -> Result<(u64, Span<u64>), EncodeError> {
+        re_tracing::profile_function!();
+
+        if self.is_finished {
+            return Err(EncodeError::AlreadyFinished);
+        }
 
         let Some(w) = self.write.as_mut() else {
             return Err(EncodeError::AlreadyUnwrapped);
@@ -345,7 +308,7 @@ impl<W: std::io::Write> Encoder<W> {
         self.scratch.clear();
         let n = match self.serializer {
             Serializer::Protobuf => {
-                message.to_rrd_bytes(&mut self.scratch)?;
+                encodable.to_rrd_bytes(&mut self.scratch)?;
                 let n = w
                     .write_all(&self.scratch)
                     .map(|()| self.scratch.len() as u64)
@@ -357,12 +320,10 @@ impl<W: std::io::Write> Encoder<W> {
 
         let byte_size_excluding_header = n - crate::MessageHeader::ENCODED_SIZE_BYTES as u64;
 
-        let byte_span_excluding_header = re_span::Span {
-            start: byte_offset_excluding_header,
-            len: byte_size_excluding_header,
-        };
+        let byte_span_excluding_header =
+            Span::from_start_len(byte_offset_excluding_header, byte_size_excluding_header);
 
-        Ok((byte_span_excluding_header, message.byte_size_uncompressed()))
+        Ok((n, byte_span_excluding_header))
     }
 
     /// Like [`Self::finish`], but appends the specified, custom RRD footer.
@@ -496,18 +457,14 @@ impl<W: std::io::Write> Encoder<W> {
     ///
     /// Returns the size in bytes of the encoded data.
     pub fn encode_into(
-        version: CrateVersion,
+        version: CrateVersion<'static>,
         options: EncodingOptions,
         messages: impl IntoIterator<Item = ChunkResult<impl Borrow<LogMsg>>>,
         write: &mut W,
     ) -> Result<u64, EncodeError> {
         re_tracing::profile_function!();
         let mut encoder = Encoder::new_eager(version, options, write)?;
-        let mut size_bytes = 0;
-        for message in messages {
-            size_bytes += encoder.append(message?.borrow())?;
-        }
-        Ok(size_bytes)
+        encoder.extend(messages)
     }
 }
 

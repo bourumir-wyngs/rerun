@@ -7,8 +7,8 @@ A buffer that is known to store image data.
 
 To interpret the contents of this buffer, see, [`components.ImageFormat`](https://rerun.io/docs/reference/types/components/image_format).
 
-## Rerun datatype
-[`Blob`](../datatypes/blob.md)
+## Rerun encoding
+[`Blob`](../encodings/blob.md)
 
 
 ## Arrow datatype
@@ -25,7 +25,7 @@ List(non-null UInt8)
 ## Used by
 
 * [`DepthImage`](../archetypes/depth_image.md)
-* [`GridMap`](../archetypes/grid_map.md?speculative-link)
+* [`GridMap`](../archetypes/grid_map.md)
 * [`Image`](../archetypes/image.md)
 * [`Mesh3D`](../archetypes/mesh3d.md)
 * [`SegmentationImage`](../archetypes/segmentation_image.md)

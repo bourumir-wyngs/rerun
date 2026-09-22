@@ -127,7 +127,7 @@ impl SplitCommand {
         // activations), so that we can properly rebuild the final RRD files.
         //
         // TODO(RR-1075): recordings should not contain anything but stateless data.
-        let mut meta_messages: HashMap<StoreId, Vec<re_log_types::LogMsg>> = HashMap::default();
+        let mut meta_messages: HashMap<StoreId, Vec<re_log_msg::LogMsg>> = HashMap::default();
 
         {
             // Load all the data & metadata for all the stores present in the file.
@@ -139,7 +139,7 @@ impl SplitCommand {
             for (msg_nr, (_source, res)) in rx_decoder.iter().enumerate() {
                 match res {
                     Ok(msg) => match &msg {
-                        re_log_types::LogMsg::SetStoreInfo(set_store_info) => {
+                        re_log_msg::LogMsg::SetStoreInfo(set_store_info) => {
                             let store_id = set_store_info.info.store_id.clone();
                             current_store_id = Some(store_id.clone());
 
@@ -153,7 +153,7 @@ impl SplitCommand {
                             });
                         }
 
-                        re_log_types::LogMsg::ArrowMsg(store_id, msg) => {
+                        re_log_msg::LogMsg::ArrowMsg(store_id, msg) => {
                             let Some(store) = stores.get_mut(store_id) else {
                                 anyhow::bail!("unknown store ID: {store_id:?}");
                             };
@@ -161,7 +161,7 @@ impl SplitCommand {
                             store.insert_chunk(&Arc::new(chunk))?;
                         }
 
-                        re_log_types::LogMsg::BlueprintActivationCommand(_) => {
+                        re_log_msg::LogMsg::BlueprintActivationCommand(_) => {
                             let Some(current_store_id) = current_store_id.clone() else {
                                 re_log::warn!(
                                     "found BlueprintActivationCommand without an active store, discarding"
@@ -200,7 +200,13 @@ impl SplitCommand {
         );
 
         re_log::info!("extracting keyframes…");
+        #[cfg(feature = "video")]
         let mut keyframes_per_entity: IntMap<_, Vec<_>> = IntMap::default();
+        #[cfg(not(feature = "video"))]
+        let keyframes_per_entity: IntMap<_, Vec<_>> = IntMap::default();
+        // Without the `video` feature there is no keyframe detection, so no entity ever
+        // gets keyframe-based rebatching.
+        #[cfg(feature = "video")]
         for store in stores.values() {
             for entity in store.all_entities() {
                 let keyframes = extract_keyframes(&entity, store, cutoff_timeline);
@@ -259,7 +265,7 @@ impl SplitCommand {
                 .take(path_to_output_rrds.len())
                 .unzip();
 
-        type Receiver = re_log::Receiver<(StoreId, Vec<re_log_types::LogMsg>)>;
+        type Receiver = re_log::Receiver<(StoreId, Vec<re_log_msg::LogMsg>)>;
         let spawn_encoding_thread = move |split_idx, path: String, msgs: Receiver| {
             std::thread::Builder::new()
                 .name(format!("rerun-rrd-split-out-{split_idx}"))
@@ -299,15 +305,15 @@ impl SplitCommand {
                             for mut msg in msgs {
                                 if new_store_id.kind() != StoreKind::Blueprint {
                                     match &mut msg {
-                                        re_log_types::LogMsg::SetStoreInfo(info) => {
+                                        re_log_msg::LogMsg::SetStoreInfo(info) => {
                                             info.info.store_id = new_store_id.clone();
                                         }
 
-                                        re_log_types::LogMsg::ArrowMsg(id, _) => {
+                                        re_log_msg::LogMsg::ArrowMsg(id, _) => {
                                             *id = new_store_id.clone();
                                         }
 
-                                        re_log_types::LogMsg::BlueprintActivationCommand(_) => {}
+                                        re_log_msg::LogMsg::BlueprintActivationCommand(_) => {}
                                     }
                                 }
 
@@ -342,11 +348,10 @@ impl SplitCommand {
                 let chunks = store
                     .iter_physical_chunks()
                     .map(|chunk| {
-                        Ok(re_log_types::LogMsg::ArrowMsg(
+                        Ok(re_log_msg::LogMsg::ArrowMsg(
                             store_id.clone(),
-                            re_log_types::ArrowMsg {
-                                chunk_id: *chunk.id(),
-                                batch: chunk.to_record_batch()?,
+                            re_log_msg::ArrowMsg {
+                                batch: std::sync::Arc::new(chunk.to_chunk_batch()?),
                                 on_release: None,
                             },
                         ))
@@ -446,7 +451,10 @@ impl SplitCommand {
                 }
             }
 
-            let Some(cutoff_timeline) = known_timelines.remove(&timeline.as_str().into()) else {
+            let Some(cutoff_timeline) = TimelineName::try_new(timeline)
+                .ok()
+                .and_then(|name| known_timelines.remove(&name))
+            else {
                 anyhow::bail!(
                     "timeline '{timeline}' does not exist in the input recording, available timelines are {}",
                     known_timelines.keys().map(|name| name.as_str()).join(", ")
@@ -493,14 +501,15 @@ impl SplitCommand {
             let time_span = max_time.saturating_sub(min_time) / *num_parts as i64;
             let mut cur_time = min_time;
 
-            (0..*num_parts as u64)
-                .map(|_| {
+            std::iter::chain(
+                (0..*num_parts as u64).map(|_| {
                     let t = cur_time;
                     cur_time += time_span;
                     TimeInt::new_temporal(t)
-                })
-                .chain(std::iter::once(TimeInt::new_temporal(max_time)))
-                .collect()
+                }),
+                std::iter::once(TimeInt::new_temporal(max_time)),
+            )
+            .collect()
         } else if !times.is_empty() {
             let times = times
                 .iter()
@@ -531,7 +540,7 @@ impl SplitCommand {
         cutoff_timeline: Timeline,
         cutoff_times: &[TimeInt],
         keyframes_per_entity: &IntMap<EntityPath, Vec<TimeInt>>,
-        txs_encoding: &[re_log::Sender<(StoreId, Vec<re_log_types::LogMsg>)>],
+        txs_encoding: &[re_log::Sender<(StoreId, Vec<re_log_msg::LogMsg>)>],
     ) -> anyhow::Result<()> {
         // `VideoStream`s must be split on a keyframe, always.
         //
@@ -676,21 +685,21 @@ impl SplitCommand {
                 // Special cases: transforms and/or pinholes with multiplexed coordinate frames
                 let entity_has_multiplexed_transforms_on_timeline =
                     store.entity_has_component_on_timeline(
-                        cutoff_timeline.name(),
+                        Some(cutoff_timeline.name()),
                         entity,
                         transform_parent_frame_identifier,
                     ) || store.entity_has_component_on_timeline(
-                        cutoff_timeline.name(),
+                        Some(cutoff_timeline.name()),
                         entity,
                         transform_child_frame_identifier,
                     );
                 let entity_has_multiplexed_pinholes_on_timeline =
                     store.entity_has_component_on_timeline(
-                        cutoff_timeline.name(),
+                        Some(cutoff_timeline.name()),
                         entity,
                         pinhole_parent_frame_identifier,
                     ) || store.entity_has_component_on_timeline(
-                        cutoff_timeline.name(),
+                        Some(cutoff_timeline.name()),
                         entity,
                         pinhole_child_frame_identifier,
                     );
@@ -762,13 +771,14 @@ impl SplitCommand {
                         .map(move |(original_chunk_id, chunk)| {
                             (
                                 original_chunk_id,
-                                re_log_types::LogMsg::ArrowMsg(
+                                re_log_msg::LogMsg::ArrowMsg(
                                     store.id(),
-                                    re_log_types::ArrowMsg {
-                                        chunk_id: *chunk.id(),
-                                        batch: chunk
-                                            .to_record_batch()
-                                            .expect("we got it in, surely we can get it out"),
+                                    re_log_msg::ArrowMsg {
+                                        batch: std::sync::Arc::new(
+                                            chunk
+                                                .to_chunk_batch()
+                                                .expect("we got it in, surely we can get it out"),
+                                        ),
                                         on_release: None,
                                     },
                                 ),
@@ -785,6 +795,7 @@ impl SplitCommand {
 }
 
 // TODO(RR-3810): For a virtual store implementation, we'd want this to load no more than 1 chunk at a time.
+#[cfg(feature = "video")]
 fn extract_keyframes(
     entity_path: &EntityPath,
     store: &ChunkStore,
@@ -833,8 +844,8 @@ fn extract_keyframes(
             };
 
             let sample = sample.0.inner().as_slice();
-            match re_video::detect_gop_start(sample, codec.into()) {
-                Ok(re_video::GopStartDetection::StartOfGop(_)) => {
+            match re_video::is_start_of_gop(sample, codec.into()) {
+                Ok(true) => {
                     re_log::debug!(
                         entity = %entity_path,
                         time = %time_to_human_string(cutoff_timeline, time),
@@ -844,7 +855,7 @@ fn extract_keyframes(
                     keyframes.push(time);
                 }
 
-                Ok(re_video::GopStartDetection::NotStartOfGop) => {}
+                Ok(false) => {}
 
                 Err(err) => {
                     re_log::warn!(entity = %entity_path, chunk = %chunk.id(), %err, "keyframe detection failed");
@@ -933,7 +944,7 @@ fn extract_chunks_for_single_split(
                         // We're bootstrapping at the component batch level, so might as well discard everything else.
                         .component_sliced(*component)
                         // `Chunk::latest_at` internally performs shallow-slicing, so make sure to actually deeply re-slice.
-                        .row_sliced_deep(0, 1)
+                        .row_sliced_unit_deep(0)
                         // This chunk might be re-used in other places in this split, and because we're slicing it
                         // (and we really, really need to slice it), we must make sure that it doesn't share
                         // a chunk ID nor a row ID with anything else.
@@ -1013,7 +1024,7 @@ fn extract_chunks_for_single_split(
                     chunk.id(),
                     chunk
                         // Reminder: always perform deep copies if the intent is to write back to disk.
-                        .row_sliced_deep(start_idx, slice_len),
+                        .row_sliced_deep(re_chunk::Span::from_start_len(start_idx, slice_len)),
                 )
             };
 
@@ -1022,7 +1033,7 @@ fn extract_chunks_for_single_split(
         }
     }
 
-    chunks_bootstrap.chain(chunks)
+    std::iter::chain(chunks_bootstrap, chunks)
 }
 
 // ---

@@ -4,11 +4,13 @@ use arrow::buffer::OffsetBuffer;
 // used in docstrings:
 #[allow(clippy::allow_attributes, unused_imports, clippy::unused_trait_names)]
 use crate::Archetype;
-use crate::{ArchetypeName, ComponentDescriptor, ComponentType, Loggable, SerializationResult};
+use crate::{
+    ArchetypeName, ComponentDescriptor, ComponentType, SerializationResult, ToArrow, ToArrowOpt,
+};
 
 // ---
 
-/// A [`ComponentBatch`] represents an array's worth of [`Loggable`] instances, ready to be
+/// A [`ComponentBatch`] represents an array's worth of loggable instances, ready to be
 /// serialized.
 ///
 /// [`ComponentBatch`] is carefully designed to be erasable ("object-safe"), so that it is possible
@@ -20,7 +22,7 @@ use crate::{ArchetypeName, ComponentDescriptor, ComponentType, Loggable, Seriali
 pub trait ComponentBatch {
     // NOTE: It'd be tempting to have the following associated type, but that'd be
     // counterproductive, the whole point of this is to allow for heterogeneous collections!
-    // type Loggable: Loggable;
+    // type Element: ToArrow;
 
     /// Serializes the batch into an Arrow array.
     fn to_arrow(&self) -> SerializationResult<arrow::array::ArrayRef>;
@@ -30,8 +32,7 @@ pub trait ComponentBatch {
         let array = self.to_arrow()?;
         let offsets =
             arrow::buffer::OffsetBuffer::from_lengths(std::iter::repeat_n(1, array.len()));
-        let nullable = true;
-        let field = arrow::datatypes::Field::new("item", array.data_type().clone(), nullable);
+        let field = re_arrow_util::canonical_component_list_field(array.data_type().clone());
         ArrowListArray::try_new(field.into(), offsets, array, None).map_err(|err| err.into())
     }
 
@@ -116,20 +117,12 @@ fn assert_component_batch_object_safe() {
 /// * See [`AsComponents`] for logging serialized data.
 ///
 /// [`AsComponents`]: [crate::AsComponents]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, re_byte_size::SizeBytes)]
 pub struct SerializedComponentBatch {
     // TODO(cmc): Maybe Cow<> this one if it grows bigger. Or intern descriptors altogether, most likely.
     pub descriptor: ComponentDescriptor,
 
     pub array: arrow::array::ArrayRef,
-}
-
-impl re_byte_size::SizeBytes for SerializedComponentBatch {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        let Self { array, descriptor } = self;
-        array.heap_size_bytes() + descriptor.heap_size_bytes()
-    }
 }
 
 impl PartialEq for SerializedComponentBatch {
@@ -188,7 +181,7 @@ impl SerializedComponentBatch {
 /// A column's worth of component data.
 ///
 /// If a [`SerializedComponentBatch`] represents one row's worth of data
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, re_byte_size::SizeBytes)]
 pub struct SerializedComponentColumn {
     pub list_array: arrow::array::ListArray,
 
@@ -223,13 +216,6 @@ impl SerializedComponentColumn {
             list_array,
             descriptor,
         })
-    }
-}
-
-impl re_byte_size::SizeBytes for SerializedComponentColumn {
-    #[inline]
-    fn heap_size_bytes(&self) -> u64 {
-        self.list_array.heap_size_bytes() + self.descriptor.heap_size_bytes()
     }
 }
 
@@ -342,7 +328,7 @@ impl From<&SerializedComponentBatch> for arrow::datatypes::Field {
 
 // --- Unary ---
 
-impl<L: Clone + Loggable> ComponentBatch for L {
+impl<L: Clone + ToArrow> ComponentBatch for L {
     #[inline]
     fn to_arrow(&self) -> SerializationResult<arrow::array::ArrayRef> {
         L::to_arrow([std::borrow::Cow::Borrowed(self)])
@@ -351,7 +337,7 @@ impl<L: Clone + Loggable> ComponentBatch for L {
 
 // --- Unary Option ---
 
-impl<L: Clone + Loggable> ComponentBatch for Option<L> {
+impl<L: Clone + ToArrow> ComponentBatch for Option<L> {
     #[inline]
     fn to_arrow(&self) -> SerializationResult<arrow::array::ArrayRef> {
         L::to_arrow(self.iter().map(|v| std::borrow::Cow::Borrowed(v)))
@@ -360,7 +346,7 @@ impl<L: Clone + Loggable> ComponentBatch for Option<L> {
 
 // --- Vec ---
 
-impl<L: Clone + Loggable> ComponentBatch for Vec<L> {
+impl<L: Clone + ToArrow> ComponentBatch for Vec<L> {
     #[inline]
     fn to_arrow(&self) -> SerializationResult<arrow::array::ArrayRef> {
         L::to_arrow(self.iter().map(|v| std::borrow::Cow::Borrowed(v)))
@@ -369,7 +355,7 @@ impl<L: Clone + Loggable> ComponentBatch for Vec<L> {
 
 // --- Vec<Option> ---
 
-impl<L: Loggable> ComponentBatch for Vec<Option<L>> {
+impl<L: ToArrowOpt> ComponentBatch for Vec<Option<L>> {
     #[inline]
     fn to_arrow(&self) -> SerializationResult<arrow::array::ArrayRef> {
         L::to_arrow_opt(
@@ -381,7 +367,7 @@ impl<L: Loggable> ComponentBatch for Vec<Option<L>> {
 
 // --- Array ---
 
-impl<L: Loggable, const N: usize> ComponentBatch for [L; N] {
+impl<L: ToArrow, const N: usize> ComponentBatch for [L; N] {
     #[inline]
     fn to_arrow(&self) -> SerializationResult<arrow::array::ArrayRef> {
         L::to_arrow(self.iter().map(|v| std::borrow::Cow::Borrowed(v)))
@@ -390,7 +376,7 @@ impl<L: Loggable, const N: usize> ComponentBatch for [L; N] {
 
 // --- Array<Option> ---
 
-impl<L: Loggable, const N: usize> ComponentBatch for [Option<L>; N] {
+impl<L: ToArrowOpt, const N: usize> ComponentBatch for [Option<L>; N] {
     #[inline]
     fn to_arrow(&self) -> SerializationResult<arrow::array::ArrayRef> {
         L::to_arrow_opt(
@@ -402,7 +388,7 @@ impl<L: Loggable, const N: usize> ComponentBatch for [Option<L>; N] {
 
 // --- Slice ---
 
-impl<L: Loggable> ComponentBatch for [L] {
+impl<L: ToArrow> ComponentBatch for [L] {
     #[inline]
     fn to_arrow(&self) -> SerializationResult<arrow::array::ArrayRef> {
         L::to_arrow(self.iter().map(|v| std::borrow::Cow::Borrowed(v)))
@@ -411,7 +397,7 @@ impl<L: Loggable> ComponentBatch for [L] {
 
 // --- Slice<Option> ---
 
-impl<L: Loggable> ComponentBatch for [Option<L>] {
+impl<L: ToArrowOpt> ComponentBatch for [Option<L>] {
     #[inline]
     fn to_arrow(&self) -> SerializationResult<arrow::array::ArrayRef> {
         L::to_arrow_opt(

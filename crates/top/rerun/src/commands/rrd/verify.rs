@@ -3,8 +3,9 @@ use std::collections::{HashMap, HashSet};
 use arrow::array::AsArray as _;
 use itertools::Itertools as _;
 
-use re_log_encoding::{Decodable as _, RawRrdManifest, RrdFooter};
-use re_log_types::LogMsg;
+use re_chunk_index::RawRrdManifest;
+use re_log_encoding::{Decodable as _, RrdFooter};
+use re_log_msg::LogMsg;
 use re_sdk_types::reflection::{ComponentDescriptorExt as _, Reflection};
 
 use crate::commands::{read_rrd_streams_from_file_or_stdin, stdio::InputSource};
@@ -25,7 +26,7 @@ pub struct VerifyCommand {
 
 impl VerifyCommand {
     pub fn run(&self) -> anyhow::Result<()> {
-        let mut verifier = Verifier::new()?;
+        let mut verifier = Verifier::new();
 
         let Self {
             path_to_input_rrds,
@@ -110,16 +111,16 @@ impl VerifyCommand {
 // ---
 
 struct Verifier {
-    reflection: Reflection,
+    reflection: &'static Reflection,
     errors: HashSet<String>,
 }
 
 impl Verifier {
-    fn new() -> anyhow::Result<Self> {
-        Ok(Self {
-            reflection: re_sdk_types::reflection::generate_reflection()?,
+    fn new() -> Self {
+        Self {
+            reflection: re_sdk_types::reflection::reflection(),
             errors: HashSet::new(),
-        })
+        }
     }
 
     fn verify_log_msg(&mut self, source: &str, msg: LogMsg) {
@@ -127,17 +128,7 @@ impl Verifier {
             LogMsg::SetStoreInfo { .. } | LogMsg::BlueprintActivationCommand { .. } => {}
 
             LogMsg::ArrowMsg(_store_id, arrow_msg) => {
-                self.verify_record_batch(source, &arrow_msg.batch);
-            }
-        }
-    }
-
-    fn verify_record_batch(&mut self, source: &str, batch: &arrow::array::RecordBatch) {
-        match re_sorbet::ChunkBatch::try_from(batch) {
-            Ok(chunk_batch) => self.verify_chunk_batch(source, &chunk_batch),
-            Err(err) => {
-                self.errors
-                    .insert(format!("{source}: Failed to parse batch: {err}"));
+                self.verify_chunk_batch(source, &arrow_msg.batch);
             }
         }
     }
@@ -184,30 +175,30 @@ impl Verifier {
             anyhow::bail!(
                 "Indicators are deprecated and should be removed on ingestion in re_sorbet."
             );
-        } else {
-            // Verify data
-            let component_reflection = self
-                .reflection
-                .components
-                .get(&component_type)
-                .ok_or_else(|| anyhow::anyhow!("Unknown component"))?;
+        }
 
-            if let Some(deprecation_summary) = component_reflection.deprecation_summary {
-                anyhow::bail!(
-                    "Component is deprecated. Deprecated types should be migrated on ingestion in re_sorbet. Deprecation notice: {deprecation_summary:?}"
-                );
-            }
+        // Verify data
+        let component_reflection = self
+            .reflection
+            .components
+            .get(&component_type)
+            .ok_or_else(|| anyhow::anyhow!("Unknown component"))?;
 
-            let list_array = column.as_list_opt::<i32>().ok_or_else(|| {
-                anyhow::anyhow!("Expected list array, found {}", column.data_type())
-            })?;
+        if let Some(deprecation_summary) = component_reflection.deprecation_summary {
+            anyhow::bail!(
+                "Component is deprecated. Deprecated types should be migrated on ingestion in re_sorbet. Deprecation notice: {deprecation_summary:?}"
+            );
+        }
 
-            assert_eq!(column.len() + 1, list_array.offsets().len());
+        let list_array = column
+            .as_list_opt::<i32>()
+            .ok_or_else(|| anyhow::anyhow!("Expected list array, found {}", column.data_type()))?;
 
-            for i in 0..column.len() {
-                let cell = list_array.value(i);
-                (component_reflection.verify_arrow_array)(cell.as_ref())?;
-            }
+        assert_eq!(column.len() + 1, list_array.offsets().len());
+
+        for i in 0..column.len() {
+            let cell = list_array.value(i);
+            (component_reflection.verify_arrow_array)(cell.as_ref())?;
         }
 
         if let Some(archetype_name) = archetype_name {
@@ -269,9 +260,9 @@ fn load_from_rrd_filepath_with_rrd_manifest(
 
     let mut file = std::fs::File::open(path_to_rrd)?;
 
-    let chunk_ids = rrd_manifest.col_chunk_id()?;
-    let byte_offsets = rrd_manifest.col_chunk_byte_offset()?;
-    let byte_sizes = rrd_manifest.col_chunk_byte_size()?;
+    let chunk_ids = rrd_manifest.col_chunk_id_iter()?;
+    let byte_offsets = rrd_manifest.col_chunk_byte_offset_iter()?;
+    let byte_sizes = rrd_manifest.col_chunk_byte_size_iter()?;
 
     let mut buf = Vec::new();
     for (chunk_id, offset, size) in itertools::izip!(chunk_ids, byte_offsets, byte_sizes) {

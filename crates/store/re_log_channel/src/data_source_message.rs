@@ -3,13 +3,16 @@
 
 use std::sync::Arc;
 
-use re_log_encoding::RrdManifest;
-use re_log_types::{LogMsg, StoreId, TableMsg, impl_into_enum};
+use re_chunk_index::RrdManifest;
+use re_log_msg::{LogMsg, TableMsg};
+use re_log_types::{ApplicationId, StoreId, impl_into_enum};
+
+use crate::ViewerControlCommand;
 
 /// Message from a data source.
 ///
-/// May contain limited UI commands for instrumenting the state of the receiving end.
-#[derive(Clone, Debug)]
+/// May contain limited viewer-control commands for instrumenting the state of the receiving end.
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
 pub enum DataSourceMessage {
     /// A piece of the index of all the chunks in a recording.
     ///
@@ -23,90 +26,69 @@ pub enum DataSourceMessage {
     /// See [`LogMsg`].
     LogMsg(LogMsg),
 
+    /// Associate a fully received blueprint with one of its consumers.
+    // TODO(andreas): Whenever we make the request for a blueprint we should just keep the information
+    // about why we pulled it in the first place and therefore should know upon arrival what to do with it?
+    // TODO(andreas): If needed, make this more flexible than just making a thing the default.
+    DefaultBlueprintRegistration(DefaultBlueprintRegistration),
+
     /// See [`TableMsg`].
     TableMsg(TableMsg),
 
-    /// A UI command that has to be ordered relative to [`LogMsg`]s.
+    /// A viewer-control command that has to be ordered relative to [`LogMsg`]s.
     ///
     /// Non-ui receivers can safely ignore these.
-    UiCommand(DataSourceUiCommand),
-}
-
-impl re_byte_size::SizeBytes for DataSourceMessage {
-    fn heap_size_bytes(&self) -> u64 {
-        match self {
-            Self::RrdManifest(_, manifest) => manifest.heap_size_bytes(),
-            Self::LogMsg(log_msg) => log_msg.heap_size_bytes(),
-            Self::TableMsg(table_msg) => table_msg.heap_size_bytes(),
-            Self::RrdManifestComplete(_) | Self::UiCommand(_) => 0,
-        }
-    }
+    // TODO(RR-5073): Remove viewer-control commands from DataSourceMessage
+    ViewerControl(ViewerControlCommand),
 }
 
 impl_into_enum!(LogMsg, DataSourceMessage, LogMsg);
+impl_into_enum!(
+    DefaultBlueprintRegistration,
+    DataSourceMessage,
+    DefaultBlueprintRegistration
+);
 impl_into_enum!(TableMsg, DataSourceMessage, TableMsg);
-impl_into_enum!(DataSourceUiCommand, DataSourceMessage, UiCommand);
+impl_into_enum!(ViewerControlCommand, DataSourceMessage, ViewerControl);
 
 impl DataSourceMessage {
     /// The name of the variant, useful for error message etc
     pub fn variant_name(&self) -> &'static str {
         match self {
-            Self::RrdManifest { .. } => "RrdManifest",
+            Self::RrdManifest(..) => "RrdManifest",
             Self::RrdManifestComplete(_) => "RrdManifestComplete",
             Self::LogMsg(_) => "LogMsg",
+            Self::DefaultBlueprintRegistration(_) => "BlueprintRegistration",
             Self::TableMsg(_) => "TableMsg",
-            Self::UiCommand(_) => "UiCommand",
+            Self::ViewerControl(_) => "ViewerControl",
         }
     }
 
-    // We sometimes inject meta-data for latency tracking etc
-    pub fn insert_arrow_record_batch_metadata(&mut self, key: String, value: String) {
+    /// Records the current time as the moment the carried data passed `location`.
+    ///
+    /// Only messages that carry Arrow data are stamped.
+    pub fn track_latency(&mut self, location: re_sorbet::TimestampLocation) {
         match self {
-            Self::LogMsg(log_msg) => log_msg.insert_arrow_record_batch_metadata(key, value),
-            Self::TableMsg(table_msg) => table_msg.insert_arrow_record_batch_metadata(key, value),
-            Self::RrdManifest { .. } | Self::RrdManifestComplete(_) | Self::UiCommand(_) => {
-                // Not everything needs latency tracking
-            }
+            Self::LogMsg(log_msg) => log_msg.track_latency(location),
+            Self::TableMsg(table_msg) => table_msg.track_latency(location),
+            Self::RrdManifest(..)
+            | Self::RrdManifestComplete(_)
+            | Self::DefaultBlueprintRegistration(_)
+            | Self::ViewerControl(_) => {}
         }
     }
 }
 
-/// UI commands issued when streaming in datasets.
-///
-/// If you're not in a ui context you can safely ignore these.
-#[derive(Clone, Debug)]
-pub enum DataSourceUiCommand {
-    /// Navigate to time/entities/anchors/etc. that are set in a `re_uri::Fragment`.
-    SetUrlFragment {
-        store_id: StoreId,
-
-        /// Uri fragment, see `re_uri::Fragment` on how to parse it.
-        // Not using `re_uri::Fragment` to avoid further dependency entanglement.
-        fragment: String, //re_uri::Fragment,
-    },
-
-    /// Save a screenshot to a file.
-    SaveScreenshot {
-        /// File path to save the screenshot to.
-        // TODO(#12482): Returning the screenshot to the caller would be more flexible and useful.
-        file_path: camino::Utf8PathBuf,
-
-        /// Optional view id to screenshot a specific view.
-        ///
-        /// If none is provided, the entire viewer is screenshotted.
-        view_id: Option<String>,
-    },
+/// An ordered association command sent after all data for a blueprint store.
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
+pub struct DefaultBlueprintRegistration {
+    pub blueprint_id: StoreId,
+    pub target: BlueprintTarget,
 }
 
-impl re_byte_size::SizeBytes for DataSourceUiCommand {
-    fn heap_size_bytes(&self) -> u64 {
-        match self {
-            Self::SetUrlFragment { store_id, fragment } => {
-                store_id.heap_size_bytes() + fragment.heap_size_bytes()
-            }
-            Self::SaveScreenshot { file_path, view_id } => {
-                file_path.capacity() as u64 + view_id.heap_size_bytes()
-            }
-        }
-    }
+/// The consumer of a blueprint.
+#[derive(Clone, Debug, re_byte_size::SizeBytes)]
+pub enum BlueprintTarget {
+    Application(ApplicationId),
+    Table(re_uri::TableReference),
 }

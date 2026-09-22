@@ -2,11 +2,25 @@ use std::hash::Hasher as _;
 
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::error::ArrowError;
+use itertools::Itertools as _;
 
+use re_log_types::RecordingId;
+use re_log_types::TableId;
 use re_log_types::external::re_types_core::ComponentDescriptor;
-use re_log_types::{RecordingId, StoreKind, TableId};
 
 use crate::{TypeConversionError, invalid_field, missing_field};
+
+/// `google.protobuf.Timestamp` requires `nanos` in `0..=999_999_999`, whereas jiff reports a
+/// negative fraction for instants before the Unix epoch.
+pub fn timestamp_to_proto(ts: jiff::Timestamp) -> prost_types::Timestamp {
+    let mut seconds = ts.as_second();
+    let mut nanos = ts.subsec_nanosecond();
+    if nanos < 0 {
+        seconds -= 1;
+        nanos += 1_000_000_000;
+    }
+    prost_types::Timestamp { seconds, nanos }
+}
 
 /// Compression format used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,59 +133,24 @@ impl TryFrom<crate::common::v1alpha1::Tuid> for crate::common::v1alpha1::EntryId
 
 // --- SegmentId ---
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-pub struct SegmentId {
-    pub id: String,
-}
-
-impl SegmentId {
-    #[inline]
-    pub fn new(id: String) -> Self {
-        Self { id }
-    }
-}
-
-impl From<String> for SegmentId {
-    fn from(id: String) -> Self {
-        Self { id }
-    }
-}
-
-impl From<&str> for SegmentId {
-    fn from(id: &str) -> Self {
-        Self { id: id.to_owned() }
-    }
-}
-
-impl std::fmt::Display for SegmentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.id.fmt(f)
-    }
-}
+pub use re_types_core::SegmentId;
 
 impl TryFrom<crate::common::v1alpha1::SegmentId> for SegmentId {
     type Error = TypeConversionError;
 
     fn try_from(value: crate::common::v1alpha1::SegmentId) -> Result<Self, Self::Error> {
-        Ok(Self {
-            id: value
-                .id
-                .ok_or(missing_field!(crate::common::v1alpha1::SegmentId, "id"))?,
-        })
+        Ok(Self::from(value.id.ok_or(missing_field!(
+            crate::common::v1alpha1::SegmentId,
+            "id"
+        ))?))
     }
 }
 
 impl From<SegmentId> for crate::common::v1alpha1::SegmentId {
     fn from(value: SegmentId) -> Self {
-        Self { id: Some(value.id) }
-    }
-}
-
-impl AsRef<str> for SegmentId {
-    fn as_ref(&self) -> &str {
-        self.id.as_str()
+        Self {
+            id: Some(value.into()),
+        }
     }
 }
 
@@ -191,23 +170,188 @@ impl From<&str> for crate::common::v1alpha1::SegmentId {
     }
 }
 
+// --- DatasetKind ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DatasetKind {
+    Recording,
+    Blueprint,
+    Asset,
+}
+
+impl DatasetKind {
+    pub fn name(&self) -> &str {
+        match self {
+            DatasetKind::Recording => "dataset",
+            DatasetKind::Blueprint => "blueprint dataset",
+            DatasetKind::Asset => "asset dataset",
+        }
+    }
+
+    /// Name of the thing this dataset contains.
+    pub fn contained_name(&self) -> &str {
+        match self {
+            DatasetKind::Recording => "segment",
+            DatasetKind::Blueprint => "blueprint",
+            DatasetKind::Asset => "asset",
+        }
+    }
+
+    /// The kind of catalog entry that a dataset of this kind is stored as.
+    pub fn entry_kind(self) -> super::rerun_cloud_v1alpha1::EntryKind {
+        match self {
+            Self::Recording => super::rerun_cloud_v1alpha1::EntryKind::Dataset,
+            Self::Blueprint => super::rerun_cloud_v1alpha1::EntryKind::BlueprintDataset,
+            Self::Asset => super::rerun_cloud_v1alpha1::EntryKind::AssetDataset,
+        }
+    }
+
+    pub fn store_kind(self) -> re_log_types::StoreKind {
+        match self {
+            Self::Recording | Self::Asset => re_log_types::StoreKind::Recording,
+            Self::Blueprint => re_log_types::StoreKind::Blueprint,
+        }
+    }
+
+    /// The limits enforced when registering segments into a dataset of this kind.
+    pub fn limits(self) -> DatasetLimits {
+        match self {
+            Self::Recording => DatasetLimits::UNLIMITED,
+
+            // Blueprint datasets aren't expected to have huge segments.
+            //
+            // The size limit of 25MB, comes from a blueprint with 100 empty
+            // views being ~555 KiB. So some good head-room on top of that.
+            Self::Blueprint => {
+                DatasetLimits {
+                    static_chunks_only: false,
+                    max_segment_size_bytes: Some(25 * 1024 * 1024), // 25 MB
+                    max_segment_count: None,
+                }
+            }
+
+            // Asset datasets hold a small set of static blobs shared across a
+            // dataset's segments, so we keep them deliberately small.
+            //
+            // The exact numbers here aren't important, and are there as a starting
+            // point.
+            Self::Asset => DatasetLimits {
+                static_chunks_only: true,
+                max_segment_size_bytes: Some(300 * 1024 * 1024), // 300 MiB
+                max_segment_count: Some(12),
+            },
+        }
+    }
+}
+
+/// Limits enforced when registering segments into a dataset.
+///
+/// Which limits apply depends on the dataset's [`DatasetKind`]. See [`DatasetKind::limits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatasetLimits {
+    /// Reject any segment that contains temporal chunks.
+    pub static_chunks_only: bool,
+
+    /// Reject any segment whose total encoded size exceeds this many bytes.
+    ///
+    /// Measured as the sum of each chunk's `chunk_byte_len`, i.e. its IPC byte
+    /// length as stored in the recording. This is the on-disk size, not the
+    /// uncompressed in-memory size.
+    pub max_segment_size_bytes: Option<u64>,
+
+    /// Reject registration once the dataset already holds this many segments.
+    pub max_segment_count: Option<u64>,
+}
+
+impl DatasetLimits {
+    /// No limits: a dataset may hold any number of segments of any size and kind.
+    pub const UNLIMITED: Self = Self {
+        static_chunks_only: false,
+        max_segment_size_bytes: None,
+        max_segment_count: None,
+    };
+}
+
+impl From<DatasetKind> for crate::common::v1alpha1::DatasetKind {
+    fn from(value: DatasetKind) -> Self {
+        match value {
+            DatasetKind::Recording => Self::Recording,
+            DatasetKind::Blueprint => Self::Blueprint,
+            DatasetKind::Asset => Self::Asset,
+        }
+    }
+}
+
+impl From<crate::common::v1alpha1::DatasetKind> for DatasetKind {
+    fn from(value: crate::common::v1alpha1::DatasetKind) -> Self {
+        match value {
+            crate::common::v1alpha1::DatasetKind::Unspecified
+            | crate::common::v1alpha1::DatasetKind::Recording => Self::Recording,
+            crate::common::v1alpha1::DatasetKind::Blueprint => Self::Blueprint,
+            crate::common::v1alpha1::DatasetKind::Asset => Self::Asset,
+        }
+    }
+}
+
+impl From<super::rerun_cloud_v1alpha1::EntryKind> for DatasetKind {
+    fn from(value: super::rerun_cloud_v1alpha1::EntryKind) -> Self {
+        match value {
+            super::rerun_cloud_v1alpha1::EntryKind::BlueprintDataset => DatasetKind::Blueprint,
+            super::rerun_cloud_v1alpha1::EntryKind::AssetDataset => DatasetKind::Asset,
+            super::rerun_cloud_v1alpha1::EntryKind::Unspecified
+            | super::rerun_cloud_v1alpha1::EntryKind::Dataset
+            | super::rerun_cloud_v1alpha1::EntryKind::DatasetView
+            | super::rerun_cloud_v1alpha1::EntryKind::Table
+            | super::rerun_cloud_v1alpha1::EntryKind::TableView => DatasetKind::Recording,
+        }
+    }
+}
+
+impl std::fmt::Display for DatasetKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Recording => f.write_str("Recording"),
+            Self::Blueprint => f.write_str("Blueprint"),
+            Self::Asset => f.write_str("Asset"),
+        }
+    }
+}
+
+impl std::str::FromStr for DatasetKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Recording" => Ok(Self::Recording),
+            "Blueprint" => Ok(Self::Blueprint),
+            "Asset" => Ok(Self::Asset),
+            other => Err(format!("unknown DatasetKind: {other:?}")),
+        }
+    }
+}
+
 // --- DatasetHandle ---
 
 #[derive(Debug, Clone)]
 pub struct DatasetHandle {
     pub id: Option<re_log_types::EntryId>,
-    pub store_kind: StoreKind,
+    pub dataset_kind: DatasetKind,
     pub url: url::Url,
 }
 
 impl DatasetHandle {
     /// Create a new dataset handle
-    pub fn new(url: url::Url, store_kind: StoreKind) -> Self {
+    pub fn new(url: url::Url, dataset_kind: DatasetKind) -> Self {
         Self {
             id: None,
-            store_kind,
+            dataset_kind,
             url,
         }
+    }
+
+    pub fn with_id(mut self, id: re_log_types::EntryId) -> Self {
+        self.id = Some(id);
+        self
     }
 }
 
@@ -215,9 +359,35 @@ impl TryFrom<crate::common::v1alpha1::DatasetHandle> for DatasetHandle {
     type Error = TypeConversionError;
 
     fn try_from(value: crate::common::v1alpha1::DatasetHandle) -> Result<Self, Self::Error> {
+        let dataset_kind = crate::common::v1alpha1::DatasetKind::try_from(value.dataset_kind);
+        // TODO(RR-5123): Remove once new client -> old server isn't needed anymore.
+        #[expect(deprecated)]
+        let store_kind = crate::common::v1alpha1::StoreKind::try_from(value.store_kind);
+
+        let dataset_kind = if let Ok(store_kind) = store_kind
+            && !matches!(store_kind, crate::common::v1alpha1::StoreKind::Unspecified)
+            && matches!(
+                dataset_kind,
+                Ok(crate::common::v1alpha1::DatasetKind::Unspecified) | Err(_)
+            ) {
+            Ok(match store_kind {
+                crate::common::v1alpha1::StoreKind::Unspecified => {
+                    crate::common::v1alpha1::DatasetKind::Unspecified
+                }
+                crate::common::v1alpha1::StoreKind::Recording => {
+                    crate::common::v1alpha1::DatasetKind::Recording
+                }
+                crate::common::v1alpha1::StoreKind::Blueprint => {
+                    crate::common::v1alpha1::DatasetKind::Blueprint
+                }
+            })
+        } else {
+            dataset_kind
+        };
+
         Ok(Self {
             id: value.entry_id.map(|id| id.try_into()).transpose()?,
-            store_kind: crate::common::v1alpha1::StoreKind::try_from(value.store_kind)?.into(),
+            dataset_kind: dataset_kind?.into(),
             url: value
                 .dataset_url
                 .ok_or(missing_field!(
@@ -233,10 +403,16 @@ impl TryFrom<crate::common::v1alpha1::DatasetHandle> for DatasetHandle {
 }
 
 impl From<DatasetHandle> for crate::common::v1alpha1::DatasetHandle {
+    // The deprecated `store_kind` field is still populated for old servers,
+    // see the TODO below.
+    #[allow(deprecated)]
     fn from(value: DatasetHandle) -> Self {
         Self {
             entry_id: value.id.map(Into::into),
-            store_kind: crate::common::v1alpha1::StoreKind::from(value.store_kind) as i32,
+            // TODO(RR-5123): Remove once new client -> old server isn't needed anymore.
+            store_kind: crate::common::v1alpha1::StoreKind::from(value.dataset_kind.store_kind())
+                as i32,
+            dataset_kind: crate::common::v1alpha1::DatasetKind::from(value.dataset_kind) as i32,
             dataset_url: Some(value.url.to_string()),
         }
     }
@@ -250,6 +426,10 @@ impl crate::common::v1alpha1::TaskId {
         Self::from_hashable(re_tuid::Tuid::new())
     }
 
+    pub fn into_string(self) -> String {
+        self.id
+    }
+
     pub fn from_hashable<H: std::hash::Hash>(hashable: H) -> Self {
         let mut hasher = std::hash::DefaultHasher::new();
         hashable.hash(&mut hasher);
@@ -260,6 +440,21 @@ impl crate::common::v1alpha1::TaskId {
         }
     }
 }
+
+impl From<String> for crate::common::v1alpha1::TaskId {
+    fn from(id: String) -> Self {
+        Self { id }
+    }
+}
+
+impl From<crate::common::v1alpha1::TaskId> for String {
+    fn from(task_id: crate::common::v1alpha1::TaskId) -> Self {
+        task_id.id
+    }
+}
+
+// Make `quiver::Column<TaskId>` work (backed by a `Utf8` column):
+quiver::newtype_data_type!(crate::common::v1alpha1::TaskId, quiver::Utf8);
 
 // ---
 
@@ -344,9 +539,11 @@ impl TryFrom<crate::common::v1alpha1::IndexRange> for re_log_types::AbsoluteTime
     }
 }
 
-impl From<crate::common::v1alpha1::Timeline> for re_log_types::TimelineName {
-    fn from(value: crate::common::v1alpha1::Timeline) -> Self {
-        Self::new(&value.name)
+impl TryFrom<crate::common::v1alpha1::Timeline> for re_log_types::TimelineName {
+    type Error = TypeConversionError;
+
+    fn try_from(value: crate::common::v1alpha1::Timeline) -> Result<Self, Self::Error> {
+        Ok(Self::try_new(&value.name)?)
     }
 }
 
@@ -366,6 +563,35 @@ impl From<re_log_types::Timeline> for crate::common::v1alpha1::Timeline {
     }
 }
 
+impl From<re_log_types::TimeType> for crate::common::v1alpha1::TimeType {
+    fn from(value: re_log_types::TimeType) -> Self {
+        match value {
+            re_log_types::TimeType::Sequence => Self::Sequence,
+            re_log_types::TimeType::DurationNs => Self::DurationNs,
+            re_log_types::TimeType::TimestampNs => Self::TimestampNs,
+        }
+    }
+}
+
+impl std::fmt::Display for crate::common::v1alpha1::TimeType {
+    /// Short, human-readable name, matching `re_log_types::TimeType`'s `Display`
+    /// (`"sequence"`, `"duration"`, `"timestamp"`, or `"unknown"`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unspecified => "unknown",
+            Self::Sequence => "sequence",
+            Self::DurationNs => "duration",
+            Self::TimestampNs => "timestamp",
+        })
+    }
+}
+
+impl From<i64> for crate::common::v1alpha1::TimelineTime {
+    fn from(time: i64) -> Self {
+        Self { time }
+    }
+}
+
 impl TryFrom<crate::common::v1alpha1::IndexColumnSelector> for re_log_types::TimelineName {
     type Error = TypeConversionError;
 
@@ -374,7 +600,7 @@ impl TryFrom<crate::common::v1alpha1::IndexColumnSelector> for re_log_types::Tim
             crate::common::v1alpha1::IndexColumnSelector,
             "timeline"
         ))?;
-        Ok(timeline.into())
+        timeline.try_into()
     }
 }
 
@@ -386,10 +612,12 @@ impl From<re_log_types::TimelineName> for crate::common::v1alpha1::IndexColumnSe
     }
 }
 
-impl From<crate::common::v1alpha1::ApplicationId> for re_log_types::ApplicationId {
+impl TryFrom<crate::common::v1alpha1::ApplicationId> for re_log_types::ApplicationId {
+    type Error = re_log_types::InvalidApplicationIdError;
+
     #[inline]
-    fn from(value: crate::common::v1alpha1::ApplicationId) -> Self {
-        Self::from(value.id)
+    fn try_from(value: crate::common::v1alpha1::ApplicationId) -> Result<Self, Self::Error> {
+        Self::try_new(value.id)
     }
 }
 
@@ -451,26 +679,61 @@ impl StoreIdMissingApplicationIdError {
     }
 }
 
+/// Error converting a proto [`StoreId`](crate::common::v1alpha1::StoreId) into a
+/// [`re_log_types::StoreId`].
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum StoreIdFromProtoError {
+    /// No application id was present.
+    ///
+    /// This is recoverable via 0.24 back compat: the id may arrive later in a `SetStoreInfo`,
+    /// or be carried in the deprecated `StoreInfo.application_id` field.
+    #[error("`StoreId` is missing an application id (kind: {}, recording_id: {})", .0.store_kind, .0.recording_id)]
+    MissingApplicationId(StoreIdMissingApplicationIdError),
+
+    /// An application id was present, but invalid (e.g. empty). This is not recoverable.
+    #[error("invalid application id: {0}")]
+    InvalidApplicationId(re_log_types::InvalidApplicationIdError),
+}
+
+impl From<StoreIdFromProtoError> for TypeConversionError {
+    fn from(value: StoreIdFromProtoError) -> Self {
+        match value {
+            StoreIdFromProtoError::MissingApplicationId(err) => {
+                err.into_type_conversion_error("`StoreId` is missing an application id")
+            }
+            StoreIdFromProtoError::InvalidApplicationId(err) => err.into(),
+        }
+    }
+}
+
 /// Convert a store id
 impl TryFrom<crate::common::v1alpha1::StoreId> for re_log_types::StoreId {
-    type Error = StoreIdMissingApplicationIdError;
+    type Error = StoreIdFromProtoError;
 
     #[inline]
     fn try_from(value: crate::common::v1alpha1::StoreId) -> Result<Self, Self::Error> {
         let store_kind = value.kind().into();
         let recording_id = RecordingId::from(value.recording_id);
 
-        //TODO(#10730): switch to `TypeConversionError` when cleaning up 0.24 back compat
+        //TODO(#10730): drop the recoverable `MissingApplicationId` path when removing 0.24 back compat
+        // An absent application id (`None`) is recoverable (0.24 back compat); a *present* but
+        // invalid one (e.g. empty) is a hard error — we don't second-guess `ApplicationId::try_new`.
         match value.application_id {
-            None => Err(StoreIdMissingApplicationIdError {
-                store_kind,
-                recording_id,
-            }),
-            Some(application_id) => Ok(re_log_types::StoreId::new(
-                store_kind,
-                application_id,
-                recording_id,
+            None => Err(StoreIdFromProtoError::MissingApplicationId(
+                StoreIdMissingApplicationIdError {
+                    store_kind,
+                    recording_id,
+                },
             )),
+            Some(application_id) => {
+                let application_id = re_log_types::ApplicationId::try_new(application_id.id)
+                    .map_err(StoreIdFromProtoError::InvalidApplicationId)?;
+                Ok(re_log_types::StoreId::new(
+                    store_kind,
+                    application_id,
+                    recording_id,
+                ))
+            }
         }
     }
 }
@@ -499,7 +762,7 @@ impl From<re_log_types::TableId> for crate::common::v1alpha1::TableId {
 impl From<crate::common::v1alpha1::TableId> for re_log_types::TableId {
     #[inline]
     fn from(value: crate::common::v1alpha1::TableId) -> Self {
-        TableId::from(value.id)
+        TableId::new(value.id)
     }
 }
 
@@ -534,7 +797,7 @@ impl TryFrom<crate::common::v1alpha1::ScanParameters> for ScanParameters {
                 .order_by
                 .into_iter()
                 .map(|ob| ob.try_into())
-                .collect::<Result<Vec<_>, _>>()?,
+                .try_collect()?,
             explain_plan: value.explain_plan,
             explain_filter: value.explain_filter,
         })
@@ -696,9 +959,16 @@ impl TryFrom<crate::common::v1alpha1::ComponentDescriptor> for ComponentDescript
         ))?;
 
         Ok(ComponentDescriptor {
-            archetype: archetype.map(Into::into),
-            component: component.into(),
-            component_type: component_type.map(Into::into),
+            archetype: archetype.and_then(|s| re_types_core::ArchetypeName::try_new(s).ok()),
+            component: re_types_core::ComponentIdentifier::try_new(component).map_err(|err| {
+                invalid_field!(
+                    crate::common::v1alpha1::ComponentDescriptor,
+                    "component",
+                    err
+                )
+            })?,
+            component_type: component_type
+                .and_then(|s| re_types_core::ComponentType::try_new(s).ok()),
         })
     }
 }
@@ -740,8 +1010,8 @@ impl From<crate::common::v1alpha1::BuildInfo> for re_build_info::BuildInfo {
     }
 }
 
-impl From<re_build_info::CrateVersion> for crate::common::v1alpha1::SemanticVersion {
-    fn from(version: re_build_info::CrateVersion) -> Self {
+impl From<re_build_info::CrateVersion<'_>> for crate::common::v1alpha1::SemanticVersion {
+    fn from(version: re_build_info::CrateVersion<'_>) -> Self {
         crate::common::v1alpha1::SemanticVersion {
             major: Some(version.major.into()),
             minor: Some(version.minor.into()),
@@ -751,7 +1021,7 @@ impl From<re_build_info::CrateVersion> for crate::common::v1alpha1::SemanticVers
     }
 }
 
-impl From<crate::common::v1alpha1::SemanticVersion> for re_build_info::CrateVersion {
+impl From<crate::common::v1alpha1::SemanticVersion> for re_build_info::CrateVersion<'static> {
     fn from(version: crate::common::v1alpha1::SemanticVersion) -> Self {
         Self {
             major: version.major() as u8,
@@ -762,8 +1032,8 @@ impl From<crate::common::v1alpha1::SemanticVersion> for re_build_info::CrateVers
     }
 }
 
-impl From<re_build_info::Meta> for crate::common::v1alpha1::semantic_version::Meta {
-    fn from(version_meta: re_build_info::Meta) -> Self {
+impl From<re_build_info::Meta<'_>> for crate::common::v1alpha1::semantic_version::Meta {
+    fn from(version_meta: re_build_info::Meta<'_>) -> Self {
         match version_meta {
             re_build_info::Meta::Rc(v) => Self::Rc(v.into()),
 
@@ -779,7 +1049,7 @@ impl From<re_build_info::Meta> for crate::common::v1alpha1::semantic_version::Me
     }
 }
 
-impl From<crate::common::v1alpha1::semantic_version::Meta> for re_build_info::Meta {
+impl From<crate::common::v1alpha1::semantic_version::Meta> for re_build_info::Meta<'static> {
     fn from(version_meta: crate::common::v1alpha1::semantic_version::Meta) -> Self {
         match version_meta {
             crate::common::v1alpha1::semantic_version::Meta::Rc(v) => Self::Rc(v as _),
@@ -968,39 +1238,89 @@ fn record_batch_to_ipc_bytes(
 }
 
 /// IPC bytes to `RecordBatch`. `Ok(None)` if there's no data.
+///
+/// The arrays are sliced out of the IPC body rather than copied, so the batch is one allocation
+/// shared by all its columns for as long as any of them is alive.
 #[tracing::instrument(level = "debug", skip_all)]
 fn record_batch_from_ipc_bytes(
-    bytes: &[u8],
+    payload: &prost::bytes::Bytes,
     compression: Compression,
     uncompressed_size: u64,
 ) -> Result<Option<arrow::array::RecordBatch>, ArrowError> {
-    let mut uncompressed = Vec::new();
-    let bytes = match compression {
-        Compression::Off => bytes,
+    let mut buffer = match compression {
+        Compression::Off => arrow::buffer::Buffer::from(payload.clone()),
         Compression::LZ4 => {
             re_tracing::profile_scope!("LZ4-decompress");
             let _span = tracing::trace_span!("lz4::decompress").entered();
-            uncompressed.resize(uncompressed_size as usize, 0);
-            lz4_flex::block::decompress_into(bytes, &mut uncompressed).map_err(|err| {
+            let mut uncompressed = vec![0; uncompressed_size as usize];
+            lz4_flex::block::decompress_into(payload, &mut uncompressed).map_err(|err| {
                 ArrowError::ParseError(format!("LZ4 decompression failure: {err:#}"))
             })?;
-            uncompressed.as_slice()
+            arrow::buffer::Buffer::from_vec(uncompressed)
         }
     };
 
-    let mut stream = {
-        let _span = tracing::trace_span!("schema").entered();
-        arrow::ipc::reader::StreamReader::try_new(bytes, None)?
-    };
-
     let _span = tracing::trace_span!("data").entered();
-    stream.next().transpose()
+    // A single `decode` consumes the whole buffer up to the first record batch; `finish` then
+    // reports a truncated message as an error rather than silently yielding no batch.
+    let mut decoder = arrow::ipc::reader::StreamDecoder::new();
+    match decoder.decode(&mut buffer)? {
+        Some(batch) => Ok(Some(batch)),
+        None => {
+            decoder.finish()?;
+            Ok(None)
+        }
+    }
 }
 
 // ---
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn record_batch_ipc_roundtrip_and_truncation() {
+        use arrow::array::{Int32Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![std::sync::Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let (payload, uncompressed_size) = record_batch_to_ipc_bytes(&batch, Compression::Off);
+        let payload = prost::bytes::Bytes::from(payload);
+
+        let decoded = record_batch_from_ipc_bytes(&payload, Compression::Off, uncompressed_size)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, batch);
+
+        let truncated = payload.slice(..payload.len() - 16);
+        assert!(
+            record_batch_from_ipc_bytes(&truncated, Compression::Off, uncompressed_size).is_err()
+        );
+    }
+
+    #[test]
+    fn timestamp_to_proto_normalizes_pre_epoch_nanos() {
+        for ts in [
+            jiff::Timestamp::MIN,
+            jiff::Timestamp::new(-1, -500_000_000).unwrap(),
+            jiff::Timestamp::UNIX_EPOCH,
+            jiff::Timestamp::new(1, 500_000_000).unwrap(),
+            jiff::Timestamp::MAX,
+        ] {
+            let proto = super::timestamp_to_proto(ts);
+            assert!((0..1_000_000_000).contains(&proto.nanos), "{ts}");
+            assert_eq!(
+                jiff::Timestamp::new(proto.seconds, proto.nanos).unwrap(),
+                ts
+            );
+        }
+    }
 
     #[test]
     fn entity_path_conversion() {
@@ -1048,7 +1368,7 @@ mod tests {
         let application_id = re_log_types::ApplicationId::from("test");
         let proto_application_id: crate::common::v1alpha1::ApplicationId =
             application_id.clone().into();
-        let application_id2: re_log_types::ApplicationId = proto_application_id.into();
+        let application_id2: re_log_types::ApplicationId = proto_application_id.try_into().unwrap();
         assert_eq!(application_id, application_id2);
     }
 

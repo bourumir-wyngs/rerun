@@ -1,15 +1,16 @@
 use std::time::Duration;
 
 use re_chunk::ChunkBatcherConfig;
-use re_log_types::LogMsg;
+use re_log_msg::LogMsg;
 
 use crate::sink::SinkFlushError;
 
-/// A [`crate::sink::LogSink`] tied to a hosted Rerun gRPC server.
+/// A [`crate::sink::LogSink`] that hosts a Rerun gRPC server.
 ///
-/// The hosted gRPC server may be connected to by any SDK or Viewer.
+/// This is a gRPC server: SDKs and Viewers connect to it.
+/// To connect as a client to an existing server, use [`crate::sink::GrpcSink`] instead.
 ///
-/// All data sent through this sink is immediately redirected to the gRPC server.
+/// All data sent through this sink is immediately redirected to the hosted server.
 ///
 /// NOTE: When the `GrpcServerSink` is dropped, it will shut down the gRPC server.
 /// If this sink has been passed to a `RecordingStream`, dropping, or disconnecting
@@ -46,16 +47,21 @@ impl GrpcServerSink {
         let server_handle = std::thread::Builder::new()
             .name("message_proxy_server".to_owned())
             .spawn(move || {
-                let mut builder = tokio::runtime::Builder::new_current_thread();
+                let mut builder = tokio::runtime::Builder::new_current_thread(); // NOLINT: the synchronous server thread owns this runtime
                 builder.enable_all();
                 let rt = builder.build().expect("failed to build tokio runtime");
 
-                rt.block_on(re_grpc_server::serve_from_channel(
-                    grpc_server_addr,
-                    server_options,
-                    shutdown,
-                    channel_rx,
-                ));
+                match re_grpc_server::ServerListener::bind(grpc_server_addr) {
+                    Ok(listener) => rt.block_on(re_grpc_server::serve_from_channel(
+                        listener,
+                        server_options,
+                        shutdown,
+                        channel_rx,
+                    )),
+                    Err(err) => {
+                        re_log::error!("Failed to listen on {grpc_server_addr}: {err}");
+                    }
+                }
             })
             .expect("failed to spawn thread for message proxy server");
 

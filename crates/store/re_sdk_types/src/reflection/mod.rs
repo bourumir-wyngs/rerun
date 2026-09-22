@@ -10,26 +10,59 @@ use crate::blueprint::components::*;
 use crate::components::*;
 use re_types_core::components::*;
 use re_types_core::{
-    ArchetypeName, Component, ComponentBatch as _, ComponentType, Loggable as _,
-    SerializationError,
+    ArchetypeName, ArrowDataType as _, Component, ComponentBatch as _, ComponentType,
+    FromArrow as _, SerializationError, ViewClassIdentifier,
     reflection::{
         ArchetypeFieldFlags, ArchetypeFieldReflection, ArchetypeReflection, ArchetypeReflectionMap,
-        ComponentReflection, ComponentReflectionMap, Reflection,
+        ComponentReflection, ComponentReflectionMap, ComponentTypeSet, Reflection,
+        ViewApplicability, ViewReflection, ViewReflectionMap,
         generate_component_identifier_reflection,
     },
 };
 
+/// Reflection about all known components, archetypes, and views.
+///
+/// Built on first use and shared from then on.
+/// Clone it if you need to extend it, as the viewer does for custom archetypes.
+
+pub fn reflection() -> &'static Reflection {
+    static REFLECTION: std::sync::OnceLock<Reflection> = std::sync::OnceLock::new();
+    REFLECTION.get_or_init(generate_reflection)
+}
+
 /// Generates reflection about all known components.
 ///
-/// Call only once and reuse the results.
+/// Private: go through [`reflection`], which builds this once and shares it.
+///
+/// # Panics
+/// If a component's placeholder cannot be serialized, which is a bug in Rerun.
 
-pub fn generate_reflection() -> Result<Reflection, SerializationError> {
+fn generate_reflection() -> Reflection {
     re_tracing::profile_function!();
     let archetypes = generate_archetype_reflection();
-    Ok(Reflection {
-        components: generate_component_reflection()?,
+    Reflection {
+        components: generate_component_reflection()
+            .expect("Failed to serialize the component placeholders — this is a bug in Rerun"),
         component_identifiers: generate_component_identifier_reflection(&archetypes),
         archetypes,
+        views: generate_view_reflection(),
+    }
+}
+
+/// The component types marked `#[rerun(own_chunk)]`.
+///
+/// Each of these always gets a chunk of its own, never sharing one with any other
+/// component, not even one of its own archetype.
+
+pub fn own_chunk_components() -> &'static ComponentTypeSet {
+    static COMPONENTS: std::sync::OnceLock<ComponentTypeSet> = std::sync::OnceLock::new();
+    COMPONENTS.get_or_init(|| {
+        reflection()
+            .components
+            .iter()
+            .filter(|(_, reflection)| reflection.own_chunk)
+            .map(|(component_type, _)| *component_type)
+            .collect()
     })
 }
 
@@ -39,15 +72,16 @@ pub fn generate_reflection() -> Result<Reflection, SerializationError> {
 
 fn generate_component_reflection() -> Result<ComponentReflectionMap, SerializationError> {
     re_tracing::profile_function!();
-    let array = [
+    let entries = vec![
         (
             <AbsoluteTimeRange as Component>::name(),
             ComponentReflection {
                 docstring_md: "A reference to a range of time.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: AbsoluteTimeRange::arrow_datatype(),
+                datatype: AbsoluteTimeRange::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: AbsoluteTimeRange::verify_arrow_array,
             },
         ),
@@ -57,8 +91,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The active tab in a tabbed container.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ActiveTab::default().to_arrow()?),
-                datatype: ActiveTab::arrow_datatype(),
+                datatype: ActiveTab::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ActiveTab::verify_arrow_array,
             },
         ),
@@ -68,8 +103,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Angular speed, used for rotation speed for example.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(AngularSpeed::default().to_arrow()?),
-                datatype: AngularSpeed::arrow_datatype(),
+                datatype: AngularSpeed::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: AngularSpeed::verify_arrow_array,
             },
         ),
@@ -79,8 +115,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Whether empty cells in a dataframe should be filled with a latest-at query.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ApplyLatestAt::default().to_arrow()?),
-                datatype: ApplyLatestAt::arrow_datatype(),
+                datatype: ApplyLatestAt::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ApplyLatestAt::verify_arrow_array,
             },
         ),
@@ -90,8 +127,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Whether the viewport layout is determined automatically.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(AutoLayout::default().to_arrow()?),
-                datatype: AutoLayout::arrow_datatype(),
+                datatype: AutoLayout::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: AutoLayout::verify_arrow_array,
             },
         ),
@@ -101,8 +139,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Whether the view should auto-scroll to follow the time cursor.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(AutoScroll::default().to_arrow()?),
-                datatype: AutoScroll::arrow_datatype(),
+                datatype: AutoScroll::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: AutoScroll::verify_arrow_array,
             },
         ),
@@ -112,8 +151,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Whether or not views should be created automatically.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(AutoViews::default().to_arrow()?),
-                datatype: AutoViews::arrow_datatype(),
+                datatype: AutoViews::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: AutoViews::verify_arrow_array,
             },
         ),
@@ -123,9 +163,22 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The type of the background in a view.",
                 deprecation_summary: None,
                 custom_placeholder: Some(BackgroundKind::default().to_arrow()?),
-                datatype: BackgroundKind::arrow_datatype(),
+                datatype: BackgroundKind::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: BackgroundKind::verify_arrow_array,
+            },
+        ),
+        (
+            <ColumnName as Component>::name(),
+            ComponentReflection {
+                docstring_md: "The name of a column in a table.\n\nThis is the physical column name: it is what the column is looked up by, and it is also\nwhat the user reads whenever the column has no separate, human-facing label.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                deprecation_summary: None,
+                custom_placeholder: None,
+                datatype: ColumnName::arrow_data_type(),
+                is_enum: false,
+                own_chunk: false,
+                verify_arrow_array: ColumnName::verify_arrow_array,
             },
         ),
         (
@@ -134,8 +187,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The order of component columns (which remain always grouped by entity path) in the dataframe view.\n\nEntities not in this list are appended at the end in their default order.\nEntities in this list that are not present in the view are ignored.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ColumnOrder::default().to_arrow()?),
-                datatype: ColumnOrder::arrow_datatype(),
+                datatype: ColumnOrder::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ColumnOrder::verify_arrow_array,
             },
         ),
@@ -145,8 +199,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The layout share of a column in the container.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ColumnShare::default().to_arrow()?),
-                datatype: ColumnShare::arrow_datatype(),
+                datatype: ColumnShare::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ColumnShare::verify_arrow_array,
             },
         ),
@@ -156,8 +211,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Describe a component column to be selected in the dataframe view.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ComponentColumnSelector::default().to_arrow()?),
-                datatype: ComponentColumnSelector::arrow_datatype(),
+                datatype: ComponentColumnSelector::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ComponentColumnSelector::verify_arrow_array,
             },
         ),
@@ -167,8 +223,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The kind of a blueprint container (tabs, grid, …).",
                 deprecation_summary: None,
                 custom_placeholder: Some(ContainerKind::default().to_arrow()?),
-                datatype: ContainerKind::arrow_datatype(),
+                datatype: ContainerKind::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: ContainerKind::verify_arrow_array,
             },
         ),
@@ -178,9 +235,22 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "One of four 2D corners, typically used to align objects.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Corner2D::default().to_arrow()?),
-                datatype: Corner2D::arrow_datatype(),
+                datatype: Corner2D::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: Corner2D::verify_arrow_array,
+            },
+        ),
+        (
+            <Editable as Component>::name(),
+            ComponentReflection {
+                docstring_md: "Whether a table column's values can be edited.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                deprecation_summary: None,
+                custom_placeholder: None,
+                datatype: Editable::arrow_data_type(),
+                is_enum: false,
+                own_chunk: false,
+                verify_arrow_array: Editable::verify_arrow_array,
             },
         ),
         (
@@ -189,8 +259,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Whether a procedure is enabled.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(Enabled::default().to_arrow()?),
-                datatype: Enabled::arrow_datatype(),
+                datatype: Enabled::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Enabled::verify_arrow_array,
             },
         ),
@@ -200,8 +271,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The kind of the 3D eye to view a scene in a [`views.Spatial3DView`](https://rerun.io/docs/reference/types/views/spatial3d_view).\n\nThis is used to specify how the controls of the view react to user input (such as mouse gestures).",
                 deprecation_summary: None,
                 custom_placeholder: Some(Eye3DKind::default().to_arrow()?),
-                datatype: Eye3DKind::arrow_datatype(),
+                datatype: Eye3DKind::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: Eye3DKind::verify_arrow_array,
             },
         ),
@@ -211,8 +283,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Configuration for a filter-by-range feature of the dataframe view.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(FilterByRange::default().to_arrow()?),
-                datatype: FilterByRange::arrow_datatype(),
+                datatype: FilterByRange::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: FilterByRange::verify_arrow_array,
             },
         ),
@@ -222,8 +295,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Configuration for the filter is not null feature of the dataframe view.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(FilterIsNotNull::default().to_arrow()?),
-                datatype: FilterIsNotNull::arrow_datatype(),
+                datatype: FilterIsNotNull::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: FilterIsNotNull::verify_arrow_array,
             },
         ),
@@ -233,8 +307,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The target distance between two nodes.\n\nThis is helpful to scale the layout, for example if long labels are involved.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ForceDistance::default().to_arrow()?),
-                datatype: ForceDistance::arrow_datatype(),
+                datatype: ForceDistance::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ForceDistance::verify_arrow_array,
             },
         ),
@@ -244,8 +319,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Specifies how often this force should be applied per iteration.\n\nIncreasing this parameter can lead to better results at the cost of longer computation time.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ForceIterations::default().to_arrow()?),
-                datatype: ForceIterations::arrow_datatype(),
+                datatype: ForceIterations::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ForceIterations::verify_arrow_array,
             },
         ),
@@ -255,8 +331,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The strength of a given force.\n\nAllows to assign different weights to the individual forces, prioritizing one over the other.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ForceStrength::default().to_arrow()?),
-                datatype: ForceStrength::arrow_datatype(),
+                datatype: ForceStrength::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ForceStrength::verify_arrow_array,
             },
         ),
@@ -266,8 +343,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Frames per second for a sequence timeline.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: Fps::arrow_datatype(),
+                datatype: Fps::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Fps::verify_arrow_array,
             },
         ),
@@ -277,8 +355,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "How many columns a grid container should have.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(GridColumns::default().to_arrow()?),
-                datatype: GridColumns::arrow_datatype(),
+                datatype: GridColumns::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: GridColumns::verify_arrow_array,
             },
         ),
@@ -288,8 +367,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Space between grid lines of one line to the next in scene units.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(GridSpacing::default().to_arrow()?),
-                datatype: GridSpacing::arrow_datatype(),
+                datatype: GridSpacing::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: GridSpacing::verify_arrow_array,
             },
         ),
@@ -299,19 +379,21 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "All the contents in the container.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(IncludedContent::default().to_arrow()?),
-                datatype: IncludedContent::arrow_datatype(),
+                datatype: IncludedContent::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: IncludedContent::verify_arrow_array,
             },
         ),
         (
             <LinkAxis as Component>::name(),
             ComponentReflection {
-                docstring_md: "How should the horizontal/X/time axis be linked across multiple plots",
+                docstring_md: "Controls how the horizontal time axis is linked across time series and state timeline views.",
                 deprecation_summary: None,
                 custom_placeholder: Some(LinkAxis::default().to_arrow()?),
-                datatype: LinkAxis::arrow_datatype(),
+                datatype: LinkAxis::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: LinkAxis::verify_arrow_array,
             },
         ),
@@ -321,8 +403,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Indicate whether the range should be locked when zooming in on the data.\n\nDefault is `false`, i.e. zoom will change the visualized range.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(LockRangeDuringZoom::default().to_arrow()?),
-                datatype: LockRangeDuringZoom::arrow_datatype(),
+                datatype: LockRangeDuringZoom::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: LockRangeDuringZoom::verify_arrow_array,
             },
         ),
@@ -332,8 +415,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "If playing, whether and how the playback time should loop.",
                 deprecation_summary: None,
                 custom_placeholder: Some(LoopMode::default().to_arrow()?),
-                datatype: LoopMode::arrow_datatype(),
+                datatype: LoopMode::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: LoopMode::verify_arrow_array,
             },
         ),
@@ -343,8 +427,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Name of the map provider to be used in Map views.",
                 deprecation_summary: None,
                 custom_placeholder: Some(MapProvider::default().to_arrow()?),
-                datatype: MapProvider::arrow_datatype(),
+                datatype: MapProvider::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: MapProvider::verify_arrow_array,
             },
         ),
@@ -354,8 +439,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Distance to the near clip plane used for `Spatial2DView`.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(NearClipPlane::default().to_arrow()?),
-                datatype: NearClipPlane::arrow_datatype(),
+                datatype: NearClipPlane::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: NearClipPlane::verify_arrow_array,
             },
         ),
@@ -365,8 +451,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Tri-state for panel controls.",
                 deprecation_summary: None,
                 custom_placeholder: Some(PanelState::default().to_arrow()?),
-                datatype: PanelState::arrow_datatype(),
+                datatype: PanelState::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: PanelState::verify_arrow_array,
             },
         ),
@@ -376,8 +463,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The current play state.",
                 deprecation_summary: None,
                 custom_placeholder: Some(PlayState::default().to_arrow()?),
-                datatype: PlayState::arrow_datatype(),
+                datatype: PlayState::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: PlayState::verify_arrow_array,
             },
         ),
@@ -387,19 +475,33 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A playback speed which determines how fast time progresses.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: PlaybackSpeed::arrow_datatype(),
+                datatype: PlaybackSpeed::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: PlaybackSpeed::verify_arrow_array,
+            },
+        ),
+        (
+            <PointsDisplay as Component>::name(),
+            ComponentReflection {
+                docstring_md: "Controls when data point markers are displayed on line series.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                deprecation_summary: None,
+                custom_placeholder: Some(PointsDisplay::default().to_arrow()?),
+                datatype: PointsDisplay::arrow_data_type(),
+                is_enum: true,
+                own_chunk: false,
+                verify_arrow_array: PointsDisplay::verify_arrow_array,
             },
         ),
         (
             <QueryExpression as Component>::name(),
             ComponentReflection {
-                docstring_md: "An individual query expression used to filter a set of [`datatypes.EntityPath`](https://rerun.io/docs/reference/types/datatypes/entity_path)s.\n\nEach expression is either an inclusion or an exclusion expression.\nInclusions start with an optional `+` and exclusions must start with a `-`.\n\nMultiple expressions are combined together as part of archetypes.ViewContents.\n\nThe `/**` suffix matches the whole subtree, i.e. self and any child, recursively\n(`/world/**` matches both `/world` and `/world/car/driver`).\nOther uses of `*` are not (yet) supported.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                docstring_md: "An individual query expression used to filter a set of [`encodings.EntityPath`](https://rerun.io/docs/reference/types/encodings/entity_path)s.\n\nEach expression is either an inclusion or an exclusion expression.\nInclusions start with an optional `+` and exclusions must start with a `-`.\n\nMultiple expressions are combined together as part of archetypes.ViewContents.\n\nThe `/**` suffix matches the whole subtree, i.e. self and any child, recursively\n(`/world/**` matches both `/world` and `/world/car/driver`).\nOther uses of `*` are not (yet) supported.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(QueryExpression::default().to_arrow()?),
-                datatype: QueryExpression::arrow_datatype(),
+                datatype: QueryExpression::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: QueryExpression::verify_arrow_array,
             },
         ),
@@ -409,8 +511,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The container that sits at the root of a viewport.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(RootContainer::default().to_arrow()?),
-                datatype: RootContainer::arrow_datatype(),
+                datatype: RootContainer::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: RootContainer::verify_arrow_array,
             },
         ),
@@ -420,8 +523,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The layout share of a row in the container.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(RowShare::default().to_arrow()?),
-                datatype: RowShare::arrow_datatype(),
+                datatype: RowShare::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: RowShare::verify_arrow_array,
             },
         ),
@@ -431,9 +535,34 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Describe a component column to be selected in the dataframe view.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(SelectedColumns::default().to_arrow()?),
-                datatype: SelectedColumns::arrow_datatype(),
+                datatype: SelectedColumns::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: SelectedColumns::verify_arrow_array,
+            },
+        ),
+        (
+            <TableCellKind as Component>::name(),
+            ComponentReflection {
+                docstring_md: "How a table column value is rendered.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                deprecation_summary: None,
+                custom_placeholder: Some(TableCellKind::default().to_arrow()?),
+                datatype: TableCellKind::arrow_data_type(),
+                is_enum: true,
+                own_chunk: false,
+                verify_arrow_array: TableCellKind::verify_arrow_array,
+            },
+        ),
+        (
+            <TableLayoutKind as Component>::name(),
+            ComponentReflection {
+                docstring_md: "How table records are presented.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                deprecation_summary: None,
+                custom_placeholder: Some(TableLayoutKind::default().to_arrow()?),
+                datatype: TableLayoutKind::arrow_data_type(),
+                is_enum: true,
+                own_chunk: false,
+                verify_arrow_array: TableLayoutKind::verify_arrow_array,
             },
         ),
         (
@@ -442,8 +571,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Show a slider for the index of some dimension of a slider.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(TensorDimensionIndexSlider::default().to_arrow()?),
-                datatype: TensorDimensionIndexSlider::arrow_datatype(),
+                datatype: TensorDimensionIndexSlider::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TensorDimensionIndexSlider::verify_arrow_array,
             },
         ),
@@ -453,8 +583,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A text log column\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(TextLogColumn::default().to_arrow()?),
-                datatype: TextLogColumn::arrow_datatype(),
+                datatype: TextLogColumn::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TextLogColumn::verify_arrow_array,
             },
         ),
@@ -464,8 +595,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A reference to a time.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: TimeInt::arrow_datatype(),
+                datatype: TimeInt::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TimeInt::verify_arrow_array,
             },
         ),
@@ -475,8 +607,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A time range on an unspecified timeline using either relative or absolute boundaries.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: TimeRange::arrow_datatype(),
+                datatype: TimeRange::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TimeRange::verify_arrow_array,
             },
         ),
@@ -486,20 +619,34 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A timeline column in a text log table.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(TimelineColumn::default().to_arrow()?),
-                datatype: TimelineColumn::arrow_datatype(),
+                datatype: TimelineColumn::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TimelineColumn::verify_arrow_array,
             },
         ),
         (
             <TimelineName as Component>::name(),
             ComponentReflection {
-                docstring_md: "A timeline identified by its name.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                docstring_md: "A timeline identified by its name.\n\nThe name is used both as an identifier and as a display label: it is what timelines are\nkeyed on, and also what the user reads.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(TimelineName::default().to_arrow()?),
-                datatype: TimelineName::arrow_datatype(),
+                datatype: TimelineName::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TimelineName::verify_arrow_array,
+            },
+        ),
+        (
+            <TooltipMode as Component>::name(),
+            ComponentReflection {
+                docstring_md: "Controls how the plot tooltip behaves when hovering over data.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                deprecation_summary: None,
+                custom_placeholder: Some(TooltipMode::default().to_arrow()?),
+                datatype: TooltipMode::arrow_data_type(),
+                is_enum: true,
+                own_chunk: false,
+                verify_arrow_array: TooltipMode::verify_arrow_array,
             },
         ),
         (
@@ -508,8 +655,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The class identifier of view, e.g. `\"2D\"`, `\"TextLog\"`, ….\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ViewClass::default().to_arrow()?),
-                datatype: ViewClass::arrow_datatype(),
+                datatype: ViewClass::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ViewClass::verify_arrow_array,
             },
         ),
@@ -519,8 +667,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Determines whether an image or texture should be scaled to fit the viewport.",
                 deprecation_summary: None,
                 custom_placeholder: Some(ViewFit::default().to_arrow()?),
-                datatype: ViewFit::arrow_datatype(),
+                datatype: ViewFit::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: ViewFit::verify_arrow_array,
             },
         ),
@@ -530,8 +679,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Whether a view is maximized.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ViewMaximized::default().to_arrow()?),
-                datatype: ViewMaximized::arrow_datatype(),
+                datatype: ViewMaximized::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ViewMaximized::verify_arrow_array,
             },
         ),
@@ -541,8 +691,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The origin of a view.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ViewOrigin::default().to_arrow()?),
-                datatype: ViewOrigin::arrow_datatype(),
+                datatype: ViewOrigin::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ViewOrigin::verify_arrow_array,
             },
         ),
@@ -552,8 +703,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Hash of a viewer recommendation.\n\nThe formation of this hash is considered an internal implementation detail of the viewer.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ViewerRecommendationHash::default().to_arrow()?),
-                datatype: ViewerRecommendationHash::arrow_datatype(),
+                datatype: ViewerRecommendationHash::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ViewerRecommendationHash::verify_arrow_array,
             },
         ),
@@ -563,8 +715,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The range of values on a given timeline that will be included in a view's query.\n\nRefer to `VisibleTimeRanges` archetype for more information.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(VisibleTimeRange::default().to_arrow()?),
-                datatype: VisibleTimeRange::arrow_datatype(),
+                datatype: VisibleTimeRange::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: VisibleTimeRange::verify_arrow_array,
             },
         ),
@@ -574,8 +727,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Visual bounds in 2D space used for `Spatial2DView`.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(VisualBounds2D::default().to_arrow()?),
-                datatype: VisualBounds2D::arrow_datatype(),
+                datatype: VisualBounds2D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: VisualBounds2D::verify_arrow_array,
             },
         ),
@@ -585,8 +739,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Associates components of an entity to components of a visualizer.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: VisualizerComponentMapping::arrow_datatype(),
+                datatype: VisualizerComponentMapping::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: VisualizerComponentMapping::verify_arrow_array,
             },
         ),
@@ -596,8 +751,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "ID for a visualizer instruction.\n\nIDs are only guaranteed to be unique in the scope of a view.\nFor details see archetypes.ActiveVisualizers.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(VisualizerInstructionId::default().to_arrow()?),
-                datatype: VisualizerInstructionId::arrow_datatype(),
+                datatype: VisualizerInstructionId::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: VisualizerInstructionId::verify_arrow_array,
             },
         ),
@@ -607,8 +763,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The type of the visualizer.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(VisualizerType::default().to_arrow()?),
-                datatype: VisualizerType::arrow_datatype(),
+                datatype: VisualizerType::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: VisualizerType::verify_arrow_array,
             },
         ),
@@ -618,8 +775,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A zoom level determines how much of the world is visible on a map.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ZoomLevel::default().to_arrow()?),
-                datatype: ZoomLevel::arrow_datatype(),
+                datatype: ZoomLevel::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ZoomLevel::verify_arrow_array,
             },
         ),
@@ -629,8 +787,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Policy for aggregation of multiple scalar plot values.\n\nThis is used for lines in plots when the X axis distance of individual points goes below a single pixel,\ni.e. a single pixel covers more than one tick worth of data. It can greatly improve performance\n(and readability) in such situations as it prevents overdraw.",
                 deprecation_summary: None,
                 custom_placeholder: Some(AggregationPolicy::default().to_arrow()?),
-                datatype: AggregationPolicy::arrow_datatype(),
+                datatype: AggregationPolicy::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: AggregationPolicy::verify_arrow_array,
             },
         ),
@@ -640,19 +799,21 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A color multiplier, usually applied to a whole entity, e.g. a mesh.",
                 deprecation_summary: None,
                 custom_placeholder: Some(AlbedoFactor::default().to_arrow()?),
-                datatype: AlbedoFactor::arrow_datatype(),
+                datatype: AlbedoFactor::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: AlbedoFactor::verify_arrow_array,
             },
         ),
         (
             <AnnotationContext as Component>::name(),
             ComponentReflection {
-                docstring_md: "The annotation context provides additional information on how to display entities.\n\nEntities can use [`datatypes.ClassId`](https://rerun.io/docs/reference/types/datatypes/class_id)s and [`datatypes.KeypointId`](https://rerun.io/docs/reference/types/datatypes/keypoint_id)s to provide annotations, and\nthe labels and colors will be looked up in the appropriate\nannotation context. We use the *first* annotation context we find in the\npath-hierarchy when searching up through the ancestors of a given entity\npath.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                docstring_md: "The annotation context provides additional information on how to display entities.\n\nEntities can use [`encodings.ClassId`](https://rerun.io/docs/reference/types/encodings/class_id)s and [`encodings.KeypointId`](https://rerun.io/docs/reference/types/encodings/keypoint_id)s to provide annotations, and\nthe labels and colors will be looked up in the appropriate\nannotation context. We use the *first* annotation context we find in the\npath-hierarchy when searching up through the ancestors of a given entity\npath.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(AnnotationContext::default().to_arrow()?),
-                datatype: AnnotationContext::arrow_datatype(),
+                datatype: AnnotationContext::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: AnnotationContext::verify_arrow_array,
             },
         ),
@@ -662,8 +823,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The length of an axis in local units of the space.",
                 deprecation_summary: None,
                 custom_placeholder: Some(AxisLength::default().to_arrow()?),
-                datatype: AxisLength::arrow_datatype(),
+                datatype: AxisLength::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: AxisLength::verify_arrow_array,
             },
         ),
@@ -672,9 +834,10 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
             ComponentReflection {
                 docstring_md: "A binary blob of data.",
                 deprecation_summary: None,
-                custom_placeholder: None,
-                datatype: Blob::arrow_datatype(),
+                custom_placeholder: Some(Blob::default().to_arrow()?),
+                datatype: Blob::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Blob::verify_arrow_array,
             },
         ),
@@ -684,8 +847,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The metric size of one grid cell in local scene units.\n\nE.g. for 2D grid maps, this is the physical size represented by a single pixel or cell.",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: CellSize::arrow_datatype(),
+                datatype: CellSize::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: CellSize::verify_arrow_array,
             },
         ),
@@ -695,8 +859,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A 16-bit ID representing an MCAP channel.\n\nUsed to identify specific channels within an MCAP file.",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: ChannelId::arrow_datatype(),
+                datatype: ChannelId::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ChannelId::verify_arrow_array,
             },
         ),
@@ -706,8 +871,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A mapping of channel IDs to their respective message counts.\n\nUsed in MCAP statistics to track how many messages were recorded per channel.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ChannelMessageCounts::default().to_arrow()?),
-                datatype: ChannelMessageCounts::arrow_datatype(),
+                datatype: ChannelMessageCounts::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ChannelMessageCounts::verify_arrow_array,
             },
         ),
@@ -717,8 +883,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A 16-bit ID representing a type of semantic class.",
                 deprecation_summary: None,
                 custom_placeholder: Some(ClassId::default().to_arrow()?),
-                datatype: ClassId::arrow_datatype(),
+                datatype: ClassId::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ClassId::verify_arrow_array,
             },
         ),
@@ -728,8 +895,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Configures how a clear operation should behave - recursive or not.",
                 deprecation_summary: None,
                 custom_placeholder: Some(ClearIsRecursive::default().to_arrow()?),
-                datatype: ClearIsRecursive::arrow_datatype(),
+                datatype: ClearIsRecursive::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ClearIsRecursive::verify_arrow_array,
             },
         ),
@@ -739,8 +907,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "An RGBA color with unmultiplied/separate alpha, in sRGB gamma space with linear alpha.\n\nThe color is stored as a 32-bit integer, where the most significant\nbyte is `R` and the least significant byte is `A`.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Color::default().to_arrow()?),
-                datatype: Color::arrow_datatype(),
+                datatype: Color::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Color::verify_arrow_array,
             },
         ),
@@ -750,8 +919,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Colormap for mapping scalar values within a given range to a color.\n\nThis provides a number of popular pre-defined colormaps.\nIn the future, the Rerun Viewer will allow users to define their own colormaps,\nbut currently the Viewer is limited to the types defined here.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Colormap::default().to_arrow()?),
-                datatype: Colormap::arrow_datatype(),
+                datatype: Colormap::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: Colormap::verify_arrow_array,
             },
         ),
@@ -761,8 +931,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A generic count value.\n\nUsed for counting various entities like messages, schemas, channels, etc.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: Count::arrow_datatype(),
+                datatype: Count::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Count::verify_arrow_array,
             },
         ),
@@ -772,8 +943,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The world->depth map scaling factor.\n\nThis measures how many depth map units are in a world unit.\nFor instance, if a depth map uses millimeters and the world uses meters,\nthis value would be `1000`.\n\nNote that the only effect on 2D views is the physical depth values shown when hovering the image.\nIn 3D views on the other hand, this affects where the points of the point cloud are placed.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(DepthMeter::default().to_arrow()?),
-                datatype: DepthMeter::arrow_datatype(),
+                datatype: DepthMeter::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: DepthMeter::verify_arrow_array,
             },
         ),
@@ -783,8 +955,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Draw order of 2D elements. Higher values are drawn on top of lower values.\n\nAn entity can have only a single draw order component.\nWithin an entity draw order is governed by the order of the components.\n\nDraw order for entities with the same draw order is generally undefined.",
                 deprecation_summary: None,
                 custom_placeholder: Some(DrawOrder::default().to_arrow()?),
-                datatype: DrawOrder::arrow_datatype(),
+                datatype: DrawOrder::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: DrawOrder::verify_arrow_array,
             },
         ),
@@ -794,8 +967,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A path to an entity, usually to reference some data that is part of the target entity.",
                 deprecation_summary: None,
                 custom_placeholder: Some(EntityPath::default().to_arrow()?),
-                datatype: EntityPath::arrow_datatype(),
+                datatype: EntityPath::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: EntityPath::verify_arrow_array,
             },
         ),
@@ -805,8 +979,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "How a geometric shape is drawn and colored.",
                 deprecation_summary: None,
                 custom_placeholder: Some(FillMode::default().to_arrow()?),
-                datatype: FillMode::arrow_datatype(),
+                datatype: FillMode::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: FillMode::verify_arrow_array,
             },
         ),
@@ -816,8 +991,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "How much a primitive fills out the available space.\n\nUsed for instance to scale the points of the point cloud created from [`archetypes.DepthImage`](https://rerun.io/docs/reference/types/archetypes/depth_image) projection in 3D views.\nValid range is from 0 to max float although typically values above 1.0 are not useful.\n\nDefaults to 1.0.",
                 deprecation_summary: None,
                 custom_placeholder: Some(FillRatio::default().to_arrow()?),
-                datatype: FillRatio::arrow_datatype(),
+                datatype: FillRatio::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: FillRatio::verify_arrow_array,
             },
         ),
@@ -827,8 +1003,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A gamma correction value to be used with a scalar value or color.\n\nUsed to adjust the gamma of a color or scalar value between 0 and 1 before rendering.\n`new_value = old_value ^ gamma`\n\nMust be a positive number.\nDefaults to 1.0 unless otherwise specified.",
                 deprecation_summary: None,
                 custom_placeholder: Some(GammaCorrection::default().to_arrow()?),
-                datatype: GammaCorrection::arrow_datatype(),
+                datatype: GammaCorrection::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: GammaCorrection::verify_arrow_array,
             },
         ),
@@ -838,8 +1015,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A geospatial line string expressed in [EPSG:4326](https://epsg.io/4326) latitude and longitude (North/East-positive degrees).",
                 deprecation_summary: None,
                 custom_placeholder: Some(GeoLineString::default().to_arrow()?),
-                datatype: GeoLineString::arrow_datatype(),
+                datatype: GeoLineString::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: GeoLineString::verify_arrow_array,
             },
         ),
@@ -849,8 +1027,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "An edge in a graph connecting two nodes.",
                 deprecation_summary: None,
                 custom_placeholder: Some(GraphEdge::default().to_arrow()?),
-                datatype: GraphEdge::arrow_datatype(),
+                datatype: GraphEdge::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: GraphEdge::verify_arrow_array,
             },
         ),
@@ -860,8 +1039,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A string-based ID representing a node in a graph.",
                 deprecation_summary: None,
                 custom_placeholder: Some(GraphNode::default().to_arrow()?),
-                datatype: GraphNode::arrow_datatype(),
+                datatype: GraphNode::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: GraphNode::verify_arrow_array,
             },
         ),
@@ -871,8 +1051,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Specifies if a graph has directed or undirected edges.",
                 deprecation_summary: None,
                 custom_placeholder: Some(GraphType::default().to_arrow()?),
-                datatype: GraphType::arrow_datatype(),
+                datatype: GraphType::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: GraphType::verify_arrow_array,
             },
         ),
@@ -882,8 +1063,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Half-size (radius) of a 2D box.\n\nMeasured in its local coordinate system.\n\nThe box extends both in negative and positive direction along each axis.\nNegative sizes indicate that the box is flipped along the respective axis, but this has no effect on how it is displayed.",
                 deprecation_summary: None,
                 custom_placeholder: Some(HalfSize2D::default().to_arrow()?),
-                datatype: HalfSize2D::arrow_datatype(),
+                datatype: HalfSize2D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: HalfSize2D::verify_arrow_array,
             },
         ),
@@ -893,8 +1075,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Half-size (radius) of a 3D box.\n\nMeasured in its local coordinate system.\n\nThe box extends both in negative and positive direction along each axis.\nNegative sizes indicate that the box is flipped along the respective axis, but this has no effect on how it is displayed.",
                 deprecation_summary: None,
                 custom_placeholder: Some(HalfSize3D::default().to_arrow()?),
-                datatype: HalfSize3D::arrow_datatype(),
+                datatype: HalfSize3D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: HalfSize3D::verify_arrow_array,
             },
         ),
@@ -904,8 +1087,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A buffer that is known to store image data.\n\nTo interpret the contents of this buffer, see, [`components.ImageFormat`](https://rerun.io/docs/reference/types/components/image_format).",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: ImageBuffer::arrow_datatype(),
+                datatype: ImageBuffer::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ImageBuffer::verify_arrow_array,
             },
         ),
@@ -915,8 +1099,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The metadata describing the contents of a [`components.ImageBuffer`](https://rerun.io/docs/reference/types/components/image_buffer).",
                 deprecation_summary: None,
                 custom_placeholder: Some(ImageFormat::default().to_arrow()?),
-                datatype: ImageFormat::arrow_datatype(),
+                datatype: ImageFormat::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ImageFormat::verify_arrow_array,
             },
         ),
@@ -926,8 +1111,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The distance from the camera origin to the image plane when the projection is shown in a 3D viewer.\n\nThis is only used for visualization purposes, and does not affect the projection itself.",
                 deprecation_summary: None,
                 custom_placeholder: Some(ImagePlaneDistance::default().to_arrow()?),
-                datatype: ImagePlaneDistance::arrow_datatype(),
+                datatype: ImagePlaneDistance::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ImagePlaneDistance::verify_arrow_array,
             },
         ),
@@ -937,8 +1123,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Whether the entity can be interacted with.\n\nNon interactive components are still visible, but mouse interactions in the view are disabled.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Interactive::default().to_arrow()?),
-                datatype: Interactive::arrow_datatype(),
+                datatype: Interactive::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Interactive::verify_arrow_array,
             },
         ),
@@ -948,9 +1135,22 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Specifies how values between data points are interpolated in time series.",
                 deprecation_summary: None,
                 custom_placeholder: Some(InterpolationMode::default().to_arrow()?),
-                datatype: InterpolationMode::arrow_datatype(),
+                datatype: InterpolationMode::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: InterpolationMode::verify_arrow_array,
+            },
+        ),
+        (
+            <IsKeyframe as Component>::name(),
+            ComponentReflection {
+                docstring_md: "Whether a [`components.VideoSample`](https://rerun.io/docs/reference/types/components/video_sample) contains a keyframe (also known as a sync sample or IDR).\n\nA keyframe in this sense must be _decoder re-entrant_: a decoder must be able to start\ndecoding the stream from this sample alone, with no prior decoder state.\nNot every intra-coded frame qualifies. Some codecs have intra-only frames that may\nstill reference existing decoder state and are therefore not valid sync points.\nSee [`components.VideoCodec`](https://rerun.io/docs/reference/types/components/video_codec) for the codec-specific definition of a keyframe.",
+                deprecation_summary: None,
+                custom_placeholder: None,
+                datatype: IsKeyframe::arrow_data_type(),
+                is_enum: false,
+                own_chunk: true,
+                verify_arrow_array: IsKeyframe::verify_arrow_array,
             },
         ),
         (
@@ -959,8 +1159,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A map of string keys to string values.\n\nThis component can be used to attach arbitrary metadata or annotations to entities.\nEach key-value pair is stored as a UTF-8 string mapping.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(KeyValuePairs::default().to_arrow()?),
-                datatype: KeyValuePairs::arrow_datatype(),
+                datatype: KeyValuePairs::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: KeyValuePairs::verify_arrow_array,
             },
         ),
@@ -970,8 +1171,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A 16-bit ID representing a type of semantic keypoint within a class.",
                 deprecation_summary: None,
                 custom_placeholder: Some(KeypointId::default().to_arrow()?),
-                datatype: KeypointId::arrow_datatype(),
+                datatype: KeypointId::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: KeypointId::verify_arrow_array,
             },
         ),
@@ -981,8 +1183,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A geospatial position expressed in [EPSG:4326](https://epsg.io/4326) latitude and longitude (North/East-positive degrees).",
                 deprecation_summary: None,
                 custom_placeholder: Some(LatLon::default().to_arrow()?),
-                datatype: LatLon::arrow_datatype(),
+                datatype: LatLon::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: LatLon::verify_arrow_array,
             },
         ),
@@ -992,8 +1195,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Length, or one-dimensional size.\n\nMeasured in its local coordinate system; consult the archetype in use to determine which\naxis or part of the entity this is the length of.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Length::default().to_arrow()?),
-                datatype: Length::arrow_datatype(),
+                datatype: Length::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Length::verify_arrow_array,
             },
         ),
@@ -1003,8 +1207,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A line strip in 2D space.\n\nA line strip is a list of points connected by line segments. It can be used to draw\napproximations of smooth curves.\n\nThe points will be connected in order, like so:\n```text\n       2------3     5\n      /        \\   /\n0----1          \\ /\n                 4\n```",
                 deprecation_summary: None,
                 custom_placeholder: Some(LineStrip2D::default().to_arrow()?),
-                datatype: LineStrip2D::arrow_datatype(),
+                datatype: LineStrip2D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: LineStrip2D::verify_arrow_array,
             },
         ),
@@ -1014,8 +1219,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A line strip in 3D space.\n\nA line strip is a list of points connected by line segments. It can be used to draw\napproximations of smooth curves.\n\nThe points will be connected in order, like so:\n```text\n       2------3     5\n      /        \\   /\n0----1          \\ /\n                 4\n```",
                 deprecation_summary: None,
                 custom_placeholder: Some(LineStrip3D::default().to_arrow()?),
-                datatype: LineStrip3D::arrow_datatype(),
+                datatype: LineStrip3D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: LineStrip3D::verify_arrow_array,
             },
         ),
@@ -1025,8 +1231,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Linear speed, used for translation speed for example.",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: LinearSpeed::arrow_datatype(),
+                datatype: LinearSpeed::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: LinearSpeed::verify_arrow_array,
             },
         ),
@@ -1036,8 +1243,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Filter used when a single texel/pixel of an image is displayed larger than a single screen pixel.\n\nThis happens when zooming into an image, when displaying a low-resolution image in a large area,\nor when viewing an image up close in 3D space.",
                 deprecation_summary: None,
                 custom_placeholder: Some(MagnificationFilter::default().to_arrow()?),
-                datatype: MagnificationFilter::arrow_datatype(),
+                datatype: MagnificationFilter::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: MagnificationFilter::verify_arrow_array,
             },
         ),
@@ -1047,8 +1255,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The visual appearance of a point in e.g. a 2D plot.",
                 deprecation_summary: None,
                 custom_placeholder: Some(MarkerShape::default().to_arrow()?),
-                datatype: MarkerShape::arrow_datatype(),
+                datatype: MarkerShape::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: MarkerShape::verify_arrow_array,
             },
         ),
@@ -1058,8 +1267,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Radius of a marker of a point in e.g. a 2D plot, measured in UI points.",
                 deprecation_summary: None,
                 custom_placeholder: Some(MarkerSize::default().to_arrow()?),
-                datatype: MarkerSize::arrow_datatype(),
+                datatype: MarkerSize::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: MarkerSize::verify_arrow_array,
             },
         ),
@@ -1069,8 +1279,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A standardized media type (RFC2046, formerly known as MIME types), encoded as a string.\n\nThe complete reference of officially registered media types is maintained by the IANA and can be\nconsulted at <https://www.iana.org/assignments/media-types/media-types.xhtml>.",
                 deprecation_summary: None,
                 custom_placeholder: Some(MediaType::default().to_arrow()?),
-                datatype: MediaType::arrow_datatype(),
+                datatype: MediaType::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: MediaType::verify_arrow_array,
             },
         ),
@@ -1080,19 +1291,21 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Determines which faces of a mesh are rendered.\n\nFor this purpose, we assume that the winding order of vertices in a mesh is\nconsistent and that front faces are defined as those with vertices in counter clockwise order.",
                 deprecation_summary: None,
                 custom_placeholder: Some(MeshFaceRendering::default().to_arrow()?),
-                datatype: MeshFaceRendering::arrow_datatype(),
+                datatype: MeshFaceRendering::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: MeshFaceRendering::verify_arrow_array,
             },
         ),
         (
             <Name as Component>::name(),
             ComponentReflection {
-                docstring_md: "A display name, typically for an entity or a item like a plot series.",
+                docstring_md: "A display name, typically for an entity or a item like a plot series.\n\nThis name is only a display label, never an identifier: it is not used to look anything\nup, and two items may share the same name.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Name::default().to_arrow()?),
-                datatype: Name::arrow_datatype(),
+                datatype: Name::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Name::verify_arrow_array,
             },
         ),
@@ -1102,9 +1315,22 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Degree of transparency ranging from 0.0 (fully transparent) to 1.0 (fully opaque).\n\nThe final opacity value may be a result of multiplication with alpha values as specified by other color sources.\nUnless otherwise specified, the default value is 1.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Opacity::default().to_arrow()?),
-                datatype: Opacity::arrow_datatype(),
+                datatype: Opacity::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Opacity::verify_arrow_array,
+            },
+        ),
+        (
+            <OpticalDensity as Component>::name(),
+            ComponentReflection {
+                docstring_md: "Dimensionless natural-log optical depth.\n\nHigh values lead to more opaque surfaces, lower to more transparent ones.\nMore accurately, a value of 1 attenuates light to `exp(-1)` over the reference distance.",
+                deprecation_summary: None,
+                custom_placeholder: Some(OpticalDensity::default().to_arrow()?),
+                datatype: OpticalDensity::arrow_data_type(),
+                is_enum: false,
+                own_chunk: false,
+                verify_arrow_array: OpticalDensity::verify_arrow_array,
             },
         ),
         (
@@ -1113,8 +1339,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Camera projection, from image coordinates to view coordinates.\n\nChild from parent.\nImage coordinates from camera view coordinates.\n\nExample:\n```text\n1496.1     0.0  980.5\n   0.0  1496.1  744.5\n   0.0     0.0    1.0\n```",
                 deprecation_summary: None,
                 custom_placeholder: Some(PinholeProjection::default().to_arrow()?),
-                datatype: PinholeProjection::arrow_datatype(),
+                datatype: PinholeProjection::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: PinholeProjection::verify_arrow_array,
             },
         ),
@@ -1124,9 +1351,22 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "An infinite 3D plane represented by a unit normal vector and a distance.\n\nAny point P on the plane fulfills the equation `dot(xyz, P) - d = 0`,\nwhere `xyz` is the plane's normal and `d` the distance of the plane from the origin.\nThis representation is also known as the Hesse normal form.\n\nNote: although the normal will be passed through to the\ndatastore as provided, when used in the Viewer, planes will always be normalized.\nI.e. the plane with xyz = (2, 0, 0), d = 1 is equivalent to xyz = (1, 0, 0), d = 0.5",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: Plane3D::arrow_datatype(),
+                datatype: Plane3D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Plane3D::verify_arrow_array,
+            },
+        ),
+        (
+            <PointShading as Component>::name(),
+            ComponentReflection {
+                docstring_md: "Defines how points are shaded.",
+                deprecation_summary: None,
+                custom_placeholder: Some(PointShading::default().to_arrow()?),
+                datatype: PointShading::arrow_data_type(),
+                is_enum: true,
+                own_chunk: false,
+                verify_arrow_array: PointShading::verify_arrow_array,
             },
         ),
         (
@@ -1135,8 +1375,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A position in 2D space.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Position2D::default().to_arrow()?),
-                datatype: Position2D::arrow_datatype(),
+                datatype: Position2D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Position2D::verify_arrow_array,
             },
         ),
@@ -1146,8 +1387,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A position in 3D space.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Position3D::default().to_arrow()?),
-                datatype: Position3D::arrow_datatype(),
+                datatype: Position3D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Position3D::verify_arrow_array,
             },
         ),
@@ -1157,8 +1399,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The radius of something, e.g. a point.\n\nInternally, positive values indicate scene units, whereas negative values\nare interpreted as UI points.\n\nUI points are independent of zooming in Views, but are sensitive to the application UI scaling.\nat 100% UI scaling, UI points are equal to pixels\nThe Viewer's UI scaling defaults to the OS scaling which typically is 100% for full HD screens and 200% for 4k screens.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Radius::default().to_arrow()?),
-                datatype: Radius::arrow_datatype(),
+                datatype: Radius::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Radius::verify_arrow_array,
             },
         ),
@@ -1168,8 +1411,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A 1D range, specifying a lower and upper bound.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Range1D::default().to_arrow()?),
-                datatype: Range1D::arrow_datatype(),
+                datatype: Range1D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Range1D::verify_arrow_array,
             },
         ),
@@ -1179,8 +1423,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Pixel resolution width & height, e.g. of a camera sensor.\n\nTypically in integer units, but for some use cases floating point may be used.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Resolution::default().to_arrow()?),
-                datatype: Resolution::arrow_datatype(),
+                datatype: Resolution::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Resolution::verify_arrow_array,
             },
         ),
@@ -1190,8 +1435,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "3D rotation represented by a rotation around a given axis.\n\nIf normalization of the rotation axis fails the rotation is treated as an invalid transform, unless the\nangle is zero in which case it is treated as an identity.",
                 deprecation_summary: None,
                 custom_placeholder: Some(RotationAxisAngle::default().to_arrow()?),
-                datatype: RotationAxisAngle::arrow_datatype(),
+                datatype: RotationAxisAngle::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: RotationAxisAngle::verify_arrow_array,
             },
         ),
@@ -1201,8 +1447,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A 3D rotation expressed as a quaternion.\n\nNote: although the x,y,z,w components of the quaternion will be passed through to the\ndatastore as provided, when used in the Viewer, quaternions will always be normalized.\nIf normalization fails the rotation is treated as an invalid transform.",
                 deprecation_summary: None,
                 custom_placeholder: Some(RotationQuat::default().to_arrow()?),
-                datatype: RotationQuat::arrow_datatype(),
+                datatype: RotationQuat::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: RotationQuat::verify_arrow_array,
             },
         ),
@@ -1212,8 +1459,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A scalar value, encoded as a 64-bit floating point.\n\nUsed for time series plots.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Scalar::default().to_arrow()?),
-                datatype: Scalar::arrow_datatype(),
+                datatype: Scalar::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Scalar::verify_arrow_array,
             },
         ),
@@ -1223,8 +1471,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A 3D scale factor.\n\nA scale of 1.0 means no scaling.\nA scale of 2.0 means doubling the size.\nEach component scales along the corresponding axis.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Scale3D::default().to_arrow()?),
-                datatype: Scale3D::arrow_datatype(),
+                datatype: Scale3D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Scale3D::verify_arrow_array,
             },
         ),
@@ -1234,8 +1483,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A 16-bit unique identifier for a schema within the MCAP file.",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: SchemaId::arrow_datatype(),
+                datatype: SchemaId::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: SchemaId::verify_arrow_array,
             },
         ),
@@ -1245,9 +1495,34 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Whether the entity's [`components.Text`](https://rerun.io/docs/reference/types/components/text) label is shown.\n\nThe main purpose of this component existing separately from the labels themselves\nis to be overridden when desired, to allow hiding and showing from the viewer and\nblueprints.",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: ShowLabels::arrow_datatype(),
+                datatype: ShowLabels::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ShowLabels::verify_arrow_array,
+            },
+        ),
+        (
+            <SphericalHarmonics3Rgb as Component>::name(),
+            ComponentReflection {
+                docstring_md: "View-dependent color, expressed as spherical harmonics coefficients of degrees 1 through 3.\n\nThe view-independent (degree-0) base color is represented as a separate [`components.Color`](https://rerun.io/docs/reference/types/components/color).\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                deprecation_summary: None,
+                custom_placeholder: None,
+                datatype: SphericalHarmonics3Rgb::arrow_data_type(),
+                is_enum: false,
+                own_chunk: false,
+                verify_arrow_array: SphericalHarmonics3Rgb::verify_arrow_array,
+            },
+        ),
+        (
+            <SphericalHarmonicsDegree as Component>::name(),
+            ComponentReflection {
+                docstring_md: "The highest spherical harmonics degree to evaluate when rendering, 0-3.\n\n`0` renders the view-independent base color only, and is the fastest.\nEach higher degree brings in more view-dependent detail, at the cost of fetching and\nevaluating more coefficients ([`components.SphericalHarmonics3Rgb`](https://rerun.io/docs/reference/types/components/spherical_harmonics3rgb)):\n3 of them for degree 1, 8 for degree 2, and all 15 for degree 3.\n\nLowering this in the blueprint can make the rendering a lot faster.\n\nDefaults to 3, i.e. every coefficient the data has.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                deprecation_summary: None,
+                custom_placeholder: Some(SphericalHarmonicsDegree::default().to_arrow()?),
+                datatype: SphericalHarmonicsDegree::arrow_data_type(),
+                is_enum: false,
+                own_chunk: false,
+                verify_arrow_array: SphericalHarmonicsDegree::verify_arrow_array,
             },
         ),
         (
@@ -1256,8 +1531,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The width of a stroke specified in UI points.",
                 deprecation_summary: None,
                 custom_placeholder: Some(StrokeWidth::default().to_arrow()?),
-                datatype: StrokeWidth::arrow_datatype(),
+                datatype: StrokeWidth::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: StrokeWidth::verify_arrow_array,
             },
         ),
@@ -1267,8 +1543,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "An N-dimensional array of numbers.\n\nThe number of dimensions and their respective lengths is specified by the `shape` field.\nThe dimensions are ordered from outermost to innermost. For example, in the common case of\na 2D RGB Image, the shape would be `[height, width, channel]`.\n\nThese dimensions are combined with an index to look up values from the `buffer` field,\nwhich stores a contiguous array of typed values.",
                 deprecation_summary: None,
                 custom_placeholder: Some(TensorData::default().to_arrow()?),
-                datatype: TensorData::arrow_datatype(),
+                datatype: TensorData::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TensorData::verify_arrow_array,
             },
         ),
@@ -1278,8 +1555,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Specifies a concrete index on a tensor dimension.",
                 deprecation_summary: None,
                 custom_placeholder: Some(TensorDimensionIndexSelection::default().to_arrow()?),
-                datatype: TensorDimensionIndexSelection::arrow_datatype(),
+                datatype: TensorDimensionIndexSelection::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TensorDimensionIndexSelection::verify_arrow_array,
             },
         ),
@@ -1289,8 +1567,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Specifies which dimension to use for height.",
                 deprecation_summary: None,
                 custom_placeholder: Some(TensorHeightDimension::default().to_arrow()?),
-                datatype: TensorHeightDimension::arrow_datatype(),
+                datatype: TensorHeightDimension::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TensorHeightDimension::verify_arrow_array,
             },
         ),
@@ -1300,8 +1579,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Specifies which dimension to use for width.",
                 deprecation_summary: None,
                 custom_placeholder: Some(TensorWidthDimension::default().to_arrow()?),
-                datatype: TensorWidthDimension::arrow_datatype(),
+                datatype: TensorWidthDimension::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TensorWidthDimension::verify_arrow_array,
             },
         ),
@@ -1311,8 +1591,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A 2D texture UV coordinate.\n\nTexture coordinates specify a position on a 2D texture.\nA range from 0-1 covers the entire texture in the respective dimension.\nUnless configured otherwise, the texture repeats outside of this range.\nRerun uses top-left as the origin for UV coordinates.\n\n  0     U     1\n0 + --------- →\n  |           .\nV |           .\n  |           .\n1 ↓ . . . . . .\n\nThis is the same convention as in Vulkan/Metal/DX12/WebGPU, but (!) unlike OpenGL,\nwhich places the origin at the bottom-left.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Texcoord2D::default().to_arrow()?),
-                datatype: Texcoord2D::arrow_datatype(),
+                datatype: Texcoord2D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Texcoord2D::verify_arrow_array,
             },
         ),
@@ -1322,8 +1603,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A string of text, e.g. for labels and text documents.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Text::default().to_arrow()?),
-                datatype: Text::arrow_datatype(),
+                datatype: Text::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Text::verify_arrow_array,
             },
         ),
@@ -1333,8 +1615,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The severity level of a text log message.\n\nRecommended to be one of:\n* `\"CRITICAL\"`\n* `\"ERROR\"`\n* `\"WARN\"`\n* `\"INFO\"`\n* `\"DEBUG\"`\n* `\"TRACE\"`",
                 deprecation_summary: None,
                 custom_placeholder: Some(TextLogLevel::default().to_arrow()?),
-                datatype: TextLogLevel::arrow_datatype(),
+                datatype: TextLogLevel::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TextLogLevel::verify_arrow_array,
             },
         ),
@@ -1344,8 +1627,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "When the recording started.\n\nShould be an absolute time, i.e. relative to Unix Epoch.",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: Timestamp::arrow_datatype(),
+                datatype: Timestamp::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Timestamp::verify_arrow_array,
             },
         ),
@@ -1355,8 +1639,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A string identifier for a transform frame.\n\nTransform frames may be derived from entity paths to refer to Rerun's implicit\nentity path driven hierarchy which is defined via [`archetypes.Transform3D`](https://rerun.io/docs/reference/types/archetypes/transform3d), [`archetypes.Pinhole`](https://rerun.io/docs/reference/types/archetypes/pinhole) etc..\nThese implicit transform frames look like `tf#path/to/entity`.\n\nNote that any [`archetypes.Transform3D`](https://rerun.io/docs/reference/types/archetypes/transform3d)s logged with both `parent_frame` and `child_frame` set\ndescribes a relationship between these parent and child transform frames, **not** the transform frame\nthat the entity path may be using (defined by an [`archetypes.CoordinateFrame`](https://rerun.io/docs/reference/types/archetypes/coordinate_frame)).",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: TransformFrameId::arrow_datatype(),
+                datatype: TransformFrameId::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TransformFrameId::verify_arrow_array,
             },
         ),
@@ -1366,8 +1651,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A 3x3 transformation matrix Matrix.\n\n3x3 matrixes are able to represent any affine transformation in 3D space,\ni.e. rotation, scaling, shearing, reflection etc.\n\nMatrices in Rerun are stored as flat list of coefficients in column-major order:\n```text\n            column 0       column 1       column 2\n       -------------------------------------------------\nrow 0 | flat_columns[0] flat_columns[3] flat_columns[6]\nrow 1 | flat_columns[1] flat_columns[4] flat_columns[7]\nrow 2 | flat_columns[2] flat_columns[5] flat_columns[8]\n```",
                 deprecation_summary: None,
                 custom_placeholder: Some(TransformMat3x3::default().to_arrow()?),
-                datatype: TransformMat3x3::arrow_datatype(),
+                datatype: TransformMat3x3::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TransformMat3x3::verify_arrow_array,
             },
         ),
@@ -1377,8 +1663,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Specifies relation a spatial transform describes.",
                 deprecation_summary: None,
                 custom_placeholder: Some(TransformRelation::default().to_arrow()?),
-                datatype: TransformRelation::arrow_datatype(),
+                datatype: TransformRelation::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: TransformRelation::verify_arrow_array,
             },
         ),
@@ -1388,8 +1675,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A translation vector in 3D space.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Translation3D::default().to_arrow()?),
-                datatype: Translation3D::arrow_datatype(),
+                datatype: Translation3D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Translation3D::verify_arrow_array,
             },
         ),
@@ -1399,9 +1687,22 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The three indices of a triangle in a triangle mesh.",
                 deprecation_summary: None,
                 custom_placeholder: Some(TriangleIndices::default().to_arrow()?),
-                datatype: TriangleIndices::arrow_datatype(),
+                datatype: TriangleIndices::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: TriangleIndices::verify_arrow_array,
+            },
+        ),
+        (
+            <Unit as Component>::name(),
+            ComponentReflection {
+                docstring_md: "Unit of a measured value, e.g. `\"Pa\"`, `\"lux\"`, `\"°C\"`, `\"m\"`.\n\nUsed for display only. It does not convert or scale the value.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                deprecation_summary: None,
+                custom_placeholder: None,
+                datatype: Unit::arrow_data_type(),
+                is_enum: false,
+                own_chunk: false,
+                verify_arrow_array: Unit::verify_arrow_array,
             },
         ),
         (
@@ -1410,9 +1711,22 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Range of expected or valid values, specifying a lower and upper bound.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ValueRange::default().to_arrow()?),
-                datatype: ValueRange::arrow_datatype(),
+                datatype: ValueRange::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ValueRange::verify_arrow_array,
+            },
+        ),
+        (
+            <Variance as Component>::name(),
+            ComponentReflection {
+                docstring_md: "Variance of a scalar measurement, i.e. σ², in the units of the value squared.\n\nA value of `0` is a perfectly known value and draws no error band.\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                deprecation_summary: None,
+                custom_placeholder: None,
+                datatype: Variance::arrow_data_type(),
+                is_enum: false,
+                own_chunk: false,
+                verify_arrow_array: Variance::verify_arrow_array,
             },
         ),
         (
@@ -1421,8 +1735,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A vector in 2D space.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Vector2D::default().to_arrow()?),
-                datatype: Vector2D::arrow_datatype(),
+                datatype: Vector2D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Vector2D::verify_arrow_array,
             },
         ),
@@ -1432,8 +1747,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "A vector in 3D space.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Vector3D::default().to_arrow()?),
-                datatype: Vector3D::arrow_datatype(),
+                datatype: Vector3D::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Vector3D::verify_arrow_array,
             },
         ),
@@ -1443,8 +1759,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "The codec used to encode video stored in [`components.VideoSample`](https://rerun.io/docs/reference/types/components/video_sample).\n\nSupport of these codecs by the Rerun Viewer is platform dependent.\nFor more details see check the [video reference](https://rerun.io/docs/reference/video).\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: VideoCodec::arrow_datatype(),
+                datatype: VideoCodec::arrow_data_type(),
                 is_enum: true,
+                own_chunk: false,
                 verify_arrow_array: VideoCodec::verify_arrow_array,
             },
         ),
@@ -1454,8 +1771,9 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Video sample data (also known as \"video chunk\").\n\nEach video sample must contain enough data for exactly one video frame\n(this restriction may be relaxed in the future for some codecs).\n\nKeyframes may require additional data, for details see [`components.VideoCodec`](https://rerun.io/docs/reference/types/components/video_codec).",
                 deprecation_summary: None,
                 custom_placeholder: None,
-                datatype: VideoSample::arrow_datatype(),
+                datatype: VideoSample::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: VideoSample::verify_arrow_array,
             },
         ),
@@ -1465,19 +1783,21 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Timestamp inside a [`archetypes.AssetVideo`](https://rerun.io/docs/reference/types/archetypes/asset_video).",
                 deprecation_summary: None,
                 custom_placeholder: Some(VideoTimestamp::default().to_arrow()?),
-                datatype: VideoTimestamp::arrow_datatype(),
+                datatype: VideoTimestamp::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: VideoTimestamp::verify_arrow_array,
             },
         ),
         (
             <ViewCoordinates as Component>::name(),
             ComponentReflection {
-                docstring_md: "How we interpret the coordinate system of an entity/space.\n\nFor instance: What is \"up\"? What does the Z axis mean?\n\nThe three coordinates are always ordered as [x, y, z].\n\nFor example [Right, Down, Forward] means that the X axis points to the right, the Y axis points\ndown, and the Z axis points forward.\n\n⚠ [Rerun does not yet support left-handed coordinate systems](https://github.com/rerun-io/rerun/issues/5032).\n\nThe following constants are used to represent the different directions:\n * Up = 1\n * Down = 2\n * Right = 3\n * Left = 4\n * Forward = 5\n * Back = 6\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
+                docstring_md: "An orientation convention for a camera or 3D view.\n\nOn [`archetypes.Pinhole`](https://rerun.io/docs/reference/types/archetypes/pinhole), this component controls the camera orientation and projection direction.\nOn [SpatialInformation](https://rerun.io/docs/reference/types/views/spatial3d_view), it controls the 3D view's eye orientation, navigation, and default grid plane.\nA logged [`archetypes.ViewCoordinates`](https://rerun.io/docs/reference/types/archetypes/view_coordinates) provides the default for [SpatialInformation](https://rerun.io/docs/reference/types/views/spatial3d_view).\n\nThe three directions are always ordered as [x, y, z] and specify where each positive axis points.\nFor example, [Right, Down, Forward] means that +X points right, +Y points down, and +Z points forward.\n\n⚠ [Rerun does not yet support left-handed coordinate systems](https://github.com/rerun-io/rerun/issues/5032).\n\n⚠\u{fe0f} **This type is _unstable_ and may change significantly in a way that the data won't be backwards compatible.**",
                 deprecation_summary: None,
                 custom_placeholder: Some(ViewCoordinates::default().to_arrow()?),
-                datatype: ViewCoordinates::arrow_datatype(),
+                datatype: ViewCoordinates::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: ViewCoordinates::verify_arrow_array,
             },
         ),
@@ -1487,13 +1807,50 @@ fn generate_component_reflection() -> Result<ComponentReflectionMap, Serializati
                 docstring_md: "Whether the container, view, entity or instance is currently visible.",
                 deprecation_summary: None,
                 custom_placeholder: Some(Visible::default().to_arrow()?),
-                datatype: Visible::arrow_datatype(),
+                datatype: Visible::arrow_data_type(),
                 is_enum: false,
+                own_chunk: false,
                 verify_arrow_array: Visible::verify_arrow_array,
             },
         ),
+        (
+            <VoxelIndex as Component>::name(),
+            ComponentReflection {
+                docstring_md: "Integer index of a voxel in a sparse 3D voxel grid.\n\nThe voxel center in local grid coordinates is `(index + 0.5) * voxel_size`.",
+                deprecation_summary: None,
+                custom_placeholder: None,
+                datatype: VoxelIndex::arrow_data_type(),
+                is_enum: false,
+                own_chunk: false,
+                verify_arrow_array: VoxelIndex::verify_arrow_array,
+            },
+        ),
+        (
+            <VoxelSize as Component>::name(),
+            ComponentReflection {
+                docstring_md: "The scene-unit dimensions of one voxel in a sparse 3D voxel grid.\n\nEach component is the size of a voxel along the corresponding local grid axis.\nAll components must be finite and positive.",
+                deprecation_summary: None,
+                custom_placeholder: None,
+                datatype: VoxelSize::arrow_data_type(),
+                is_enum: false,
+                own_chunk: false,
+                verify_arrow_array: VoxelSize::verify_arrow_array,
+            },
+        ),
+        (
+            <VoxelValue as Component>::name(),
+            ComponentReflection {
+                docstring_md: "Optional scalar occupancy or value associated with a voxel.",
+                deprecation_summary: None,
+                custom_placeholder: None,
+                datatype: VoxelValue::arrow_data_type(),
+                is_enum: false,
+                own_chunk: false,
+                verify_arrow_array: VoxelValue::verify_arrow_array,
+            },
+        ),
     ];
-    Ok(ComponentReflectionMap::from_iter(array))
+    Ok(ComponentReflectionMap::from_iter(entries))
 }
 
 /// Generates reflection about all known archetypes.
@@ -1504,12 +1861,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
     re_tracing::profile_function!();
     let array = [
         (
-            ArchetypeName::new("rerun.archetypes.AnnotationContext"),
+            ArchetypeName::from("rerun.archetypes.AnnotationContext"),
             ArchetypeReflection {
                 display_name: "Annotation context",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![ArchetypeFieldReflection {
                     name: "context",
                     display_name: "Context",
@@ -1520,12 +1876,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Arrows2D"),
+            ArchetypeName::from("rerun.archetypes.Arrows2D"),
             ArchetypeReflection {
                 display_name: "Arrows 2D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "vectors",
@@ -1587,12 +1942,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Arrows3D"),
+            ArchetypeName::from("rerun.archetypes.Arrows3D"),
             ArchetypeReflection {
                 display_name: "Arrows 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "vectors",
@@ -1647,12 +2001,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Asset3D"),
+            ArchetypeName::from("rerun.archetypes.Asset3D"),
             ArchetypeReflection {
                 display_name: "Asset 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "blob",
@@ -1665,7 +2018,7 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
                         name: "media_type",
                         display_name: "Media type",
                         component_type: "rerun.components.MediaType".into(),
-                        docstring_md: "The Media Type of the asset.\n\nSupported values:\n* `model/gltf-binary`\n* `model/gltf+json`\n* `model/obj` (.mtl material files are not supported yet, references are silently ignored)\n* `model/stl`\n\nIf omitted, the viewer will try to guess from the data blob.\nIf it cannot guess, it won't be able to render the asset.",
+                        docstring_md: "The Media Type of the asset.\n\nSupported values:\n* `application/x-ply`\n* `model/gltf-binary`\n* `model/gltf+json`\n* `model/obj` (.mtl material files are not supported yet, references are silently ignored)\n* `model/stl`\n\nIf omitted, the viewer will try to guess from the data blob.\nIf it cannot guess, it won't be able to render the asset.",
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
@@ -1679,12 +2032,35 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.AssetVideo"),
+            ArchetypeName::from("rerun.archetypes.AssetAudio"),
+            ArchetypeReflection {
+                display_name: "Asset audio",
+                deprecation_summary: None,
+                scope: None,
+                fields: vec![
+                    ArchetypeFieldReflection {
+                        name: "blob",
+                        display_name: "Blob",
+                        component_type: "rerun.components.Blob".into(),
+                        docstring_md: "The asset's bytes.",
+                        flags: ArchetypeFieldFlags::REQUIRED,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "media_type",
+                        display_name: "Media type",
+                        component_type: "rerun.components.MediaType".into(),
+                        docstring_md: "The Media Type of the asset.\n\nFor instance:\n* `audio/aac` (raw ADTS stream)\n* `audio/flac`\n* `audio/mp4` (M4A)\n* `audio/mpeg` (MP3)\n* `audio/ogg`\n* `audio/wav`\n\nAny audio media type can be stored.\nWhich ones the viewer can decode depends on the viewer version.\n\nIf omitted, the viewer will try to guess from the data blob.\nIf it cannot guess, it won't be able to play the asset.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                ],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.archetypes.AssetVideo"),
             ArchetypeReflection {
                 display_name: "Asset video",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "blob",
@@ -1704,12 +2080,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.BarChart"),
+            ArchetypeName::from("rerun.archetypes.BarChart"),
             ArchetypeReflection {
                 display_name: "Bar chart",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["BarChartView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "values",
@@ -1743,12 +2118,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Boxes2D"),
+            ArchetypeName::from("rerun.archetypes.Boxes2D"),
             ArchetypeReflection {
                 display_name: "Boxes 2D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "half_sizes",
@@ -1810,12 +2184,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Boxes3D"),
+            ArchetypeName::from("rerun.archetypes.Boxes3D"),
             ArchetypeReflection {
                 display_name: "Boxes 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "half_sizes",
@@ -1891,12 +2264,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Capsules3D"),
+            ArchetypeName::from("rerun.archetypes.Capsules3D"),
             ArchetypeReflection {
                 display_name: "Capsules 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "lengths",
@@ -1979,12 +2351,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Clear"),
+            ArchetypeName::from("rerun.archetypes.Clear"),
             ArchetypeReflection {
                 display_name: "Clear",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView", "TimeSeriesView"],
                 fields: vec![ArchetypeFieldReflection {
                     name: "is_recursive",
                     display_name: "Is recursive",
@@ -1995,12 +2366,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.CoordinateFrame"),
+            ArchetypeName::from("rerun.archetypes.CoordinateFrame"),
             ArchetypeReflection {
                 display_name: "Coordinate frame",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![ArchetypeFieldReflection {
                     name: "frame",
                     display_name: "Frame",
@@ -2011,12 +2381,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Cylinders3D"),
+            ArchetypeName::from("rerun.archetypes.Cylinders3D"),
             ArchetypeReflection {
                 display_name: "Cylinders 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "lengths",
@@ -2099,12 +2468,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.DepthImage"),
+            ArchetypeName::from("rerun.archetypes.DepthImage"),
             ArchetypeReflection {
                 display_name: "Depth image",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "buffer",
@@ -2166,12 +2534,77 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Ellipsoids3D"),
+            ArchetypeName::from("rerun.archetypes.Ellipses2D"),
+            ArchetypeReflection {
+                display_name: "Ellipses 2D",
+                deprecation_summary: None,
+                scope: None,
+                fields: vec![
+                    ArchetypeFieldReflection {
+                        name: "half_sizes",
+                        display_name: "Half sizes",
+                        component_type: "rerun.components.HalfSize2D".into(),
+                        docstring_md: "All half-extents (semi-axes) that make up the batch of ellipses.",
+                        flags: ArchetypeFieldFlags::REQUIRED | ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "centers",
+                        display_name: "Centers",
+                        component_type: "rerun.components.Position2D".into(),
+                        docstring_md: "Optional center positions of the ellipses.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "colors",
+                        display_name: "Colors",
+                        component_type: "rerun.components.Color".into(),
+                        docstring_md: "Optional colors for the ellipses.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "line_radii",
+                        display_name: "Line radii",
+                        component_type: "rerun.components.Radius".into(),
+                        docstring_md: "Optional radii for the lines that make up the ellipses.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "labels",
+                        display_name: "Labels",
+                        component_type: "rerun.components.Text".into(),
+                        docstring_md: "Optional text labels for the ellipses.\n\nIf there's a single label present, it will be placed at the center of the entity.\nOtherwise, each instance will have its own label.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "show_labels",
+                        display_name: "Show labels",
+                        component_type: "rerun.components.ShowLabels".into(),
+                        docstring_md: "Whether the text labels should be shown.\n\nIf not set, labels will automatically appear when there is exactly one label for this entity\nor the number of instances on this entity is under a certain threshold.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "draw_order",
+                        display_name: "Draw order",
+                        component_type: "rerun.components.DrawOrder".into(),
+                        docstring_md: "An optional floating point value that specifies the 2D drawing order.\n\nObjects with higher values are drawn on top of those with lower values.\nDefaults to `10.0`.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "class_ids",
+                        display_name: "Class ids",
+                        component_type: "rerun.components.ClassId".into(),
+                        docstring_md: "Optional [`components.ClassId`](https://rerun.io/docs/reference/types/components/class_id)s for the ellipses.\n\nThe [`components.ClassId`](https://rerun.io/docs/reference/types/components/class_id) provides colors and labels if not specified explicitly.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                ],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.archetypes.Ellipsoids3D"),
             ArchetypeReflection {
                 display_name: "Ellipsoids 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "half_sizes",
@@ -2247,25 +2680,24 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.EncodedDepthImage"),
+            ArchetypeName::from("rerun.archetypes.EncodedDepthImage"),
             ArchetypeReflection {
                 display_name: "Encoded depth image",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "blob",
                         display_name: "Blob",
                         component_type: "rerun.components.Blob".into(),
-                        docstring_md: "The encoded depth payload.\n\nSupported are:\n* single channel PNG\n* RVL with ROS2 metadata (for details see <https://github.com/ros-perception/image_transport_plugins/tree/jazzy>)",
+                        docstring_md: "The encoded depth payload.\n\nSupported are:\n* single channel PNG\n* single channel TIFF with `U8`, `U16`, or `F32` samples\n* RVL with ROS2 metadata (for details see <https://github.com/ros-perception/image_transport_plugins/tree/jazzy>)",
                         flags: ArchetypeFieldFlags::REQUIRED,
                     },
                     ArchetypeFieldReflection {
                         name: "media_type",
                         display_name: "Media type",
                         component_type: "rerun.components.MediaType".into(),
-                        docstring_md: "Media type of the blob, e.g.:\n\n * `application/rvl` (RVL-compressed 16-bit)\n * `image/png`",
+                        docstring_md: "Media type of the blob, e.g.:\n\n * `application/rvl` (RVL-compressed 16-bit)\n * `image/png`\n * `image/tiff`",
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
@@ -2314,12 +2746,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.EncodedImage"),
+            ArchetypeName::from("rerun.archetypes.EncodedImage"),
             ArchetypeReflection {
                 display_name: "Encoded image",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "blob",
@@ -2360,12 +2791,63 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.GeoLineStrings"),
+            ArchetypeName::from("rerun.archetypes.GaussianSplats3D"),
+            ArchetypeReflection {
+                display_name: "Gaussian splats 3D",
+                deprecation_summary: None,
+                scope: None,
+                fields: vec![
+                    ArchetypeFieldReflection {
+                        name: "centers",
+                        display_name: "Centers",
+                        component_type: "rerun.components.Position3D".into(),
+                        docstring_md: "The centers (means) of the gaussians.",
+                        flags: ArchetypeFieldFlags::REQUIRED | ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "scales",
+                        display_name: "Scales",
+                        component_type: "rerun.components.Scale3D".into(),
+                        docstring_md: "Per-axis standard deviations of the gaussians, in scene units.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "quaternions",
+                        display_name: "Quaternions",
+                        component_type: "rerun.components.RotationQuat".into(),
+                        docstring_md: "The orientations of the gaussians.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "colors",
+                        display_name: "Colors",
+                        component_type: "rerun.components.Color".into(),
+                        docstring_md: "The base colors and opacities of the gaussians.\n\nThe RGB part is the view-independent base color, i.e. the degree-0 (DC) term of the spherical harmonics.\nThe alpha part is the peak opacity of the gaussian; the gaussian falloff further modulates it spatially.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "sh_coefficients",
+                        display_name: "Sh coefficients",
+                        component_type: "rerun.components.SphericalHarmonics3Rgb".into(),
+                        docstring_md: "Higher-order spherical harmonics coefficients for view-dependent color.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "spherical_harmonics_degree",
+                        display_name: "Spherical harmonics degree",
+                        component_type: "rerun.components.SphericalHarmonicsDegree".into(),
+                        docstring_md: "The highest spherical harmonics degree to evaluate when rendering, 0-3.\n\nLower values render faster; `0` disables view-dependent color entirely.\nIf not set, defaults to 3, i.e. all coefficients present in the data are used.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                ],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.archetypes.GeoLineStrings"),
             ArchetypeReflection {
                 display_name: "Geo line strings",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["MapView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "line_strings",
@@ -2392,12 +2874,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.GeoPoints"),
+            ArchetypeName::from("rerun.archetypes.GeoPoints"),
             ArchetypeReflection {
                 display_name: "Geo points",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["MapView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "positions",
@@ -2431,12 +2912,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.GraphEdges"),
+            ArchetypeName::from("rerun.archetypes.GraphEdges"),
             ArchetypeReflection {
                 display_name: "Graph edges",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["GraphView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "edges",
@@ -2456,12 +2936,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.GraphNodes"),
+            ArchetypeName::from("rerun.archetypes.GraphNodes"),
             ArchetypeReflection {
                 display_name: "Graph nodes",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["GraphView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "node_ids",
@@ -2509,12 +2988,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.GridMap"),
+            ArchetypeName::from("rerun.archetypes.GridMap"),
             ArchetypeReflection {
                 display_name: "Grid map",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "data",
@@ -2534,8 +3012,8 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
                         name: "cell_size",
                         display_name: "Cell size",
                         component_type: "rerun.components.CellSize".into(),
-                        docstring_md: "The scene unit size of a single grid cell (e.g. m / pixel).",
-                        flags: ArchetypeFieldFlags::REQUIRED,
+                        docstring_md: "The scene unit size of a single grid cell (e.g. m / pixel).\n\nDefaults to 0.01 scene units per pixel.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
                         name: "translation",
@@ -2583,12 +3061,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Image"),
+            ArchetypeName::from("rerun.archetypes.Image"),
             ArchetypeReflection {
                 display_name: "Image",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "buffer",
@@ -2629,12 +3106,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.InstancePoses3D"),
+            ArchetypeName::from("rerun.archetypes.InstancePoses3D"),
             ArchetypeReflection {
                 display_name: "Instance poses 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "translations",
@@ -2675,12 +3151,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.LineStrips2D"),
+            ArchetypeName::from("rerun.archetypes.LineStrips2D"),
             ArchetypeReflection {
                 display_name: "Line strips 2D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "strips",
@@ -2735,12 +3210,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.LineStrips3D"),
+            ArchetypeName::from("rerun.archetypes.LineStrips3D"),
             ArchetypeReflection {
                 display_name: "Line strips 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "strips",
@@ -2760,7 +3234,7 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
                         name: "colors",
                         display_name: "Colors",
                         component_type: "rerun.components.Color".into(),
-                        docstring_md: "Optional colors for the line strips.",
+                        docstring_md: "Optional colors for the line strips.\n\nThe alpha channel is ignored.",
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
@@ -2788,12 +3262,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.McapChannel"),
+            ArchetypeName::from("rerun.archetypes.McapChannel"),
             ArchetypeReflection {
                 display_name: "Mcap channel",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "id",
@@ -2827,12 +3300,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.McapMessage"),
+            ArchetypeName::from("rerun.archetypes.McapMessage"),
             ArchetypeReflection {
                 display_name: "Mcap message",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "data",
                     display_name: "Data",
@@ -2843,12 +3315,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.McapSchema"),
+            ArchetypeName::from("rerun.archetypes.McapSchema"),
             ArchetypeReflection {
                 display_name: "Mcap schema",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "id",
@@ -2882,12 +3353,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.McapStatistics"),
+            ArchetypeName::from("rerun.archetypes.McapStatistics"),
             ArchetypeReflection {
                 display_name: "Mcap statistics",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "message_count",
@@ -2956,12 +3426,84 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Mesh3D"),
+            ArchetypeName::from("rerun.archetypes.Measurements"),
+            ArchetypeReflection {
+                display_name: "Measurements",
+                deprecation_summary: None,
+                scope: None,
+                fields: vec![
+                    ArchetypeFieldReflection {
+                        name: "values",
+                        display_name: "Values",
+                        component_type: "rerun.components.Scalar".into(),
+                        docstring_md: "The measured scalar values.",
+                        flags: ArchetypeFieldFlags::REQUIRED,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "variances",
+                        display_name: "Variances",
+                        component_type: "rerun.components.Variance".into(),
+                        docstring_md: "Variances of the measurements (σ², in the units of `values` squared).\n\nWhen set, length is expected to match `values`.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "units",
+                        display_name: "Units",
+                        component_type: "rerun.components.Unit".into(),
+                        docstring_md: "Units of the measurements, shown in the legend and in tooltips.\n\nWhen set, length is expected to match `values`.\nExpected to be unchanging over time.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "colors",
+                        display_name: "Colors",
+                        component_type: "rerun.components.Color".into(),
+                        docstring_md: "Color for the corresponding series.\n\nMay change over time, but can cause discontinuities in the line.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "widths",
+                        display_name: "Widths",
+                        component_type: "rerun.components.StrokeWidth".into(),
+                        docstring_md: "Stroke width for the corresponding series.\n\nMay change over time, but can cause discontinuities in the line.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "names",
+                        display_name: "Names",
+                        component_type: "rerun.components.Name".into(),
+                        docstring_md: "Display name of the series.\n\nUsed in the legend. Expected to be unchanging over time.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "visible_series",
+                        display_name: "Visible series",
+                        component_type: "rerun.components.Visible".into(),
+                        docstring_md: "Which series are visible.\n\nIf not set, all series on this entity are visible.\nUnlike with the regular visibility property of the entire entity, any series that is hidden\nvia this property will still be visible in the legend.\n\nMay change over time, but can cause discontinuities in the line.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "aggregation_policy",
+                        display_name: "Aggregation policy",
+                        component_type: "rerun.components.AggregationPolicy".into(),
+                        docstring_md: "Configures the zoom-dependent scalar aggregation.\n\nThis is done only if steps on the X axis go below a single pixel,\ni.e. a single pixel covers more than one tick worth of data. It can greatly improve performance\n(and readability) in such situations as it prevents overdraw.\n\nExpected to be unchanging over time.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "interpolation_mode",
+                        display_name: "Interpolation mode",
+                        component_type: "rerun.components.InterpolationMode".into(),
+                        docstring_md: "Specifies how values between data points are interpolated.\n\nDefaults to linear interpolation. Use one of the `Step*` variants for a stepped (staircase) line.\n\nExpected to be unchanging over time.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                ],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.archetypes.Mesh3D"),
             ArchetypeReflection {
                 display_name: "Mesh 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "vertex_positions",
@@ -3037,12 +3579,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Pinhole"),
+            ArchetypeName::from("rerun.archetypes.Pinhole"),
             ArchetypeReflection {
                 display_name: "Pinhole",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "image_from_camera",
@@ -3062,7 +3603,7 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
                         name: "camera_xyz",
                         display_name: "Camera xyz",
                         component_type: "rerun.components.ViewCoordinates".into(),
-                        docstring_md: "Sets the view coordinates for the camera.\n\nAll common values are available as constants on the [`components.ViewCoordinates`](https://rerun.io/docs/reference/types/components/view_coordinates) class.\n\nThe default is `ViewCoordinates::RDF`, i.e. X=Right, Y=Down, Z=Forward, and this is also the recommended setting.\nThis means that the camera frustum will point along the positive Z axis of the parent space,\nand the cameras \"up\" direction will be along the negative Y axis of the parent space.\n\nThe camera frustum will point whichever axis is set to `F` (or the opposite of `B`).\nWhen logging a depth image under this entity, this is the direction the point cloud will be projected.\nWith `RDF`, the default forward is +Z.\n\nThe frustum's \"up\" direction will be whichever axis is set to `U` (or the opposite of `D`).\nThis will match the negative Y direction of pixel space (all images are assumed to have xyz=RDF).\nWith `RDF`, the default is up is -Y.\n\nThe frustum's \"right\" direction will be whichever axis is set to `R` (or the opposite of `L`).\nThis will match the positive X direction of pixel space (all images are assumed to have xyz=RDF).\nWith `RDF`, the default right is +x.\n\nOther common formats are `RUB` (X=Right, Y=Up, Z=Back) and `FLU` (X=Forward, Y=Left, Z=Up).\n\nNOTE: setting this to something else than `RDF` (the default) will change the orientation of the camera frustum,\nand make the pinhole matrix not match up with the coordinate system of the pinhole entity.\n\nThe pinhole matrix (the `image_from_camera` argument) always project along the third (Z) axis,\nbut will be re-oriented to project along the forward axis of the `camera_xyz` argument.",
+                        docstring_md: "Sets the camera orientation convention.\n\nAll common values are available as constants on the [`components.ViewCoordinates`](https://rerun.io/docs/reference/types/components/view_coordinates) class.\n\nThe default is `ViewCoordinates::RDF`: +X is right, +Y is down, and +Z is forward.\nThis makes the camera frustum point along +Z in the parent space, with its up direction along -Y.\n\nThe camera frustum points along the axis set to `F`, or opposite the axis set to `B`.\nWhen logging a depth image under this entity, this is the direction in which the point cloud is projected.\n\nThe frustum's up direction is the axis set to `U`, or opposite the axis set to `D`.\nThis matches the -Y direction of pixel space, where all images use RDF coordinates.\n\nThe frustum's right direction is the axis set to `R`, or opposite the axis set to `L`.\nThis matches the +X direction of pixel space.\n\nOther common formats are `RUB` (X=Right, Y=Up, Z=Back) and `FLU` (X=Forward, Y=Left, Z=Up).\n\n`image_from_camera` is always defined to project along +Z in camera coordinates.\n`camera_xyz` reorients that projection to the forward axis of the pinhole entity.",
                         flags: ArchetypeFieldFlags::empty(),
                     },
                     ArchetypeFieldReflection {
@@ -3104,12 +3645,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Points2D"),
+            ArchetypeName::from("rerun.archetypes.Points2D"),
             ArchetypeReflection {
                 display_name: "Points 2D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "positions",
@@ -3171,12 +3711,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Points3D"),
+            ArchetypeName::from("rerun.archetypes.Points3D"),
             ArchetypeReflection {
                 display_name: "Points 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "positions",
@@ -3196,7 +3735,7 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
                         name: "colors",
                         display_name: "Colors",
                         component_type: "rerun.components.Color".into(),
-                        docstring_md: "Optional colors for the points.",
+                        docstring_md: "Optional colors for the points.\n\nBy default, the alpha channel affects brightness rather than transparency.\nTODO(#1611): To use the alpha channel for transparency, enable the experimental \"Transparent point clouds\" feature flag.",
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
@@ -3211,6 +3750,13 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
                         display_name: "Show labels",
                         component_type: "rerun.components.ShowLabels".into(),
                         docstring_md: "Whether the text labels should be shown.\n\nIf not set, labels will automatically appear when there is exactly one label for this entity\nor the number of instances on this entity is under a certain threshold.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "point_shading",
+                        display_name: "Point shading",
+                        component_type: "rerun.components.PointShading".into(),
+                        docstring_md: "How points should be shaded.\n\nIf not set, points are rendered with [`components.PointShading#Gradient`](https://rerun.io/docs/reference/types/components/point_shading) by default.",
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
@@ -3231,12 +3777,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.RecordingInfo"),
+            ArchetypeName::from("rerun.archetypes.RecordingInfo"),
             ArchetypeReflection {
                 display_name: "Recording info",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "start_time",
@@ -3256,12 +3801,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Scalars"),
+            ArchetypeName::from("rerun.archetypes.Scalars"),
             ArchetypeReflection {
                 display_name: "Scalars",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["TimeSeriesView"],
                 fields: vec![ArchetypeFieldReflection {
                     name: "scalars",
                     display_name: "Scalars",
@@ -3272,12 +3816,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.SegmentationImage"),
+            ArchetypeName::from("rerun.archetypes.SegmentationImage"),
             ArchetypeReflection {
                 display_name: "Segmentation image",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "buffer",
@@ -3311,12 +3854,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.SeriesLines"),
+            ArchetypeName::from("rerun.archetypes.SeriesLines"),
             ArchetypeReflection {
                 display_name: "Series lines",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["TimeSeriesView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "colors",
@@ -3364,12 +3906,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.SeriesPoints"),
+            ArchetypeName::from("rerun.archetypes.SeriesPoints"),
             ArchetypeReflection {
                 display_name: "Series points",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["TimeSeriesView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "colors",
@@ -3410,12 +3951,64 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Tensor"),
+            ArchetypeName::from("rerun.archetypes.StateChange"),
+            ArchetypeReflection {
+                display_name: "State change",
+                deprecation_summary: None,
+                scope: None,
+                fields: vec![ArchetypeFieldReflection {
+                    name: "state",
+                    display_name: "State",
+                    component_type: "rerun.components.Text".into(),
+                    docstring_md: "The new state values; each instance gets its own lane in the state timeline view.\n\nA reset ends the previous state and shows a gap in the state timeline view until the\nnext state. An empty string, a null array entry, and an empty state array (e.g. from\nclearing the field) all act as resets.\n\nThe length of the state array should not change over time.",
+                    flags: ArchetypeFieldFlags::REQUIRED | ArchetypeFieldFlags::UI_EDITABLE,
+                }],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.archetypes.StateConfiguration"),
+            ArchetypeReflection {
+                display_name: "State configuration",
+                deprecation_summary: None,
+                scope: None,
+                fields: vec![
+                    ArchetypeFieldReflection {
+                        name: "values",
+                        display_name: "Values",
+                        component_type: "rerun.components.Text".into(),
+                        docstring_md: "The raw state values that this configuration applies to.\n\nEach entry defines a known state value. The order determines the mapping to\n`labels`, `colors`, and `visible` (by index).",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "labels",
+                        display_name: "Labels",
+                        component_type: "rerun.components.Text".into(),
+                        docstring_md: "Display labels for each state value.\n\nIf provided, the label at index `i` is shown instead of the raw value at index `i`.\nIf not provided or shorter than `values`, the raw value is used as the label.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "colors",
+                        display_name: "Colors",
+                        component_type: "rerun.components.Color".into(),
+                        docstring_md: "Colors for each state value.\n\nIf provided, the color at index `i` is used for the state at index `i`.\nIf not provided, colors are assigned automatically from a built-in palette.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "visible",
+                        display_name: "Visible",
+                        component_type: "rerun.components.Visible".into(),
+                        docstring_md: "Visibility for each state value.\n\nIf provided, the visibility at index `i` controls whether the state at index `i` is shown.\nIf not provided, all state values are visible.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                ],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.archetypes.Tensor"),
             ArchetypeReflection {
                 display_name: "Tensor",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["TensorView", "BarChartView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "data",
@@ -3435,12 +4028,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.TextDocument"),
+            ArchetypeName::from("rerun.archetypes.TextDocument"),
             ArchetypeReflection {
                 display_name: "Text document",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["TextDocumentView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "text",
@@ -3460,12 +4052,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.TextLog"),
+            ArchetypeName::from("rerun.archetypes.TextLog"),
             ArchetypeReflection {
                 display_name: "Text log",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["TextLogView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "text",
@@ -3492,12 +4083,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.Transform3D"),
+            ArchetypeName::from("rerun.archetypes.Transform3D"),
             ArchetypeReflection {
                 display_name: "Transform 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView", "Spatial2DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "translation",
@@ -3552,19 +4142,18 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
                         name: "parent_frame",
                         display_name: "Parent frame",
                         component_type: "rerun.components.TransformFrameId".into(),
-                        docstring_md: "The parent frame this transform transforms into.\n\nIf not specified, this is set to the implicit transform frame of the current entity path's parent.\nThis means that if a [`archetypes.Transform3D`](https://rerun.io/docs/reference/types/archetypes/transform3d) is set on an entity called `/my/entity/path` then this will default to `tf#/my/entity`.\n\nTo set the frame an entity is part of see [`archetypes.CoordinateFrame`](https://rerun.io/docs/reference/types/archetypes/coordinate_frame).\n\nAny update to this field will reset all other transform properties that aren't changed in the same log call or `send_columns` row.",
+                        docstring_md: "The parent frame this transform transforms into.\n\nAny child frame has exactly one parent frame at any point in time, so logging a different `parent_frame` for a known `child_frame` replaces the previous relationship.\n\nIf not specified, this is set to the implicit transform frame of the current entity path's parent.\nThis means that if a [`archetypes.Transform3D`](https://rerun.io/docs/reference/types/archetypes/transform3d) is set on an entity called `/my/entity/path` then this will default to `tf#/my/entity`.\n\nTo set the frame an entity is part of see [`archetypes.CoordinateFrame`](https://rerun.io/docs/reference/types/archetypes/coordinate_frame).\n\nAny update to this field will reset all other transform properties that aren't changed in the same log call or `send_columns` row.",
                         flags: ArchetypeFieldFlags::empty(),
                     },
                 ],
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.TransformAxes3D"),
+            ArchetypeName::from("rerun.archetypes.TransformAxes3D"),
             ArchetypeReflection {
                 display_name: "Transform axes 3D",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "axis_length",
@@ -3584,12 +4173,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.VideoFrameReference"),
+            ArchetypeName::from("rerun.archetypes.VideoFrameReference"),
             ArchetypeReflection {
                 display_name: "Video frame reference",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "timestamp",
@@ -3602,7 +4190,7 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
                         name: "video_reference",
                         display_name: "Video reference",
                         component_type: "rerun.components.EntityPath".into(),
-                        docstring_md: "Optional reference to an entity with a [`archetypes.AssetVideo`](https://rerun.io/docs/reference/types/archetypes/asset_video).\n\nIf none is specified, the video is assumed to be at the same entity.\nNote that blueprint overrides on the referenced video will be ignored regardless,\nas this is always interpreted as a reference to the data store.\n\nFor a series of video frame references, it is recommended to specify this path only once\nat the beginning of the series and then rely on latest-at query semantics to\nkeep the video reference active.",
+                        docstring_md: "Optional reference to an entity with an [`archetypes.AssetVideo`](https://rerun.io/docs/reference/types/archetypes/asset_video) or [`archetypes.VideoStream`](https://rerun.io/docs/reference/types/archetypes/video_stream).\n\nIf none is specified, the video is assumed to be at the same entity.\nNote that blueprint overrides on the referenced video will be ignored regardless,\nas this is always interpreted as a reference to the data store.\n\nFor a series of video frame references, it is recommended to specify this path only once\nat the beginning of the series and then rely on latest-at query semantics to\nkeep the video reference active.",
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
@@ -3623,12 +4211,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.VideoStream"),
+            ArchetypeName::from("rerun.archetypes.VideoStream"),
             ArchetypeReflection {
                 display_name: "Video stream",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial2DView", "Spatial3DView"],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "codec",
@@ -3642,6 +4229,13 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
                         display_name: "Sample",
                         component_type: "rerun.components.VideoSample".into(),
                         docstring_md: "Video sample data (also known as \"video chunk\").\n\nThe current timestamp is used as presentation timestamp (PTS) for all data in this sample.\nThere is currently no way to log differing decoding timestamps, meaning\nthat there is no support for B-frames.\nSee <https://github.com/rerun-io/rerun/issues/10090> for more details.\n\nRerun chunks containing frames (i.e. bundles of sample data) may arrive out of order,\nbut may cause the video playback in the Viewer to reset.\nIt is recommended to have all chunks for a video stream to be ordered temporally order.\n\nLogging separate videos on the same entity is allowed iff they share the exact same\ncodec parameters & resolution.\n\nThe samples are expected to be encoded using the `codec` field.\nEach video sample must contain enough data for exactly one video frame\n(this restriction may be relaxed in the future for some codecs).\n\nUnless your stream consists entirely of key-frames (in which case you should consider [`archetypes.EncodedImage`](https://rerun.io/docs/reference/types/archetypes/encoded_image))\nnever log this component as static data as this means that you loose all information of\nprevious samples which may be required to decode an image.\n\nSee [`components.VideoCodec`](https://rerun.io/docs/reference/types/components/video_codec) for codec specific requirements.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "is_keyframe",
+                        display_name: "Is keyframe",
+                        component_type: "rerun.components.IsKeyframe".into(),
+                        docstring_md: "Whether the corresponding [`components.VideoSample`](https://rerun.io/docs/reference/types/components/video_sample) contains a keyframe.\n\nA keyframe (also known as a sync sample or IDR) is a frame from which a decoder can\nstart decoding the stream with no prior decoder state. See [`components.IsKeyframe`](https://rerun.io/docs/reference/types/components/is_keyframe)\nand [`components.VideoCodec`](https://rerun.io/docs/reference/types/components/video_codec) for the codec-specific definition.\n\nThis field is optional. It does not change how the stream itself is decoded: it is\nmetadata that travels with the sample and can be inspected when querying the data\nback, for example to locate sync points or build a frame index.",
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
@@ -3662,12 +4256,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.archetypes.ViewCoordinates"),
+            ArchetypeName::from("rerun.archetypes.ViewCoordinates"),
             ArchetypeReflection {
                 display_name: "View coordinates",
                 deprecation_summary: None,
                 scope: None,
-                view_types: &["Spatial3DView"],
                 fields: vec![ArchetypeFieldReflection {
                     name: "xyz",
                     display_name: "Xyz",
@@ -3678,12 +4271,157 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.ActiveVisualizers"),
+            ArchetypeName::from("rerun.archetypes.Volume3D"),
+            ArchetypeReflection {
+                display_name: "Volume 3D",
+                deprecation_summary: None,
+                scope: None,
+                fields: vec![
+                    ArchetypeFieldReflection {
+                        name: "values",
+                        display_name: "Values",
+                        component_type: "rerun.components.TensorData".into(),
+                        docstring_md: "The scalar value of each voxel, as a 3D tensor with dimensions ordered `[z, y, x]`.\n\nCurrently only `f16` are supported.",
+                        flags: ArchetypeFieldFlags::REQUIRED,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "voxel_size",
+                        display_name: "Voxel size",
+                        component_type: "rerun.components.VoxelSize".into(),
+                        docstring_md: "The scene-unit dimensions of a single voxel cell.\n\nThis defines the voxel size along the local grid X/Y/Z axes, and thus the total extent of the\nvolume: `[width, height, depth] * voxel_size`.\nAnisotropic spacing (as is common for medical scans) is expressed here.\nEach dimension must be finite and positive.\n\nDefaults to `[1.0, 1.0, 1.0]`.",
+                        flags: ArchetypeFieldFlags::empty(),
+                    },
+                    ArchetypeFieldReflection {
+                        name: "translation",
+                        display_name: "Translation",
+                        component_type: "rerun.components.Translation3D".into(),
+                        docstring_md: "Translation of the minimum corner of voxel `[0, 0, 0]`.\n\nTogether with [`components.RotationQuat`](https://rerun.io/docs/reference/types/components/rotation_quat), this defines the pose of the volume\nrelative to the entity's coordinate frame.\n\nIf not set, the minimum corner is placed at the origin of the entity's coordinate frame.",
+                        flags: ArchetypeFieldFlags::empty(),
+                    },
+                    ArchetypeFieldReflection {
+                        name: "quaternion",
+                        display_name: "Quaternion",
+                        component_type: "rerun.components.RotationQuat".into(),
+                        docstring_md: "Rotation of the volume via quaternion.\n\nTogether with [`components.Translation3D`](https://rerun.io/docs/reference/types/components/translation3d), this defines the pose of the volume\nrelative to the entity's coordinate frame.\nThe rotation is around the minimum corner of voxel `[0, 0, 0]`, and is applied before the\ntranslation.",
+                        flags: ArchetypeFieldFlags::empty(),
+                    },
+                    ArchetypeFieldReflection {
+                        name: "value_range",
+                        display_name: "Value range",
+                        component_type: "rerun.components.ValueRange".into(),
+                        docstring_md: "The inclusive range of voxel values to render.\n\nValues outside the range are ignored.\n\nIf not specified, the range is automatically estimated from the data.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "gamma",
+                        display_name: "Gamma",
+                        component_type: "rerun.components.GammaCorrection".into(),
+                        docstring_md: "Gamma correction applied to normalized voxel values before colormapping and opacity calculation.\n\nThe corrected density is `normalized_value ^ gamma`.\nMust be finite and positive.\nDefaults to 3.0, suppressing low-density material and emphasizing dense structures.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "colormap",
+                        display_name: "Colormap",
+                        component_type: "rerun.components.Colormap".into(),
+                        docstring_md: "Colormap applied to the values after mapping them through `value_range` and gamma correction.\n\nDefaults to Turbo.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "optical_density",
+                        display_name: "Optical density",
+                        component_type: "rerun.components.OpticalDensity".into(),
+                        docstring_md: "Dimensionless optical depth for the volume.\n\nFor a uniform volume at the upper bound of `value_range`, this is the optical depth across one full volume-local axis.\nZero is transparent, one is about 63% opaque, and larger values are denser.\n\nDefaults to 1.0.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                ],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.archetypes.VoxelGridMap"),
+            ArchetypeReflection {
+                display_name: "Voxel grid map",
+                deprecation_summary: None,
+                scope: None,
+                fields: vec![
+                    ArchetypeFieldReflection {
+                        name: "voxel_indices",
+                        display_name: "Voxel indices",
+                        component_type: "rerun.components.VoxelIndex".into(),
+                        docstring_md: "Indices of the voxels within the grid volume.",
+                        flags: ArchetypeFieldFlags::REQUIRED,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "voxel_size",
+                        display_name: "Voxel size",
+                        component_type: "rerun.components.VoxelSize".into(),
+                        docstring_md: "The scene-unit dimensions of a single voxel cell.\n\nThis defines the voxel size along the local grid X/Y/Z axes.\nEach dimension must be finite and positive.",
+                        flags: ArchetypeFieldFlags::REQUIRED,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "values",
+                        display_name: "Values",
+                        component_type: "rerun.components.VoxelValue".into(),
+                        docstring_md: "Optional scalar occupancy or value data for each voxel.\n\nIf explicit colors are not provided, values are mapped through `colormap` and `value_range`.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "colors",
+                        display_name: "Colors",
+                        component_type: "rerun.components.Color".into(),
+                        docstring_md: "Optional colors for each voxel.\n\nIf set, these colors take precedence over color-mapped scalar values.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "translation",
+                        display_name: "Translation",
+                        component_type: "rerun.components.Translation3D".into(),
+                        docstring_md: "Translation of the minimum corner of voxel `[0, 0, 0]`.\n\nTogether with [`components.RotationAxisAngle`](https://rerun.io/docs/reference/types/components/rotation_axis_angle) or [`components.RotationQuat`](https://rerun.io/docs/reference/types/components/rotation_quat), this defines the pose of the\ngrid relative to the map's parent coordinate frame.\n\nIf not set, the minimum corner is placed at the origin of the map's parent coordinate frame.",
+                        flags: ArchetypeFieldFlags::empty(),
+                    },
+                    ArchetypeFieldReflection {
+                        name: "rotation_axis_angle",
+                        display_name: "Rotation axis angle",
+                        component_type: "rerun.components.RotationAxisAngle".into(),
+                        docstring_md: "Rotation of the grid via axis + angle.\n\nTogether with [`components.Translation3D`](https://rerun.io/docs/reference/types/components/translation3d), this defines the pose of the grid relative to the\nmap's parent coordinate frame.\n\nNote: either this or [`components.RotationQuat`](https://rerun.io/docs/reference/types/components/rotation_quat) can be set to specify the grid's rotation, but not both.\nIf both this and [`components.RotationQuat`](https://rerun.io/docs/reference/types/components/rotation_quat) are set, this is ignored in favor of the quaternion.",
+                        flags: ArchetypeFieldFlags::empty(),
+                    },
+                    ArchetypeFieldReflection {
+                        name: "quaternion",
+                        display_name: "Quaternion",
+                        component_type: "rerun.components.RotationQuat".into(),
+                        docstring_md: "Rotation of the grid via quaternion.\n\nTogether with [`components.Translation3D`](https://rerun.io/docs/reference/types/components/translation3d), this defines the pose of the grid relative to the\nmap's parent coordinate frame.",
+                        flags: ArchetypeFieldFlags::empty(),
+                    },
+                    ArchetypeFieldReflection {
+                        name: "opacity",
+                        display_name: "Opacity",
+                        component_type: "rerun.components.Opacity".into(),
+                        docstring_md: "Opacity of the voxels after color or colormap application.\n\nDefaults to 1.0 (fully opaque).",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "value_range",
+                        display_name: "Value range",
+                        component_type: "rerun.components.ValueRange".into(),
+                        docstring_md: "Scalar value range for color-mapping.\n\nDefaults to `[0.0, 1.0]`.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "colormap",
+                        display_name: "Colormap",
+                        component_type: "rerun.components.Colormap".into(),
+                        docstring_md: "Colormap to use when `values` are present and explicit `colors` are not provided.\n\nDefaults to Turbo.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                ],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.blueprint.archetypes.ActiveVisualizers"),
             ArchetypeReflection {
                 display_name: "Active visualizers",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "instruction_ids",
                     display_name: "Instruction ids",
@@ -3694,12 +4432,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.Background"),
+            ArchetypeName::from("rerun.blueprint.archetypes.Background"),
             ArchetypeReflection {
                 display_name: "Background",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "kind",
@@ -3719,12 +4456,42 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.ContainerBlueprint"),
+            ArchetypeName::from("rerun.blueprint.archetypes.CardLayout"),
+            ArchetypeReflection {
+                display_name: "Card layout",
+                deprecation_summary: None,
+                scope: Some("blueprint"),
+                fields: vec![
+                    ArchetypeFieldReflection {
+                        name: "title",
+                        display_name: "Title",
+                        component_type: "rerun.blueprint.components.ColumnName".into(),
+                        docstring_md: "The source column used for card titles.\n\nIf unset, the first visible string column is used as the title.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "link",
+                        display_name: "Link",
+                        component_type: "rerun.blueprint.components.ColumnName".into(),
+                        docstring_md: "The source column containing the target opened when a card is activated.\n\nIf unset, the first configured preview field is used, then the first inferred URL column.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "field_order",
+                        display_name: "Field order",
+                        component_type: "rerun.blueprint.components.ColumnName".into(),
+                        docstring_md: "Source columns visible by default in each card, in display order.\n\nUnlisted fields are hidden unless their archetypes.TableColumn visibility overrides the default.\nEach source column may appear at most once.\n\nFields with `TableCellKind::Flag` are omitted from the labeled-field list and the first one is shown in the card header.\nCard layouts currently support at most one flag field.",
+                        flags: ArchetypeFieldFlags::REQUIRED | ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                ],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.blueprint.archetypes.ContainerBlueprint"),
             ArchetypeReflection {
                 display_name: "Container blueprint",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "container_kind",
@@ -3786,12 +4553,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.DataframeQuery"),
+            ArchetypeName::from("rerun.blueprint.archetypes.DataframeQuery"),
             ArchetypeReflection {
                 display_name: "Dataframe query",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "timeline",
@@ -3846,12 +4612,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.EntityBehavior"),
+            ArchetypeName::from("rerun.blueprint.archetypes.EntityBehavior"),
             ArchetypeReflection {
                 display_name: "Entity behavior",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "interactive",
@@ -3871,12 +4636,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.EyeControls3D"),
+            ArchetypeName::from("rerun.blueprint.archetypes.EyeControls3D"),
             ArchetypeReflection {
                 display_name: "Eye controls 3D",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "kind",
@@ -3931,12 +4695,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.ForceCenter"),
+            ArchetypeName::from("rerun.blueprint.archetypes.ForceCenter"),
             ArchetypeReflection {
                 display_name: "Force center",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "enabled",
@@ -3956,12 +4719,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.ForceCollisionRadius"),
+            ArchetypeName::from("rerun.blueprint.archetypes.ForceCollisionRadius"),
             ArchetypeReflection {
                 display_name: "Force collision radius",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "enabled",
@@ -3988,12 +4750,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.ForceLink"),
+            ArchetypeName::from("rerun.blueprint.archetypes.ForceLink"),
             ArchetypeReflection {
                 display_name: "Force link",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "enabled",
@@ -4020,12 +4781,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.ForceManyBody"),
+            ArchetypeName::from("rerun.blueprint.archetypes.ForceManyBody"),
             ArchetypeReflection {
                 display_name: "Force many body",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "enabled",
@@ -4045,12 +4805,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.ForcePosition"),
+            ArchetypeName::from("rerun.blueprint.archetypes.ForcePosition"),
             ArchetypeReflection {
                 display_name: "Force position",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "enabled",
@@ -4077,12 +4836,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.GraphBackground"),
+            ArchetypeName::from("rerun.blueprint.archetypes.GraphBackground"),
             ArchetypeReflection {
                 display_name: "Graph background",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "color",
                     display_name: "Color",
@@ -4093,12 +4851,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.LineGrid3D"),
+            ArchetypeName::from("rerun.blueprint.archetypes.LineGrid3D"),
             ArchetypeReflection {
                 display_name: "Line grid 3D",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "visible",
@@ -4118,7 +4875,7 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
                         name: "plane",
                         display_name: "Plane",
                         component_type: "rerun.components.Plane3D".into(),
-                        docstring_md: "In what plane the grid is drawn.\n\nDefaults to whatever plane is determined as the plane at zero units up/down as defined by [`components.ViewCoordinates`](https://rerun.io/docs/reference/types/components/view_coordinates) if present.",
+                        docstring_md: "In what plane the grid is drawn.\n\nDefaults to the plane at zero units along the up/down axis defined by archetypes.SpatialInformation's axes property.",
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
@@ -4139,12 +4896,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.MapBackground"),
+            ArchetypeName::from("rerun.blueprint.archetypes.MapBackground"),
             ArchetypeReflection {
                 display_name: "Map background",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "provider",
                     display_name: "Provider",
@@ -4155,12 +4911,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.MapZoom"),
+            ArchetypeName::from("rerun.blueprint.archetypes.MapZoom"),
             ArchetypeReflection {
                 display_name: "Map zoom",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "zoom",
                     display_name: "Zoom",
@@ -4171,12 +4926,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.NearClipPlane"),
+            ArchetypeName::from("rerun.blueprint.archetypes.NearClipPlane"),
             ArchetypeReflection {
                 display_name: "Near clip plane",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "near_clip_plane",
                     display_name: "Near clip plane",
@@ -4187,12 +4941,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.PanelBlueprint"),
+            ArchetypeName::from("rerun.blueprint.archetypes.PanelBlueprint"),
             ArchetypeReflection {
                 display_name: "Panel blueprint",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "state",
                     display_name: "State",
@@ -4203,12 +4956,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.PlotBackground"),
+            ArchetypeName::from("rerun.blueprint.archetypes.PlotBackground"),
             ArchetypeReflection {
                 display_name: "Plot background",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "color",
@@ -4228,12 +4980,35 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.PlotLegend"),
+            ArchetypeName::from("rerun.blueprint.archetypes.PlotInteraction"),
+            ArchetypeReflection {
+                display_name: "Plot interaction",
+                deprecation_summary: None,
+                scope: Some("blueprint"),
+                fields: vec![
+                    ArchetypeFieldReflection {
+                        name: "tooltip_mode",
+                        display_name: "Tooltip mode",
+                        component_type: "rerun.blueprint.components.TooltipMode".into(),
+                        docstring_md: "How the tooltip behaves when hovering over the plot.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "points_display",
+                        display_name: "Points display",
+                        component_type: "rerun.blueprint.components.PointsDisplay".into(),
+                        docstring_md: "When data point markers are displayed on line series.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                ],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.blueprint.archetypes.PlotLegend"),
             ArchetypeReflection {
                 display_name: "Plot legend",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "corner",
@@ -4253,12 +5028,26 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.ScalarAxis"),
+            ArchetypeName::from("rerun.blueprint.archetypes.PreviewsConfig"),
+            ArchetypeReflection {
+                display_name: "Previews config",
+                deprecation_summary: None,
+                scope: Some("blueprint"),
+                fields: vec![ArchetypeFieldReflection {
+                    name: "timeline",
+                    display_name: "Timeline",
+                    component_type: "rerun.blueprint.components.TimelineName".into(),
+                    docstring_md: "The timeline used by every preview cell.\n\nIf left empty a timeline is automatically picked, preferring custom over built-in.",
+                    flags: ArchetypeFieldFlags::UI_EDITABLE,
+                }],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.blueprint.archetypes.ScalarAxis"),
             ArchetypeReflection {
                 display_name: "Scalar axis",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "range",
@@ -4278,18 +5067,24 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.SpatialInformation"),
+            ArchetypeName::from("rerun.blueprint.archetypes.SpatialInformation"),
             ArchetypeReflection {
                 display_name: "Spatial information",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "target_frame",
                         display_name: "Target frame",
                         component_type: "rerun.components.TransformFrameId".into(),
                         docstring_md: "The target reference frame for all transformations.\n\nDefaults to the coordinate frame used by the space origin entity.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "show_bounding_box",
+                        display_name: "Show bounding box",
+                        component_type: "rerun.blueprint.components.Enabled".into(),
+                        docstring_md: "Whether the bounding box should be shown.",
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
@@ -4300,22 +5095,104 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
-                        name: "show_bounding_box",
-                        display_name: "Show bounding box",
-                        component_type: "rerun.blueprint.components.Enabled".into(),
-                        docstring_md: "Whether the bounding box should be shown.",
+                        name: "axes",
+                        display_name: "Axes",
+                        component_type: "rerun.components.ViewCoordinates".into(),
+                        docstring_md: "Controls the orientation of the axes in a 3D view; it has no effect in a 2D view.\n\nThis determines the 3D eye orientation, navigation, and default grid plane.\n\nThe three directions are always ordered as [x, y, z] and specify where each positive axis points.\nFor example, [Right, Down, Forward] means that +X points right, +Y points down, and +Z points forward.\n\nWhen this property is unset, a 3D view first uses [`archetypes.ViewCoordinates`](https://rerun.io/docs/reference/types/archetypes/view_coordinates) logged at its origin entity or the closest ancestor.\nIf none is found, it uses the camera orientation from the closest ancestor [`archetypes.Pinhole`](https://rerun.io/docs/reference/types/archetypes/pinhole).\nIf neither is found, the fallback is RFU.\n\nThis property is hidden from the selection panel for 2D views.\n\n⚠ [Rerun does not yet support left-handed coordinate systems](https://github.com/rerun-io/rerun/issues/5032).",
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                 ],
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.TensorScalarMapping"),
+            ArchetypeName::from("rerun.blueprint.archetypes.TableBlueprint"),
+            ArchetypeReflection {
+                display_name: "Table blueprint",
+                deprecation_summary: None,
+                scope: Some("blueprint"),
+                fields: vec![ArchetypeFieldReflection {
+                    name: "layout",
+                    display_name: "Layout",
+                    component_type: "rerun.blueprint.components.TableLayoutKind".into(),
+                    docstring_md: "The currently selected layout.\n\nIf unset, defaults to card layout if available.\n`Cards` falls back to table layout when no archetypes.CardLayout is configured.",
+                    flags: ArchetypeFieldFlags::UI_EDITABLE,
+                }],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.blueprint.archetypes.TableColumn"),
+            ArchetypeReflection {
+                display_name: "Table column",
+                deprecation_summary: None,
+                scope: Some("blueprint"),
+                fields: vec![
+                    ArchetypeFieldReflection {
+                        name: "name",
+                        display_name: "Name",
+                        component_type: "rerun.components.Name".into(),
+                        docstring_md: "The name shown for the column.\n\nIf unset, the name is inferred from the source column.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "editable",
+                        display_name: "Editable",
+                        component_type: "rerun.blueprint.components.Editable".into(),
+                        docstring_md: "Whether the column's values can be edited.\n\nIf unset, editing is disabled.\nEdits require a remote table with a column marked by `rerun:is_table_index` metadata and write permission.\n⚠ Currently only boolean values with `cell_kind` set to `Flag` are supported.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "visible",
+                        display_name: "Visible",
+                        component_type: "rerun.components.Visible".into(),
+                        docstring_md: "Whether the column is visible in this layout.\n\nIf unset, the enclosing layout determines visibility.\nColumns listed in the enclosing layout's `column_order` or `field_order` are shown.\nUnlisted columns use the viewer default for table layouts and are hidden in card layouts.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "cell_kind",
+                        display_name: "Cell kind",
+                        component_type: "rerun.blueprint.components.TableCellKind".into(),
+                        docstring_md: "How to render the column's values.\n\nIf unset or `Auto`, the viewer infers the renderer from the component or Arrow datatype.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                ],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.blueprint.archetypes.TableColumnPreview"),
+            ArchetypeReflection {
+                display_name: "Table column preview",
+                deprecation_summary: None,
+                scope: Some("blueprint"),
+                fields: vec![ArchetypeFieldReflection {
+                    name: "views",
+                    display_name: "Views",
+                    component_type: "rerun.blueprint.components.IncludedContent".into(),
+                    docstring_md: "The views rendered for the preview, in display order.\n\nEach components.IncludedContent must reference a archetypes.ViewBlueprint at `/view/{view_id}`.\nView contents, properties, defaults, and overrides remain at their regular blueprint paths.",
+                    flags: ArchetypeFieldFlags::REQUIRED | ArchetypeFieldFlags::UI_EDITABLE,
+                }],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.blueprint.archetypes.TableLayout"),
+            ArchetypeReflection {
+                display_name: "Table layout",
+                deprecation_summary: None,
+                scope: Some("blueprint"),
+                fields: vec![ArchetypeFieldReflection {
+                    name: "column_order",
+                    display_name: "Column order",
+                    component_type: "rerun.blueprint.components.ColumnName".into(),
+                    docstring_md: "Source columns visible by default and shown first, in display order.\n\nUnmentioned columns retain the viewer visibility defaults and follow in default order.\nEach source column may appear at most once.",
+                    flags: ArchetypeFieldFlags::UI_EDITABLE,
+                }],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.blueprint.archetypes.TensorScalarMapping"),
             ArchetypeReflection {
                 display_name: "Tensor scalar mapping",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "mag_filter",
@@ -4342,12 +5219,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.TensorSliceSelection"),
+            ArchetypeName::from("rerun.blueprint.archetypes.TensorSliceSelection"),
             ArchetypeReflection {
                 display_name: "Tensor slice selection",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "width",
@@ -4382,12 +5258,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.TensorViewFit"),
+            ArchetypeName::from("rerun.blueprint.archetypes.TensorViewFit"),
             ArchetypeReflection {
                 display_name: "Tensor view fit",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "scaling",
                     display_name: "Scaling",
@@ -4398,12 +5273,35 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.TextLogColumns"),
+            ArchetypeName::from("rerun.blueprint.archetypes.TextDocumentFormat"),
+            ArchetypeReflection {
+                display_name: "Text document format",
+                deprecation_summary: None,
+                scope: Some("blueprint"),
+                fields: vec![
+                    ArchetypeFieldReflection {
+                        name: "monospace",
+                        display_name: "Monospace",
+                        component_type: "rerun.blueprint.components.Enabled".into(),
+                        docstring_md: "Whether to use a monospace font for the document body.\n\nDefaults to disabled.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                    ArchetypeFieldReflection {
+                        name: "word_wrap",
+                        display_name: "Word wrap",
+                        component_type: "rerun.blueprint.components.Enabled".into(),
+                        docstring_md: "Whether to wrap long lines in the document body.\n\nDefaults to enabled.",
+                        flags: ArchetypeFieldFlags::UI_EDITABLE,
+                    },
+                ],
+            },
+        ),
+        (
+            ArchetypeName::from("rerun.blueprint.archetypes.TextLogColumns"),
             ArchetypeReflection {
                 display_name: "Text log columns",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "timeline_columns",
@@ -4423,12 +5321,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.TextLogFormat"),
+            ArchetypeName::from("rerun.blueprint.archetypes.TextLogFormat"),
             ArchetypeReflection {
                 display_name: "Text log format",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "monospace_body",
                     display_name: "Monospace body",
@@ -4439,12 +5336,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.TextLogRows"),
+            ArchetypeName::from("rerun.blueprint.archetypes.TextLogRows"),
             ArchetypeReflection {
                 display_name: "Text log rows",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "filter_by_log_level",
                     display_name: "Filter by log level",
@@ -4455,18 +5351,17 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.TimeAxis"),
+            ArchetypeName::from("rerun.blueprint.archetypes.TimeAxis"),
             ArchetypeReflection {
                 display_name: "Time axis",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "link",
                         display_name: "Link",
                         component_type: "rerun.blueprint.components.LinkAxis".into(),
-                        docstring_md: "How should the horizontal/X/time axis be linked across multiple plots?\n\nLinking with global will ignore `view_range`.",
+                        docstring_md: "How should the horizontal time axis be linked across multiple views?\n\nLinking with global uses the shared global view range instead of this view's `view_range`.",
                         flags: ArchetypeFieldFlags::UI_EDITABLE,
                     },
                     ArchetypeFieldReflection {
@@ -4487,12 +5382,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.TimePanelBlueprint"),
+            ArchetypeName::from("rerun.blueprint.archetypes.TimePanelBlueprint"),
             ArchetypeReflection {
                 display_name: "Time panel blueprint",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "state",
@@ -4547,12 +5441,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.ViewBlueprint"),
+            ArchetypeName::from("rerun.blueprint.archetypes.ViewBlueprint"),
             ArchetypeReflection {
                 display_name: "View blueprint",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "class_identifier",
@@ -4586,12 +5479,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.ViewContents"),
+            ArchetypeName::from("rerun.blueprint.archetypes.ViewContents"),
             ArchetypeReflection {
                 display_name: "View contents",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "query",
                     display_name: "Query",
@@ -4602,12 +5494,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.ViewportBlueprint"),
+            ArchetypeName::from("rerun.blueprint.archetypes.ViewportBlueprint"),
             ArchetypeReflection {
                 display_name: "Viewport blueprint",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "root_container",
@@ -4649,12 +5540,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.VisibleTimeRanges"),
+            ArchetypeName::from("rerun.blueprint.archetypes.VisibleTimeRanges"),
             ArchetypeReflection {
                 display_name: "Visible time ranges",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "ranges",
                     display_name: "Ranges",
@@ -4665,12 +5555,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.VisualBounds2D"),
+            ArchetypeName::from("rerun.blueprint.archetypes.VisualBounds2D"),
             ArchetypeReflection {
                 display_name: "Visual bounds 2D",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![ArchetypeFieldReflection {
                     name: "range",
                     display_name: "Range",
@@ -4681,12 +5570,11 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
             },
         ),
         (
-            ArchetypeName::new("rerun.blueprint.archetypes.VisualizerInstruction"),
+            ArchetypeName::from("rerun.blueprint.archetypes.VisualizerInstruction"),
             ArchetypeReflection {
                 display_name: "Visualizer instruction",
                 deprecation_summary: None,
                 scope: Some("blueprint"),
-                view_types: &[],
                 fields: vec![
                     ArchetypeFieldReflection {
                         name: "visualizer_type",
@@ -4708,4 +5596,169 @@ fn generate_archetype_reflection() -> ArchetypeReflectionMap {
         ),
     ];
     ArchetypeReflectionMap::from_iter(array)
+}
+
+/// Generates reflection about all known views.
+///
+/// Call only once and reuse the results.
+
+fn generate_view_reflection() -> ViewReflectionMap {
+    let entries = [
+        (
+            ViewClassIdentifier::from_static_str("BarChart"),
+            ViewReflection {
+                applicability: ViewApplicability::Archetypes(vec![
+                    ArchetypeName::from("rerun.archetypes.BarChart"),
+                    ArchetypeName::from("rerun.archetypes.Tensor"),
+                ]),
+            },
+        ),
+        (
+            ViewClassIdentifier::from_static_str("Dataframe"),
+            ViewReflection {
+                applicability: ViewApplicability::AllArchetypes,
+            },
+        ),
+        (
+            ViewClassIdentifier::from_static_str("Graph"),
+            ViewReflection {
+                applicability: ViewApplicability::Archetypes(vec![
+                    ArchetypeName::from("rerun.archetypes.GraphEdges"),
+                    ArchetypeName::from("rerun.archetypes.GraphNodes"),
+                ]),
+            },
+        ),
+        (
+            ViewClassIdentifier::from_static_str("Map"),
+            ViewReflection {
+                applicability: ViewApplicability::Archetypes(vec![
+                    ArchetypeName::from("rerun.archetypes.GeoLineStrings"),
+                    ArchetypeName::from("rerun.archetypes.GeoPoints"),
+                ]),
+            },
+        ),
+        (
+            ViewClassIdentifier::from_static_str("2D"),
+            ViewReflection {
+                applicability: ViewApplicability::Archetypes(vec![
+                    ArchetypeName::from("rerun.archetypes.AnnotationContext"),
+                    ArchetypeName::from("rerun.archetypes.Arrows2D"),
+                    ArchetypeName::from("rerun.archetypes.Arrows3D"),
+                    ArchetypeName::from("rerun.archetypes.Asset3D"),
+                    ArchetypeName::from("rerun.archetypes.AssetVideo"),
+                    ArchetypeName::from("rerun.archetypes.Boxes2D"),
+                    ArchetypeName::from("rerun.archetypes.Boxes3D"),
+                    ArchetypeName::from("rerun.archetypes.Capsules3D"),
+                    ArchetypeName::from("rerun.archetypes.Clear"),
+                    ArchetypeName::from("rerun.archetypes.CoordinateFrame"),
+                    ArchetypeName::from("rerun.archetypes.Cylinders3D"),
+                    ArchetypeName::from("rerun.archetypes.DepthImage"),
+                    ArchetypeName::from("rerun.archetypes.Ellipses2D"),
+                    ArchetypeName::from("rerun.archetypes.Ellipsoids3D"),
+                    ArchetypeName::from("rerun.archetypes.EncodedDepthImage"),
+                    ArchetypeName::from("rerun.archetypes.EncodedImage"),
+                    ArchetypeName::from("rerun.archetypes.GridMap"),
+                    ArchetypeName::from("rerun.archetypes.Image"),
+                    ArchetypeName::from("rerun.archetypes.InstancePoses3D"),
+                    ArchetypeName::from("rerun.archetypes.LineStrips2D"),
+                    ArchetypeName::from("rerun.archetypes.LineStrips3D"),
+                    ArchetypeName::from("rerun.archetypes.Mesh3D"),
+                    ArchetypeName::from("rerun.archetypes.Pinhole"),
+                    ArchetypeName::from("rerun.archetypes.Points2D"),
+                    ArchetypeName::from("rerun.archetypes.Points3D"),
+                    ArchetypeName::from("rerun.archetypes.SegmentationImage"),
+                    ArchetypeName::from("rerun.archetypes.Transform3D"),
+                    ArchetypeName::from("rerun.archetypes.VideoFrameReference"),
+                    ArchetypeName::from("rerun.archetypes.VideoStream"),
+                ]),
+            },
+        ),
+        (
+            ViewClassIdentifier::from_static_str("3D"),
+            ViewReflection {
+                applicability: ViewApplicability::Archetypes(vec![
+                    ArchetypeName::from("rerun.archetypes.AnnotationContext"),
+                    ArchetypeName::from("rerun.archetypes.Arrows2D"),
+                    ArchetypeName::from("rerun.archetypes.Arrows3D"),
+                    ArchetypeName::from("rerun.archetypes.Asset3D"),
+                    ArchetypeName::from("rerun.archetypes.AssetVideo"),
+                    ArchetypeName::from("rerun.archetypes.Boxes2D"),
+                    ArchetypeName::from("rerun.archetypes.Boxes3D"),
+                    ArchetypeName::from("rerun.archetypes.Capsules3D"),
+                    ArchetypeName::from("rerun.archetypes.Clear"),
+                    ArchetypeName::from("rerun.archetypes.CoordinateFrame"),
+                    ArchetypeName::from("rerun.archetypes.Cylinders3D"),
+                    ArchetypeName::from("rerun.archetypes.DepthImage"),
+                    ArchetypeName::from("rerun.archetypes.Ellipses2D"),
+                    ArchetypeName::from("rerun.archetypes.Ellipsoids3D"),
+                    ArchetypeName::from("rerun.archetypes.EncodedDepthImage"),
+                    ArchetypeName::from("rerun.archetypes.EncodedImage"),
+                    ArchetypeName::from("rerun.archetypes.GaussianSplats3D"),
+                    ArchetypeName::from("rerun.archetypes.GridMap"),
+                    ArchetypeName::from("rerun.archetypes.Image"),
+                    ArchetypeName::from("rerun.archetypes.InstancePoses3D"),
+                    ArchetypeName::from("rerun.archetypes.LineStrips2D"),
+                    ArchetypeName::from("rerun.archetypes.LineStrips3D"),
+                    ArchetypeName::from("rerun.archetypes.Mesh3D"),
+                    ArchetypeName::from("rerun.archetypes.Pinhole"),
+                    ArchetypeName::from("rerun.archetypes.Points2D"),
+                    ArchetypeName::from("rerun.archetypes.Points3D"),
+                    ArchetypeName::from("rerun.archetypes.SegmentationImage"),
+                    ArchetypeName::from("rerun.archetypes.Transform3D"),
+                    ArchetypeName::from("rerun.archetypes.TransformAxes3D"),
+                    ArchetypeName::from("rerun.archetypes.VideoFrameReference"),
+                    ArchetypeName::from("rerun.archetypes.VideoStream"),
+                    ArchetypeName::from("rerun.archetypes.ViewCoordinates"),
+                    ArchetypeName::from("rerun.archetypes.Volume3D"),
+                    ArchetypeName::from("rerun.archetypes.VoxelGridMap"),
+                ]),
+            },
+        ),
+        (
+            ViewClassIdentifier::from_static_str("StateTimeline"),
+            ViewReflection {
+                applicability: ViewApplicability::Archetypes(vec![
+                    ArchetypeName::from("rerun.archetypes.StateChange"),
+                    ArchetypeName::from("rerun.archetypes.StateConfiguration"),
+                ]),
+            },
+        ),
+        (
+            ViewClassIdentifier::from_static_str("Tensor"),
+            ViewReflection {
+                applicability: ViewApplicability::Archetypes(vec![ArchetypeName::from(
+                    "rerun.archetypes.Tensor",
+                )]),
+            },
+        ),
+        (
+            ViewClassIdentifier::from_static_str("TextDocument"),
+            ViewReflection {
+                applicability: ViewApplicability::Archetypes(vec![ArchetypeName::from(
+                    "rerun.archetypes.TextDocument",
+                )]),
+            },
+        ),
+        (
+            ViewClassIdentifier::from_static_str("TextLog"),
+            ViewReflection {
+                applicability: ViewApplicability::Archetypes(vec![ArchetypeName::from(
+                    "rerun.archetypes.TextLog",
+                )]),
+            },
+        ),
+        (
+            ViewClassIdentifier::from_static_str("TimeSeries"),
+            ViewReflection {
+                applicability: ViewApplicability::Archetypes(vec![
+                    ArchetypeName::from("rerun.archetypes.Clear"),
+                    ArchetypeName::from("rerun.archetypes.Measurements"),
+                    ArchetypeName::from("rerun.archetypes.Scalars"),
+                    ArchetypeName::from("rerun.archetypes.SeriesLines"),
+                    ArchetypeName::from("rerun.archetypes.SeriesPoints"),
+                ]),
+            },
+        ),
+    ];
+    ViewReflectionMap::from_iter(entries)
 }

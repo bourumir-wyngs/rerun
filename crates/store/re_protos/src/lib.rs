@@ -6,10 +6,17 @@
 //! necessary conversion code (in the form of `From` and `TryFrom` traits) in this crate.
 
 pub mod external {
-    pub use prost;
+    pub use {prost, re_span, tonic_types};
 }
 
+pub mod capabilities;
+pub mod error;
+
 pub mod headers;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod json;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod reflection;
 pub mod trace_id_layer;
 
 pub use re_log_types::{EntryName, InvalidEntryNameError};
@@ -45,11 +52,26 @@ mod v1alpha1 {
     #[path = "./rerun.sdk_comms.v1alpha1.rs"]
     pub mod rerun_sdk_comms_v1alpha1;
 
+    #[path = "./rerun.viewer_control.v1alpha1.rs"]
+    pub mod rerun_viewer_control_v1alpha1;
+
+    #[path = "./rerun.viewer_control.v1alpha1.ext.rs"]
+    pub mod rerun_viewer_control_v1alpha1_ext;
+
     #[path = "./rerun.cloud.v1alpha1.rs"]
     pub mod rerun_cloud_v1alpha1;
 
     #[path = "./rerun.cloud.v1alpha1.ext.rs"]
     pub mod rerun_cloud_v1alpha1_ext;
+
+    #[path = "./rerun.cloud.v1alpha1.ext.chunk_key.rs"]
+    pub mod rerun_cloud_v1alpha1_ext_chunk_key;
+
+    #[path = "./rerun.cloud.v1alpha1.ext.asset_properties.rs"]
+    pub mod rerun_cloud_v1alpha1_ext_asset_properties;
+
+    #[path = "./rerun.cloud.v1alpha1.ext.schemas.rs"]
+    pub mod rerun_cloud_v1alpha1_ext_schemas;
 }
 
 pub mod common {
@@ -72,6 +94,31 @@ pub mod cloud {
         pub use crate::v1alpha1::rerun_cloud_v1alpha1::*;
         pub mod ext {
             pub use crate::v1alpha1::rerun_cloud_v1alpha1_ext::*;
+            pub use crate::v1alpha1::rerun_cloud_v1alpha1_ext_asset_properties::*;
+            pub use crate::v1alpha1::rerun_cloud_v1alpha1_ext_chunk_key::*;
+            pub use crate::v1alpha1::rerun_cloud_v1alpha1_ext_schemas::*;
+        }
+
+        pub use crate::capabilities;
+
+        /// Server-supported feature flags advertised via `VersionResponse.features`.
+        ///
+        /// Constants here are the single source of truth — both client (gating)
+        /// and server (advertising) reference the same string. See `cloud.proto`
+        /// `VersionResponse.features` for protocol details.
+        pub mod features {
+            /// Server consumes `QueryLatestAt.per_segment_values` for chunk
+            /// pruning (RR-4355). New clients must check this before sending
+            /// `per_segment_values` — old servers will silently return only
+            /// static data.
+            pub const PER_SEGMENT_INDEX_VALUES: &str = "per_segment_index_values";
+
+            /// Returns the full list of features this build of the server
+            /// natively supports. Used by both OSS `re_server` and the
+            /// Rerun Hub frontend to populate `VersionResponse.features`.
+            pub fn all_supported_features() -> Vec<String> {
+                vec![PER_SEGMENT_INDEX_VALUES.to_owned()]
+            }
         }
     }
 }
@@ -79,6 +126,13 @@ pub mod cloud {
 pub mod sdk_comms {
     pub mod v1alpha1 {
         pub use crate::v1alpha1::rerun_sdk_comms_v1alpha1::*;
+    }
+}
+
+pub mod viewer_control {
+    pub mod v1alpha1 {
+        pub use crate::v1alpha1::rerun_viewer_control_v1alpha1::*;
+        pub use crate::v1alpha1::rerun_viewer_control_v1alpha1_ext::*;
     }
 }
 
@@ -114,8 +168,20 @@ pub enum TypeConversionError {
         type_name: &'static str,
     },
 
+    #[error("invalid application id: {0}")]
+    InvalidApplicationId(#[from] re_log_types::InvalidApplicationIdError),
+
     #[error("invalid entry name: {0}")]
     InvalidEntryName(#[from] InvalidEntryNameError),
+
+    #[error("invalid layer name: {0}")]
+    InvalidLayerName(#[from] re_types_core::InvalidLayerNameError),
+
+    #[error("invalid timeline name: {0}")]
+    InvalidTimelineName(#[from] re_types_core::InvalidTimelineNameError),
+
+    #[error(transparent)]
+    InvalidObjectKey(#[from] cloud::v1alpha1::ext::InvalidObjectKeyError),
 
     #[error("failed to parse timestamp: {0}")]
     InvalidTime(#[from] jiff::Error),
@@ -128,6 +194,9 @@ pub enum TypeConversionError {
 
     #[error("failed to convert arrow data: {0}")]
     ArrowError(#[from] arrow::error::ArrowError),
+
+    #[error(transparent)]
+    DowncastError(#[from] re_arrow_util::DowncastError),
 
     #[error("{0}")]
     UnknownEnumValue(#[from] prost::UnknownEnumValue),

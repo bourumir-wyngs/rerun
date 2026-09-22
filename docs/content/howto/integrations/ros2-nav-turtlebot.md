@@ -21,18 +21,18 @@ All of the code for this guide can be found on GitHub in
 [rerun/examples/python/ros_node](https://github.com/rerun-io/rerun/blob/main/examples/python/ros_node/).
 
 <picture>
-  <img src="https://static.rerun.io/ros_node_example/ddc3387995cda1b283a5c58ffbc6021d91abde7d/full.png" alt="Rerun viewer showing data streamed from the example ROS node">
-  <source media="(max-width: 480px)" srcset="https://static.rerun.io/ros_node_example/ddc3387995cda1b283a5c58ffbc6021d91abde7d/480w.png">
-  <source media="(max-width: 768px)" srcset="https://static.rerun.io/ros_node_example/ddc3387995cda1b283a5c58ffbc6021d91abde7d/768w.png">
-  <source media="(max-width: 1024px)" srcset="https://static.rerun.io/ros_node_example/ddc3387995cda1b283a5c58ffbc6021d91abde7d/1024w.png">
-  <source media="(max-width: 1200px)" srcset="https://static.rerun.io/ros_node_example/ddc3387995cda1b283a5c58ffbc6021d91abde7d/1200w.png">
+  <img src="https://static.rerun.io/ros_node_example_new/e15b81b183ccafd8ee2994a6abf0b06cbdf22741/full.png" alt="Rerun viewer showing data streamed from the example ROS node">
+  <source media="(max-width: 480px)" srcset="https://static.rerun.io/ros_node_example_new/e15b81b183ccafd8ee2994a6abf0b06cbdf22741/480w.png">
+  <source media="(max-width: 768px)" srcset="https://static.rerun.io/ros_node_example_new/e15b81b183ccafd8ee2994a6abf0b06cbdf22741/768w.png">
+  <source media="(max-width: 1024px)" srcset="https://static.rerun.io/ros_node_example_new/e15b81b183ccafd8ee2994a6abf0b06cbdf22741/1024w.png">
+  <source media="(max-width: 1200px)" srcset="https://static.rerun.io/ros_node_example_new/e15b81b183ccafd8ee2994a6abf0b06cbdf22741/1200w.png">
 </picture>
 
 ---
 
 Other relevant tutorials:
 
--   [Python SDK Tutorial](../../getting-started/data-in/python.md)
+-   [Log and Ingest Tutorial](../../getting-started/data-in.md)
 -   [Viewer Walkthrough](../../getting-started/configure-the-viewer/navigating-the-viewer.md)
 -   [Transforms & Coordinate Frames](../../concepts/logging-and-ingestion/transforms.md)
 -   [Loading URDF models](../../howto/logging-and-ingestion/urdf.md)
@@ -78,7 +78,7 @@ again.
 
 ### TF to rr.Transform3D
 
-Next, we need to map the [ROS TF2](https://docs.ros.org/en/humble/Concepts/About-Tf2.html) transforms to the corresponding Rerun archetype.
+Next, we need to map the [ROS TF2](https://docs.ros.org/en/humble/Concepts/Intermediate/About-Tf2.html) transforms to the corresponding Rerun archetype.
 
 Since Rerun 0.28, the [`Transform3D`](../../reference/types/archetypes/transform3d.md) archetype supports parent/child frame relationships, which makes our conversion step straight-forward. We just have to remember that the ROS [TFMessage](https://docs.ros2.org/foxy/api/tf2_msgs/msg/TFMessage.html) is a container for multiple transforms that have individual timestamps each and set the time accordingly.
 By specifying the parent and child frames, we can log all transforms to the same entity path, similar to the TF topic in ROS.
@@ -117,7 +117,7 @@ def tf_callback(self, tf_msg: TFMessage) -> None:
 
 ### `robot_description` (URDF)
 
-Rerun features a built-in data loader for URDF, so we can just forward the string received on the `/robot_description` topic to it.
+Rerun features a built-in importer for URDF, so we can just forward the string received on the `/robot_description` topic to it.
 
 More information about how to use URDF with Rerun can be found [here](../../howto/logging-and-ingestion/urdf.md).
 
@@ -173,6 +173,15 @@ def scan_callback(self, scan: LaserScan) -> None:
     rr.log("scan", rr.LineStrips3D(segs, radii=0.0025, colors=[255, 165, 0]))
     rr.log("scan", rr.CoordinateFrame(frame=scan.header.frame_id))
 ```
+
+### OccupancyGrid to rr.GridMap
+
+ROS [`nav_msgs/OccupancyGrid`](https://docs.ros2.org/latest/api/nav_msgs/msg/OccupancyGrid.html) messages map directly to Rerun's [`GridMap`](../../reference/types/archetypes/grid_map.md) archetype.
+This example subscribes to the static map and the local & global costmap topics, logging them with Rerun's RViz-compatible `RvizMap` and `RvizCostmap` colormaps and with draw-order values for defined layering.
+
+Most fields are a 1:1 mapping: the occupancy data becomes the `GridMap` image data, `info.resolution` becomes the cell size, and `info.origin` defines the map pose.
+The main caveat is row order: ROS occupancy grids start at the map's bottom-left cell, while regular image buffers as used by Rerun's `GridMap` are top-row first.
+The example therefore flips the rows before logging the grid data.
 
 ### Camera info and images
 

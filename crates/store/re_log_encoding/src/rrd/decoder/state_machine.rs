@@ -3,12 +3,13 @@ use std::io::{Cursor, Read as _};
 
 use itertools::Itertools as _;
 use re_build_info::CrateVersion;
+use re_chunk_index::RawRrdManifest;
 
 use crate::rrd::MessageHeader;
+
 use crate::{
     CachingApplicationIdInjector, CodecError, Decodable as _, DecodeError, DecoderEntrypoint,
-    EncodingOptions, RawRrdManifest, Serializer, StreamFooter, StreamFooterEntry, StreamHeader,
-    ToApplication as _,
+    EncodingOptions, Serializer, StreamFooter, StreamFooterEntry, StreamHeader, ToApplication as _,
 };
 
 // ---
@@ -23,7 +24,7 @@ pub type DecoderTransport = Decoder<re_protos::log_msg::v1alpha1::log_msg::Msg>;
 /// application-level types (i.e. even Arrow layers are decoded).
 ///
 /// See also [`DecoderApp`].
-pub type DecoderApp = Decoder<re_log_types::LogMsg>;
+pub type DecoderApp = Decoder<re_log_msg::LogMsg>;
 
 /// A push-based state machine that ingests byte chunks and outputs messages once it has enough
 /// data to decode one.
@@ -42,7 +43,7 @@ pub struct Decoder<T> {
     /// The Rerun version used to encode the RRD data.
     ///
     /// `None` until a Rerun header has been processed.
-    pub(crate) version: Option<CrateVersion>,
+    pub(crate) version: Option<CrateVersion<'static>>,
 
     pub(crate) options: EncodingOptions,
 
@@ -209,9 +210,9 @@ impl<T: DecoderEntrypoint> Decoder<T> {
                     let (version, options) = match version_and_options {
                         Ok(ok) => ok,
                         Err(err) => {
-                            if is_first_header {
+                            return if is_first_header {
                                 // We expected a header, but didn't find one!
-                                return Err(err.into());
+                                Err(err.into())
                             } else {
                                 // A bunch of weird trailing bytes means we're now in an irrecoverable state, but
                                 // it doesn't change the fact that we've just successfully yielded an entire stream's
@@ -223,8 +224,8 @@ impl<T: DecoderEntrypoint> Decoder<T> {
                                     "trailing bytes in rrd stream: {header_data:?} ({err})"
                                 );
                                 self.state = DecoderState::Aborted;
-                                return Ok(None);
-                            }
+                                Ok(None)
+                            };
                         }
                     };
 
@@ -287,10 +288,7 @@ impl<T: DecoderEntrypoint> Decoder<T> {
 
                 if let Some(bytes) = self.byte_chunks.try_read(header.len as usize) {
                     let bytes_len = bytes.len() as u64;
-                    let byte_span = re_chunk::Span {
-                        start: start_offset,
-                        len: bytes_len,
-                    };
+                    let byte_span = re_chunk::Span::from_start_len(start_offset, bytes_len);
                     let message = match T::decode(
                         bytes.clone(),
                         byte_span,
@@ -312,33 +310,27 @@ impl<T: DecoderEntrypoint> Decoder<T> {
                     if let Some(message) = message {
                         self.state = DecoderState::WaitingForMessageHeader;
                         return Ok(Some(message));
-                    } else {
-                        re_log::trace!(
-                            "End of stream - expecting either a StreamFooter or a new Streamheader"
-                        );
-
-                        if !bytes.is_empty() {
-                            let rrd_footer =
-                                re_protos::log_msg::v1alpha1::RrdFooter::from_rrd_bytes(&bytes)?;
-                            self.rrd_manifests.extend(rrd_footer.manifests);
-
-                            // A non-empty ::End message means there must be a footer ahead, no exception.
-                            self.state = DecoderState::WaitingForStreamFooter;
-                        } else {
-                            // There are 2 possible scenarios where we can end up here:
-                            // * The recording doesn't contain any data messages (e.g. it's empty except for
-                            //   a `SetStoreInfo` message).
-                            // * Backward compatibility: the payload is empty (i.e. `header.len == 0`) because the
-                            //   `End` message was written by a legacy encoder that predates the introduction of footers.
-                            //
-                            // Either way, we have to expect a footer next, since we don't know for sure which scenario
-                            // we're in. We could check the encoder version and such, but that's just superfluous complexity
-                            // since `WaitingForStreamFooter` already knows how to deal with optional footers anyway.
-                            self.state = DecoderState::WaitingForStreamFooter;
-                        }
-
-                        return self.try_read();
                     }
+                    re_log::trace!(
+                        "End of stream - expecting either a StreamFooter or a new Streamheader"
+                    );
+
+                    if !bytes.is_empty() {
+                        let rrd_footer =
+                            re_protos::log_msg::v1alpha1::RrdFooter::from_rrd_bytes(&bytes)?;
+                        self.rrd_manifests.extend(rrd_footer.manifests);
+                    }
+
+                    // We expect a footer next, either way:
+                    // * A non-empty `::End` message means there must be a footer ahead, no exception.
+                    // * An empty payload means either that the recording doesn't contain any data messages
+                    //   (e.g. it's empty except for a `SetStoreInfo` message), or that the `End` message was
+                    //   written by a legacy encoder that predates the introduction of footers. We don't know
+                    //   for sure which scenario we're in, and we don't have to: `WaitingForStreamFooter`
+                    //   already knows how to deal with optional footers anyway.
+                    self.state = DecoderState::WaitingForStreamFooter;
+
+                    return self.try_read();
                 }
 
                 // Not enough data yet -- wait to be fed and called back once again.
@@ -550,7 +542,7 @@ fn is_byte_chunk_empty(byte_chunk: &ByteChunk) -> bool {
 #[cfg(test)]
 mod tests {
     use re_chunk::RowId;
-    use re_log_types::{LogMsg, SetStoreInfo, StoreInfo};
+    use re_log_msg::{LogMsg, SetStoreInfo, StoreInfo};
 
     use super::*;
     use crate::Encoder;
@@ -652,7 +644,7 @@ mod tests {
     fn two_concatenated_streams_protobuf() {
         let (input1, data1) = test_data(EncodingOptions::PROTOBUF_UNCOMPRESSED, 16);
         let (input2, data2) = test_data(EncodingOptions::PROTOBUF_UNCOMPRESSED, 16);
-        let input = input1.into_iter().chain(input2).collect::<Vec<_>>();
+        let input = std::iter::chain(input1, input2).collect::<Vec<_>>();
 
         let mut decoder = DecoderApp::new();
 

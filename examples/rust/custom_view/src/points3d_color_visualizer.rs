@@ -12,6 +12,7 @@ use rerun::external::re_viewer_context::{
 #[derive(Default)]
 pub struct Points3DColorVisualizer;
 
+#[derive(Clone)]
 pub struct ColorWithInstance {
     pub color: egui::Color32,
     pub instance: Instance,
@@ -35,6 +36,7 @@ impl VisualizerSystem for Points3DColorVisualizer {
             )
             .into(),
             queried: std::iter::once(rerun::Points3D::descriptor_colors()).collect(),
+            annotation_context: None,
         }
     }
 
@@ -58,6 +60,7 @@ impl VisualizerSystem for Points3DColorVisualizer {
                 query,
                 [rerun::Points3D::descriptor_colors().component],
                 instruction,
+                None,
             );
             let results = VisualizerInstructionQueryResults::new(instruction, &results, &output);
 
@@ -71,7 +74,7 @@ impl VisualizerSystem for Points3DColorVisualizer {
             // Collect all different kinds of colors that are returned from the cache.
             let mut colors_for_entity = Vec::new();
             for ((_time, _row_id), colors_slice) in color_slices_per_time {
-                for (instance, color) in (0..).zip(colors_slice) {
+                for (instance, color) in std::iter::zip(0.., colors_slice) {
                     let [r, g, b, _] = rerun::Color::from_u32(*color).to_array();
                     colors_for_entity.push(ColorWithInstance {
                         #[expect(clippy::disallowed_methods)] // This is not a hard-coded color.

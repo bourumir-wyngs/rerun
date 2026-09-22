@@ -8,8 +8,8 @@ title: "RotationAxisAngle"
 If normalization of the rotation axis fails the rotation is treated as an invalid transform, unless the
 angle is zero in which case it is treated as an identity.
 
-## Rerun datatype
-[`RotationAxisAngle`](../datatypes/rotation_axis_angle.md)
+## Rerun encoding
+[`RotationAxisAngle`](../encodings/rotation_axis_angle.md)
 
 
 ## Arrow datatype
@@ -32,6 +32,7 @@ Struct(
 * [`Capsules3D`](../archetypes/capsules3d.md)
 * [`Cylinders3D`](../archetypes/cylinders3d.md)
 * [`Ellipsoids3D`](../archetypes/ellipsoids3d.md)
-* [`GridMap`](../archetypes/grid_map.md?speculative-link)
+* [`GridMap`](../archetypes/grid_map.md)
 * [`InstancePoses3D`](../archetypes/instance_poses3d.md)
 * [`Transform3D`](../archetypes/transform3d.md)
+* [`VoxelGridMap`](../archetypes/voxel_grid_map.md)

@@ -16,7 +16,7 @@ use crate::{
 /// Any rerun-compatible [`ArrowRecordBatch`].
 ///
 /// This is a wrapper around a [`SorbetSchema`] and a [`ArrowRecordBatch`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SorbetBatch {
     schema: SorbetSchema,
 
@@ -46,6 +46,22 @@ impl SorbetBatch {
         Ok(Self { schema, batch })
     }
 
+    /// Records the current time as the moment this batch passed `location`.
+    ///
+    /// Updates both the Arrow metadata and the parsed [`SorbetSchema`].
+    /// Does nothing for locations that are not carried in the batch metadata.
+    pub fn track_latency(&mut self, location: crate::TimestampLocation) {
+        let Some(key) = location.metadata_key() else {
+            return;
+        };
+        let now = web_time::SystemTime::now();
+        self.batch.schema_metadata_mut().insert(
+            key.to_owned(),
+            crate::timestamp_metadata::encode_timestamp(now),
+        );
+        self.schema.timestamps.insert(location, now);
+    }
+
     /// Returns self but with all rows removed.
     #[must_use]
     pub fn drop_all_rows(self) -> Self {
@@ -53,6 +69,34 @@ impl SorbetBatch {
             schema: self.schema.clone(),
             batch: self.batch.slice(0, 0),
         }
+    }
+
+    /// Replace the data of one column by index, keeping the same schema.
+    ///
+    /// Returns `None` if the column index is out of bounds or if the new
+    /// `RecordBatch` cannot be constructed.
+    #[must_use]
+    pub fn with_replaced_column(&self, col_idx: usize, new_array: ArrowArrayRef) -> Option<Self> {
+        if col_idx >= self.batch.num_columns() {
+            return None;
+        }
+        re_log::debug_assert_eq!(
+            self.batch.column(col_idx).data_type(),
+            new_array.data_type(),
+            "with_replaced_column: data type mismatch for column {col_idx}"
+        );
+        let mut columns: Vec<ArrowArrayRef> = self.batch.columns().to_vec();
+        columns[col_idx] = new_array;
+        let batch = ArrowRecordBatch::try_new_with_options(
+            self.batch.schema(),
+            columns,
+            &RecordBatchOptions::default(),
+        )
+        .ok()?;
+        Some(Self {
+            schema: self.schema.clone(),
+            batch,
+        })
     }
 }
 
@@ -90,7 +134,7 @@ impl SorbetBatch {
 
     /// The columns of the indices (timelines).
     pub fn index_columns(&self) -> impl Iterator<Item = (&IndexColumnDescriptor, &ArrowArrayRef)> {
-        itertools::izip!(self.schema.columns.iter(), self.batch.columns().iter()).filter_map(
+        itertools::izip!(self.schema.columns.iter(), self.batch.columns()).filter_map(
             |(descr, array)| {
                 if let ColumnDescriptor::Time(descr) = descr {
                     Some((descr, array))
@@ -105,7 +149,7 @@ impl SorbetBatch {
     pub fn component_columns(
         &self,
     ) -> impl Iterator<Item = (&ComponentColumnDescriptor, &ArrowArrayRef)> {
-        itertools::izip!(self.schema.columns.iter(), self.batch.columns().iter()).filter_map(
+        itertools::izip!(self.schema.columns.iter(), self.batch.columns()).filter_map(
             |(descr, array)| {
                 if let ColumnDescriptor::Component(descr) = descr {
                     Some((descr, array))
@@ -121,6 +165,18 @@ impl std::fmt::Display for SorbetBatch {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         re_arrow_util::format_record_batch_with_width(self, f.width(), f.sign_minus()).fmt(f)
+    }
+}
+
+impl re_byte_size::SizeBytes for SorbetBatch {
+    fn heap_size_bytes(&self) -> u64 {
+        let Self {
+            // TODO(RR-5743): count the parsed schema once it is no longer duplicated.
+            schema: _,
+            batch,
+        } = self;
+
+        batch.heap_size_bytes()
     }
 }
 
@@ -161,7 +217,6 @@ impl SorbetBatch {
     ///
     /// Non-Rerun metadata will be preserved (both at batch-level and column-level).
     /// Rerun metadata will be updated and added to the batch if needed.
-    #[tracing::instrument(level = "trace", skip_all)]
     pub fn try_from_record_batch(
         batch: &ArrowRecordBatch,
         batch_type: crate::BatchType,

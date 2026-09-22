@@ -1,5 +1,6 @@
 use prost::bytes::Bytes;
 
+use crate::common::v1alpha1::ext::StoreIdFromProtoError;
 use crate::{TypeConversionError, invalid_field, missing_field};
 
 impl From<crate::log_msg::v1alpha1::log_msg::Msg> for crate::log_msg::v1alpha1::LogMsg {
@@ -8,27 +9,27 @@ impl From<crate::log_msg::v1alpha1::log_msg::Msg> for crate::log_msg::v1alpha1::
     }
 }
 
-impl From<re_log_types::StoreSource> for crate::log_msg::v1alpha1::StoreSource {
+impl From<re_log_msg::StoreSource> for crate::log_msg::v1alpha1::StoreSource {
     #[inline]
-    fn from(value: re_log_types::StoreSource) -> Self {
+    fn from(value: re_log_msg::StoreSource) -> Self {
         use crate::external::prost::Message as _;
 
         let (kind, payload) = match value {
-            re_log_types::StoreSource::Unknown => (
+            re_log_msg::StoreSource::Unknown => (
                 crate::log_msg::v1alpha1::StoreSourceKind::Unspecified as i32,
                 Bytes::new(),
             ),
-            re_log_types::StoreSource::CSdk => (
+            re_log_msg::StoreSource::CSdk => (
                 crate::log_msg::v1alpha1::StoreSourceKind::CSdk as i32,
                 Bytes::new(),
             ),
-            re_log_types::StoreSource::PythonSdk(python_version) => (
+            re_log_msg::StoreSource::PythonSdk(python_version) => (
                 crate::log_msg::v1alpha1::StoreSourceKind::PythonSdk as i32,
                 crate::log_msg::v1alpha1::PythonVersion::from(python_version)
                     .encode_to_vec()
                     .into(),
             ),
-            re_log_types::StoreSource::RustSdk {
+            re_log_msg::StoreSource::RustSdk {
                 rustc_version,
                 llvm_version,
             } => (
@@ -40,17 +41,17 @@ impl From<re_log_types::StoreSource> for crate::log_msg::v1alpha1::StoreSource {
                 .encode_to_vec()
                 .into(),
             ),
-            re_log_types::StoreSource::File { file_source } => (
+            re_log_msg::StoreSource::File { file_source } => (
                 crate::log_msg::v1alpha1::StoreSourceKind::File as i32,
                 crate::log_msg::v1alpha1::FileSource::from(file_source)
                     .encode_to_vec()
                     .into(),
             ),
-            re_log_types::StoreSource::Viewer => (
+            re_log_msg::StoreSource::Viewer => (
                 crate::log_msg::v1alpha1::StoreSourceKind::Viewer as i32,
                 Bytes::new(),
             ),
-            re_log_types::StoreSource::Other(description) => (
+            re_log_msg::StoreSource::Other(description) => (
                 crate::log_msg::v1alpha1::StoreSourceKind::Other as i32,
                 description.into_bytes().into(),
             ),
@@ -63,7 +64,7 @@ impl From<re_log_types::StoreSource> for crate::log_msg::v1alpha1::StoreSource {
     }
 }
 
-impl TryFrom<crate::log_msg::v1alpha1::StoreSource> for re_log_types::StoreSource {
+impl TryFrom<crate::log_msg::v1alpha1::StoreSource> for re_log_msg::StoreSource {
     type Error = TypeConversionError;
 
     #[inline]
@@ -81,7 +82,7 @@ impl TryFrom<crate::log_msg::v1alpha1::StoreSource> for re_log_types::StoreSourc
                 ))?;
                 let python_version =
                     crate::log_msg::v1alpha1::PythonVersion::decode(&mut &extra.payload[..])?;
-                Ok(Self::PythonSdk(re_log_types::PythonVersion::try_from(
+                Ok(Self::PythonSdk(re_log_msg::PythonVersion::try_from(
                     python_version,
                 )?))
             }
@@ -105,7 +106,7 @@ impl TryFrom<crate::log_msg::v1alpha1::StoreSource> for re_log_types::StoreSourc
                 let file_source =
                     crate::log_msg::v1alpha1::FileSource::decode(&mut &extra.payload[..])?;
                 Ok(Self::File {
-                    file_source: re_log_types::FileSource::try_from(file_source)?,
+                    file_source: re_log_msg::FileSource::try_from(file_source)?,
                 })
             }
             StoreSourceKind::Viewer => Ok(Self::Viewer),
@@ -124,9 +125,9 @@ impl TryFrom<crate::log_msg::v1alpha1::StoreSource> for re_log_types::StoreSourc
     }
 }
 
-impl From<re_log_types::PythonVersion> for crate::log_msg::v1alpha1::PythonVersion {
+impl From<re_log_msg::PythonVersion> for crate::log_msg::v1alpha1::PythonVersion {
     #[inline]
-    fn from(value: re_log_types::PythonVersion) -> Self {
+    fn from(value: re_log_msg::PythonVersion) -> Self {
         Self {
             major: value.major as i32,
             minor: value.minor as i32,
@@ -136,40 +137,46 @@ impl From<re_log_types::PythonVersion> for crate::log_msg::v1alpha1::PythonVersi
     }
 }
 
-impl TryFrom<crate::log_msg::v1alpha1::PythonVersion> for re_log_types::PythonVersion {
+impl TryFrom<crate::log_msg::v1alpha1::PythonVersion> for re_log_msg::PythonVersion {
     type Error = TypeConversionError;
 
     #[inline]
     fn try_from(value: crate::log_msg::v1alpha1::PythonVersion) -> Result<Self, Self::Error> {
+        fn as_u8(field_name: &'static str, value: i32) -> Result<u8, TypeConversionError> {
+            u8::try_from(value).map_err(|err| {
+                invalid_field!(crate::log_msg::v1alpha1::PythonVersion, field_name, err)
+            })
+        }
+
         Ok(Self {
-            major: value.major as u8,
-            minor: value.minor as u8,
-            patch: value.patch as u8,
+            major: as_u8("major", value.major)?,
+            minor: as_u8("minor", value.minor)?,
+            patch: as_u8("patch", value.patch)?,
             suffix: value.suffix,
         })
     }
 }
 
-impl From<re_log_types::FileSource> for crate::log_msg::v1alpha1::FileSource {
+impl From<re_log_msg::FileSource> for crate::log_msg::v1alpha1::FileSource {
     #[inline]
-    fn from(value: re_log_types::FileSource) -> Self {
+    fn from(value: re_log_msg::FileSource) -> Self {
         let kind = match value {
-            re_log_types::FileSource::Cli => crate::log_msg::v1alpha1::FileSourceKind::Cli as i32,
-            re_log_types::FileSource::Uri => crate::log_msg::v1alpha1::FileSourceKind::Uri as i32,
-            re_log_types::FileSource::DragAndDrop { .. } => {
+            re_log_msg::FileSource::Cli => crate::log_msg::v1alpha1::FileSourceKind::Cli as i32,
+            re_log_msg::FileSource::Uri => crate::log_msg::v1alpha1::FileSourceKind::Uri as i32,
+            re_log_msg::FileSource::DragAndDrop { .. } => {
                 crate::log_msg::v1alpha1::FileSourceKind::DragAndDrop as i32
             }
-            re_log_types::FileSource::FileDialog { .. } => {
+            re_log_msg::FileSource::FileDialog { .. } => {
                 crate::log_msg::v1alpha1::FileSourceKind::FileDialog as i32
             }
-            re_log_types::FileSource::Sdk => crate::log_msg::v1alpha1::FileSourceKind::Sdk as i32,
+            re_log_msg::FileSource::Sdk => crate::log_msg::v1alpha1::FileSourceKind::Sdk as i32,
         };
 
         Self { kind }
     }
 }
 
-impl TryFrom<crate::log_msg::v1alpha1::FileSource> for re_log_types::FileSource {
+impl TryFrom<crate::log_msg::v1alpha1::FileSource> for re_log_msg::FileSource {
     type Error = TypeConversionError;
 
     #[inline]
@@ -197,9 +204,9 @@ impl TryFrom<crate::log_msg::v1alpha1::FileSource> for re_log_types::FileSource 
     }
 }
 
-impl From<re_log_types::StoreInfo> for crate::log_msg::v1alpha1::StoreInfo {
+impl From<re_log_msg::StoreInfo> for crate::log_msg::v1alpha1::StoreInfo {
     #[inline]
-    fn from(value: re_log_types::StoreInfo) -> Self {
+    fn from(value: re_log_msg::StoreInfo) -> Self {
         #[expect(deprecated)]
         Self {
             application_id: None,
@@ -214,7 +221,7 @@ impl From<re_log_types::StoreInfo> for crate::log_msg::v1alpha1::StoreInfo {
     }
 }
 
-impl TryFrom<crate::log_msg::v1alpha1::StoreInfo> for re_log_types::StoreInfo {
+impl TryFrom<crate::log_msg::v1alpha1::StoreInfo> for re_log_msg::StoreInfo {
     type Error = TypeConversionError;
 
     #[inline]
@@ -232,17 +239,23 @@ impl TryFrom<crate::log_msg::v1alpha1::StoreInfo> for re_log_types::StoreInfo {
             .try_into()
         {
             Ok(store_id) => store_id,
-            Err(err) => match legacy_application_id {
-                Some(app_id) => err.recover(app_id.into()),
+            // 0.24 back compat: a *missing* application id can be recovered from the deprecated
+            // `StoreInfo.application_id` field. A *present but invalid* id (in either place) is a
+            // hard error — we let `ApplicationId::try_new` decide, no empty-string special-casing.
+            Err(StoreIdFromProtoError::MissingApplicationId(err)) => match legacy_application_id {
+                Some(app_id) => err.recover(re_log_types::ApplicationId::try_from(app_id)?),
                 None => {
                     return Err(err.into_type_conversion_error(
                         "both `StoreId` and `StoreInfo` are missing an application id",
                     ));
                 }
             },
+            Err(err @ StoreIdFromProtoError::InvalidApplicationId(_)) => {
+                return Err(err.into());
+            }
         };
 
-        let store_source: re_log_types::StoreSource = value
+        let store_source: re_log_msg::StoreSource = value
             .store_source
             .ok_or(missing_field!(
                 crate::log_msg::v1alpha1::StoreInfo,
@@ -256,16 +269,15 @@ impl TryFrom<crate::log_msg::v1alpha1::StoreInfo> for re_log_types::StoreInfo {
 
         Ok(Self {
             store_id,
-            cloned_from: None,
             store_source,
             store_version,
         })
     }
 }
 
-impl From<re_log_types::SetStoreInfo> for crate::log_msg::v1alpha1::SetStoreInfo {
+impl From<re_log_msg::SetStoreInfo> for crate::log_msg::v1alpha1::SetStoreInfo {
     #[inline]
-    fn from(value: re_log_types::SetStoreInfo) -> Self {
+    fn from(value: re_log_msg::SetStoreInfo) -> Self {
         Self {
             row_id: Some(value.row_id.into()),
             info: Some(value.info.into()),
@@ -273,7 +285,7 @@ impl From<re_log_types::SetStoreInfo> for crate::log_msg::v1alpha1::SetStoreInfo
     }
 }
 
-impl TryFrom<crate::log_msg::v1alpha1::SetStoreInfo> for re_log_types::SetStoreInfo {
+impl TryFrom<crate::log_msg::v1alpha1::SetStoreInfo> for re_log_msg::SetStoreInfo {
     type Error = TypeConversionError;
 
     #[inline]
@@ -297,11 +309,11 @@ impl TryFrom<crate::log_msg::v1alpha1::SetStoreInfo> for re_log_types::SetStoreI
     }
 }
 
-impl From<re_log_types::BlueprintActivationCommand>
+impl From<re_log_msg::BlueprintActivationCommand>
     for crate::log_msg::v1alpha1::BlueprintActivationCommand
 {
     #[inline]
-    fn from(value: re_log_types::BlueprintActivationCommand) -> Self {
+    fn from(value: re_log_msg::BlueprintActivationCommand) -> Self {
         Self {
             blueprint_id: Some(value.blueprint_id.into()),
             make_active: value.make_active,
@@ -321,7 +333,7 @@ impl crate::log_msg::v1alpha1::log_msg::Msg {
 }
 
 // IMPORTANT: TryFrom<crate::log_msg::v1alpha1::BlueprintActivationCommand> for
-// re_log_types::BlueprintActivationCommand is not tricky because of the `ApplicationId` in
+// re_log_msg::BlueprintActivationCommand is not tricky because of the `ApplicationId` in
 // `StoreId`, so we don't implement it here.
 //TODO(#10730): we could reimplement it if/when we remove 0.24 back compat.
 
@@ -330,34 +342,60 @@ mod tests {
 
     #[test]
     fn store_source_conversion() {
-        let store_source = re_log_types::StoreSource::PythonSdk(re_log_types::PythonVersion {
+        let store_source = re_log_msg::StoreSource::PythonSdk(re_log_msg::PythonVersion {
             major: 3,
             minor: 8,
             patch: 0,
             suffix: "a".to_owned(),
         });
         let proto_store_source: crate::log_msg::v1alpha1::StoreSource = store_source.clone().into();
-        let store_source2: re_log_types::StoreSource = proto_store_source.try_into().unwrap();
+        let store_source2: re_log_msg::StoreSource = proto_store_source.try_into().unwrap();
         assert_eq!(store_source, store_source2);
     }
 
     #[test]
+    fn python_version_out_of_range() {
+        for (major, minor, patch) in [(300, 0, 0), (0, -1, 0), (0, 0, 256)] {
+            let proto = crate::log_msg::v1alpha1::PythonVersion {
+                major,
+                minor,
+                patch,
+                suffix: String::new(),
+            };
+            assert!(re_log_msg::PythonVersion::try_from(proto).is_err());
+        }
+    }
+
+    #[test]
+    fn python_version_boundary_roundtrip() {
+        let version = re_log_msg::PythonVersion {
+            major: 255,
+            minor: 0,
+            patch: 255,
+            suffix: "rc1".to_owned(),
+        };
+        let proto: crate::log_msg::v1alpha1::PythonVersion = version.clone().into();
+        let roundtripped = re_log_msg::PythonVersion::try_from(proto).unwrap();
+        assert_eq!(version, roundtripped);
+    }
+
+    #[test]
     fn file_source_conversion() {
-        let file_source = re_log_types::FileSource::Uri;
+        let file_source = re_log_msg::FileSource::Uri;
         let proto_file_source: crate::log_msg::v1alpha1::FileSource = file_source.clone().into();
-        let file_source2: re_log_types::FileSource = proto_file_source.try_into().unwrap();
+        let file_source2: re_log_msg::FileSource = proto_file_source.try_into().unwrap();
         assert_eq!(file_source, file_source2);
     }
 
     #[test]
     fn store_info_conversion() {
-        let store_info = re_log_types::StoreInfo::new_unversioned(
+        let store_info = re_log_msg::StoreInfo::new_unversioned(
             re_log_types::StoreId::new(
                 re_log_types::StoreKind::Recording,
                 "test_app_id",
                 "test_recording_id",
             ),
-            re_log_types::StoreSource::PythonSdk(re_log_types::PythonVersion {
+            re_log_msg::StoreSource::PythonSdk(re_log_msg::PythonVersion {
                 major: 3,
                 minor: 8,
                 patch: 0,
@@ -366,21 +404,21 @@ mod tests {
         );
 
         let proto_store_info: crate::log_msg::v1alpha1::StoreInfo = store_info.clone().into();
-        let store_info2: re_log_types::StoreInfo = proto_store_info.try_into().unwrap();
+        let store_info2: re_log_msg::StoreInfo = proto_store_info.try_into().unwrap();
         assert_eq!(store_info, store_info2);
     }
 
     #[test]
     fn set_store_info_conversion() {
-        let set_store_info = re_log_types::SetStoreInfo {
+        let set_store_info = re_log_msg::SetStoreInfo {
             row_id: re_tuid::Tuid::new(),
-            info: re_log_types::StoreInfo::new_unversioned(
+            info: re_log_msg::StoreInfo::new_unversioned(
                 re_log_types::StoreId::new(
                     re_log_types::StoreKind::Recording,
                     "test_app_id",
                     "test_recording_id",
                 ),
-                re_log_types::StoreSource::PythonSdk(re_log_types::PythonVersion {
+                re_log_msg::StoreSource::PythonSdk(re_log_msg::PythonVersion {
                     major: 3,
                     minor: 8,
                     patch: 0,
@@ -390,7 +428,7 @@ mod tests {
         };
         let proto_set_store_info: crate::log_msg::v1alpha1::SetStoreInfo =
             set_store_info.clone().into();
-        let set_store_info2: re_log_types::SetStoreInfo = proto_set_store_info.try_into().unwrap();
+        let set_store_info2: re_log_msg::SetStoreInfo = proto_set_store_info.try_into().unwrap();
         assert_eq!(set_store_info, set_store_info2);
     }
 }

@@ -29,7 +29,9 @@ impl MismatchedChunkSchemaError {
 ///
 /// Each [`ChunkBatch`] contains logging data for a single [`EntityPath`].
 /// It always has a [`re_types_core::RowId`] column.
-#[derive(Debug, Clone)]
+// TODO(RR-5743): `schema` embeds a second copy of the `SorbetSchema` held by `sorbet_batch`;
+// every mutation must keep both in sync.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChunkBatch {
     schema: ChunkSchema,
     sorbet_batch: SorbetBatch,
@@ -115,6 +117,27 @@ impl std::fmt::Display for ChunkBatch {
     }
 }
 
+impl ChunkBatch {
+    /// See [`SorbetBatch::track_latency`].
+    pub fn track_latency(&mut self, location: crate::TimestampLocation) {
+        self.sorbet_batch.track_latency(location);
+        // TODO(RR-5743): remove once `ChunkSchema` no longer duplicates the `SorbetSchema`.
+        self.schema.timestamps = self.sorbet_batch.sorbet_schema().timestamps.clone();
+    }
+}
+
+impl re_byte_size::SizeBytes for ChunkBatch {
+    fn heap_size_bytes(&self) -> u64 {
+        let Self {
+            // TODO(RR-5743): count the parsed schema once it is no longer duplicated.
+            schema: _,
+            sorbet_batch,
+        } = self;
+
+        sorbet_batch.heap_size_bytes()
+    }
+}
+
 impl AsRef<SorbetBatch> for ChunkBatch {
     #[inline]
     fn as_ref(&self) -> &SorbetBatch {
@@ -152,7 +175,6 @@ impl TryFrom<&ArrowRecordBatch> for ChunkBatch {
     /// * Will automatically wrap data columns in `ListArrays` if they are not already
     /// * Will reorder columns so that Row ID comes before timelines, which come before data
     /// * Will migrate component descriptors to colon-based notation
-    #[tracing::instrument(level = "trace", skip_all)]
     fn try_from(batch: &ArrowRecordBatch) -> Result<Self, Self::Error> {
         re_tracing::profile_function!();
 
@@ -167,7 +189,6 @@ impl TryFrom<SorbetBatch> for ChunkBatch {
     type Error = SorbetError;
 
     /// Will automatically wrap data columns in `ListArrays` if they are not already.
-    #[tracing::instrument(level = "trace", skip_all)]
     fn try_from(sorbet_batch: SorbetBatch) -> Result<Self, Self::Error> {
         re_tracing::profile_function!();
 

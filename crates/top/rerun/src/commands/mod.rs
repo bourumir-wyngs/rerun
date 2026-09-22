@@ -23,13 +23,17 @@ impl CallSource {
 
 #[cfg(feature = "auth")]
 mod auth;
+mod cli_data_source;
 mod download;
+mod dump_puffin;
 
 mod entrypoint;
-#[cfg(feature = "data_loaders")]
+#[cfg(feature = "importers")]
 mod mcap;
 mod rrd;
 mod stdio;
+#[cfg(feature = "importers")]
+mod table_util;
 
 #[cfg(feature = "analytics")]
 mod analytics;
@@ -37,10 +41,11 @@ mod analytics;
 #[cfg(feature = "analytics")]
 pub(crate) use self::analytics::AnalyticsCommands;
 pub use self::download::DownloadCommand;
+pub use self::dump_puffin::DumpPuffinCommand;
 pub use self::entrypoint::run;
-#[cfg(feature = "data_loaders")]
+#[cfg(feature = "importers")]
 pub use self::mcap::McapCommands;
 pub use self::rrd::RrdCommands;
 pub use self::stdio::{
-    read_raw_rrd_streams_from_file_or_stdin, read_rrd_streams_from_file_or_stdin,
+    InputSource, read_raw_rrd_streams_from_file_or_stdin, read_rrd_streams_from_file_or_stdin,
 };

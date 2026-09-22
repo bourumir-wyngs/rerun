@@ -1,13 +1,18 @@
+#![allow(clippy::iter_over_hash_type)]
+
 //! This crate covers two equally important but orthogonal matters:
 //! * Converting between transport-level and application-level Rerun types.
 //! * Encoding and decoding Rerun RRD streams.
+//!
+//! Both concern the physical byte layout of `.rrd` streams.
+//! The chunk indexes carried in the footer live in `re_chunk_index`, which knows nothing about bytes.
 //!
 //! If you are working with one of the gRPC APIs (Redap or SDK comms), then you want to be looking
 //! at the [`ToTransport`]/[`ToApplication`] traits. The [`rrd`] module is completely irrelevant in
 //! that case. You can learn more about these traits below.
 //!
 //! If you are working with actual RRD streams (i.e. everything that does not go through gRPC:
-//! files, standard I/O, HTTP, data loaders, etc), then have a look into the [`rrd`] module.
+//! files, standard I/O, HTTP, importers, etc), then have a look into the [`rrd`] module.
 //! The [`ToTransport`]/[`ToApplication`] traits will also be useful to you. You can learn more
 //! about these traits below.
 //!
@@ -38,14 +43,14 @@
 //!
 //! ## How do I make sense of all these different `LogMsg` types?!
 //!
-//! There are 3 different `LogMsg`-related types that you will very often encounter: `re_log_types::LogMsg`,
+//! There are 3 different `LogMsg`-related types that you will very often encounter: `re_log_msg::LogMsg`,
 //! `re_protos::log_msg::v1alpha1::LogMsg` and `re_protos::log_msg::v1alpha1::log_msg::Msg`.
 //!
 //! Mixing them up is a common source of pain and confusion, so let's go over what each does:
-//! * `re_log_types::LogMsg` is the application-level type that we use all across the viewer
+//! * `re_log_msg::LogMsg` is the application-level type that we use all across the viewer
 //!   codebase. It can be obtained by calling `to_application()` on one of the transport-level
 //!   `LogMsg` types which, among many other things, will perform Chunk/Sorbet-level migrations.
-//!   `re_log_types::LogMsg` isn't used in Redap, where everything is done at the transport-level, always.
+//!   `re_log_msg::LogMsg` isn't used in Redap, where everything is done at the transport-level, always.
 //! * `re_protos::log_msg::v1alpha1::LogMsg` is the transport-level definition of `LogMsg`. It is an
 //!   artifact of how `oneof` works in Protobuf: all it does is carry a `re_protos::log_msg::v1alpha1::log_msg::Msg`.
 //!   For that reason, it is never directly used, except by the legacy SDK comms protocol.
@@ -59,7 +64,7 @@
 //! * SDK comms: our legacy gRPC-based protocol, currently used by everything relying on the old
 //!   `StoreHub` model (logging, message proxy, etc).
 //! * RRD streams: the binary protocol that we use for all stream-based interfaces (files, stdio,
-//!   data-loaders, HTTP fetches, etc).
+//!   importers, HTTP fetches, etc).
 //!
 //! *All these protocols use the exact same encoding*. There is only one encoding: the Rerun encoding.
 //! It often happens that one protocol makes use of some types while others don't (e.g. the

@@ -6,6 +6,7 @@ from .annotation_context import AnnotationContext
 from .arrows2d import Arrows2D
 from .arrows3d import Arrows3D
 from .asset3d import Asset3D
+from .asset_audio import AssetAudio
 from .asset_video import AssetVideo
 from .bar_chart import BarChart
 from .boxes2d import Boxes2D
@@ -15,9 +16,11 @@ from .clear import Clear
 from .coordinate_frame import CoordinateFrame
 from .cylinders3d import Cylinders3D
 from .depth_image import DepthImage
+from .ellipses2d import Ellipses2D
 from .ellipsoids3d import Ellipsoids3D
 from .encoded_depth_image import EncodedDepthImage
 from .encoded_image import EncodedImage
+from .gaussian_splats3d import GaussianSplats3D
 from .geo_line_strings import GeoLineStrings
 from .geo_points import GeoPoints
 from .graph_edges import GraphEdges
@@ -31,6 +34,7 @@ from .mcap_channel import McapChannel
 from .mcap_message import McapMessage
 from .mcap_schema import McapSchema
 from .mcap_statistics import McapStatistics
+from .measurements import Measurements
 from .mesh3d import Mesh3D
 from .pinhole import Pinhole
 from .points2d import Points2D
@@ -40,6 +44,8 @@ from .scalars import Scalars
 from .segmentation_image import SegmentationImage
 from .series_lines import SeriesLines
 from .series_points import SeriesPoints
+from .state_change import StateChange
+from .state_configuration import StateConfiguration
 from .tensor import Tensor
 from .text_document import TextDocument
 from .text_log import TextLog
@@ -48,12 +54,15 @@ from .transform_axes3d import TransformAxes3D
 from .video_frame_reference import VideoFrameReference
 from .video_stream import VideoStream
 from .view_coordinates import ViewCoordinates
+from .volume3d import Volume3D
+from .voxel_grid_map import VoxelGridMap
 
 __all__ = [
     "AnnotationContext",
     "Arrows2D",
     "Arrows3D",
     "Asset3D",
+    "AssetAudio",
     "AssetVideo",
     "BarChart",
     "Boxes2D",
@@ -63,9 +72,11 @@ __all__ = [
     "CoordinateFrame",
     "Cylinders3D",
     "DepthImage",
+    "Ellipses2D",
     "Ellipsoids3D",
     "EncodedDepthImage",
     "EncodedImage",
+    "GaussianSplats3D",
     "GeoLineStrings",
     "GeoPoints",
     "GraphEdges",
@@ -79,6 +90,7 @@ __all__ = [
     "McapMessage",
     "McapSchema",
     "McapStatistics",
+    "Measurements",
     "Mesh3D",
     "Pinhole",
     "Points2D",
@@ -88,6 +100,8 @@ __all__ = [
     "SegmentationImage",
     "SeriesLines",
     "SeriesPoints",
+    "StateChange",
+    "StateConfiguration",
     "Tensor",
     "TextDocument",
     "TextLog",
@@ -96,4 +110,6 @@ __all__ = [
     "VideoFrameReference",
     "VideoStream",
     "ViewCoordinates",
+    "Volume3D",
+    "VoxelGridMap",
 ]

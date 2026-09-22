@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 
+use itertools::chain;
+
 // --
 // ---
 
@@ -42,8 +44,8 @@ impl<T: Clone + PartialOrd + Ord> VecDequeSortingExt<T> for VecDeque<T> {
                 true
             }
         };
-        let left_is_sorted = || !left.windows(2).any(|values| values[0] > values[1]);
-        let right_is_sorted = || !right.windows(2).any(|values| values[0] > values[1]);
+        let left_is_sorted = || !left.array_windows().any(|[a, b]| b < a);
+        let right_is_sorted = || !right.array_windows().any(|[a, b]| b < a);
 
         left_before_right() && left_is_sorted() && right_is_sorted()
     }
@@ -101,11 +103,7 @@ impl<T> VecDequeInsertionExt<T> for VecDeque<T> {
             // self.extend(values);
             // self.extend(right);
 
-            *self = std::mem::take(self)
-                .into_iter()
-                .chain(values)
-                .chain(right)
-                .collect();
+            *self = chain!(std::mem::take(self), values, right).collect();
         }
     }
 }

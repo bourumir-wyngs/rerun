@@ -5,7 +5,7 @@ use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array};
 use arrow::datatypes::{Field, Schema, SchemaBuilder};
 use itertools::Itertools as _;
 
-use crate::MissingColumnError;
+use crate::{ArrowArrayDowncastRef as _, GetColumnError, MissingColumnError};
 
 /// Takes rows from a [`RecordBatch`] at the specified indices.
 ///
@@ -32,6 +32,8 @@ pub fn concat_polymorphic_batches(batches: &[RecordBatch]) -> arrow::error::Resu
         return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
     }
 
+    re_tracing::profile_function!();
+
     let schema_merged = {
         let mut schema_builder = SchemaBuilder::new();
         for batch in batches {
@@ -40,6 +42,7 @@ pub fn concat_polymorphic_batches(batches: &[RecordBatch]) -> arrow::error::Resu
             }
 
             let md_merged = schema_builder.metadata_mut();
+            #[expect(clippy::iter_over_hash_type)] // Metadata order is irrelevant.
             for (k, v) in batch.schema_ref().metadata() {
                 if let Some(previous) = md_merged.insert(k.clone(), v.clone())
                     && previous != *v
@@ -130,6 +133,19 @@ pub trait RecordBatchExt {
     /// Rename columns based on the provided (original, new) pairs.
     fn rename_columns(self, renames: &[(&str, &str)]) -> arrow::error::Result<RecordBatch>;
 
+    /// Get a column by name and downcast it, with a nice error message otherwise.
+    fn try_get_column_as<T: arrow::array::Array + 'static>(
+        &self,
+        name: &str,
+    ) -> Result<&T, GetColumnError> {
+        self.try_get_column(name)?
+            .try_downcast_array_ref::<T>()
+            .map_err(|err| GetColumnError::Downcast {
+                column: name.to_owned(),
+                err,
+            })
+    }
+
     /// Get a column by name, with a nice error message otherwise
     fn try_get_column(&self, name: &str) -> Result<&ArrayRef, MissingColumnError> {
         self.inner()
@@ -211,14 +227,12 @@ impl RecordBatchExt for RecordBatch {
         let (schema_ref, columns, row_count) = self.into_parts();
         let Schema { fields, metadata } = Arc::unwrap_or_clone(schema_ref);
 
-        let (fields, columns): (Vec<_>, Vec<_>) = fields
-            .iter()
-            .map(Arc::clone)
-            .zip(columns)
-            .sorted_by(|(left_field, _), (right_field, _)| {
-                cmp_fn(left_field.as_ref(), right_field.as_ref())
-            })
-            .unzip();
+        let (fields, columns): (Vec<_>, Vec<_>) =
+            std::iter::zip(fields.iter().map(Arc::clone), columns)
+                .sorted_by(|(left_field, _), (right_field, _)| {
+                    cmp_fn(left_field.as_ref(), right_field.as_ref())
+                })
+                .unzip();
 
         Self::try_new_with_options(
             Arc::new(Schema::new_with_metadata(fields, metadata)),
@@ -234,12 +248,10 @@ impl RecordBatchExt for RecordBatch {
         let (schema_ref, columns, row_count) = self.into_parts();
         let Schema { fields, metadata } = Arc::unwrap_or_clone(schema_ref);
 
-        let (new_fields, new_columns): (Vec<_>, Vec<_>) = fields
-            .iter()
-            .map(Arc::clone)
-            .zip(columns)
-            .filter(|(field, _)| predicate(field))
-            .unzip();
+        let (new_fields, new_columns): (Vec<_>, Vec<_>) =
+            std::iter::zip(fields.iter().map(Arc::clone), columns)
+                .filter(|(field, _)| predicate(field))
+                .unzip();
 
         Self::try_new_with_options(
             Arc::new(Schema::new_with_metadata(new_fields, metadata)),
@@ -270,9 +282,8 @@ impl RecordBatchExt for RecordBatch {
                     return Err(arrow::error::ArrowError::InvalidArgumentError(format!(
                         "projected column '{col_name}' was requested twice"
                     )));
-                } else {
-                    seen_columns.insert(col_name);
                 }
+                seen_columns.insert(col_name);
 
                 columns
                     .get(col_index)
@@ -319,6 +330,7 @@ impl RecordBatchExt for RecordBatch {
 #[cfg(test)]
 mod tests {
     #![expect(clippy::disallowed_methods)]
+    use std::assert_matches;
 
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -330,6 +342,37 @@ mod tests {
     use arrow::error::ArrowError;
 
     use super::*;
+
+    /// Both failure modes must name the column; the wrong-type one must also say what it found.
+    #[test]
+    fn get_column_error_messages() {
+        let batch = RecordBatch::try_from_iter([
+            ("name", Arc::new(StringArray::from(vec!["a"])) as ArrayRef),
+            ("count", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+        ])
+        .unwrap();
+
+        let err = batch
+            .try_get_column_as::<Int32Array>("nope")
+            .expect_err("there is no `nope` column");
+        assert_eq!(
+            err.to_string(),
+            r#"Missing column: "nope". Available: ["name", "count"]"#
+        );
+
+        let err = batch
+            .try_get_column_as::<Int32Array>("name")
+            .expect_err("`name` is a StringArray");
+        assert_eq!(
+            err.to_string(),
+            r#"Column "name": Failed to downcast array of type Utf8 to Int32Array"#
+        );
+
+        // `Debug` must defer to `Display`, so `.unwrap()` panics with the readable message:
+        assert_eq!(format!("{err:?}"), err.to_string()); // NOLINT: this test asserts `Debug` defers to `Display`
+
+        assert!(batch.try_get_column_as::<Int32Array>("count").is_ok());
+    }
 
     #[test]
     fn make_nullable_basics() {
@@ -571,7 +614,7 @@ mod tests {
         };
 
         let err = concat_polymorphic_batches(&[batch1.clone(), batch2.clone()]).unwrap_err();
-        assert!(matches!(err, ArrowError::SchemaError(_)));
+        assert_matches!(err, ArrowError::SchemaError(_));
 
         batch2
             .schema_metadata_mut()
@@ -629,8 +672,7 @@ mod tests {
         // Verify data
         let col_a = result
             .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
+            .try_downcast_array_ref::<Int32Array>()
             .unwrap();
         assert_eq!(col_a.value(0), 1);
         assert_eq!(col_a.value(1), 2);
@@ -638,8 +680,7 @@ mod tests {
 
         let col_d = result
             .column(3)
-            .as_any()
-            .downcast_ref::<Int32Array>()
+            .try_downcast_array_ref::<Int32Array>()
             .unwrap();
         assert_eq!(col_d.value(0), 10);
         assert_eq!(col_d.value(1), 20);
@@ -952,15 +993,13 @@ mod tests {
         // Verify data moved with columns
         let apple_col = sorted
             .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
+            .try_downcast_array_ref::<StringArray>()
             .unwrap();
         assert_eq!(apple_col.value(0), "a");
 
         let mango_col = sorted
             .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
+            .try_downcast_array_ref::<Int32Array>()
             .unwrap();
         assert_eq!(mango_col.value(0), 10);
     }
@@ -1142,8 +1181,7 @@ mod tests {
         // Verify data matches the reordered columns
         let age_col = projected
             .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
+            .try_downcast_array_ref::<Int32Array>()
             .unwrap();
         assert_eq!(age_col.value(0), 30);
     }
@@ -1209,8 +1247,7 @@ mod tests {
         // Verify data is preserved
         let name_col = renamed
             .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
+            .try_downcast_array_ref::<StringArray>()
             .unwrap();
         assert_eq!(name_col.value(0), "Alice");
     }
